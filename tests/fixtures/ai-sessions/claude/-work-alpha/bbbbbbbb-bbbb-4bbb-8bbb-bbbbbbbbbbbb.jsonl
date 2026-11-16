@@ -1,0 +1,4 @@
+{"type":"summary","summary":"Older summary"}
+{"type":"ai-title","aiTitle":"Only AI title wins over summary"}
+{"type":"user","cwd":"/work/alpha","timestamp":"2025-03-02T08:00:00Z","message":{"role":"user","content":"hello from bravo"}}
+{"type":"assistant","cwd":"/work/alpha","timestamp":"2025-03-02T08:00:30+00:00","message":{"role":"assistant","content":"plain string assistant reply"}}

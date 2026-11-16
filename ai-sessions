@@ -1,0 +1,1781 @@
+#!/usr/bin/env python3
+"""ai-sessions: browse and search Claude Code and Codex CLI session transcripts.
+
+Interactive (curses) by default; --list and --show are plain-text, scriptable.
+Standard library only; works on Python 3.6+.
+
+Environment:
+  AI_SESSIONS_CLAUDE_DIR  Claude Code projects dir (default ~/.claude/projects)
+  AI_SESSIONS_CODEX_DIR   Codex home dir          (default ~/.codex)
+  AI_SESSIONS_CLAUDE_CMD  command used to resume Claude sessions (default "claude")
+  AI_SESSIONS_CODEX_CMD   command used to resume Codex sessions  (default "codex")
+                          A word containing {id} gets the session id substituted;
+                          otherwise the default resume args are appended
+                          (claude: --resume ID, codex: resume ID). Examples:
+                            claude --dangerously-skip-permissions --model opus
+                            codex resume {id} --yolo
+                          --claude-cmd / --codex-cmd override these.
+  XDG_CACHE_HOME          cache root (index in $XDG_CACHE_HOME/ai-sessions/index.json)
+"""
+
+import argparse
+import calendar
+import collections
+import curses
+import datetime
+import json
+import locale
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from typing import Any, Callable, Dict, Iterator, List, Optional, Pattern, Tuple
+
+# A parsed transcript message: a dict with keys
+#   role  one of:
+#           "user"       a prompt you typed
+#           "assistant"  a reply from Claude / Codex
+#           "cmd"        a slash command you ran (Claude only), e.g. "/review src/x.py"
+#           "tool"       a tool call, summarized to one line, e.g. "Read: /path"
+#           "result"     the output of a tool call (capped at RESULT_CAP chars)
+#   text  the message text (for "tool": the one-line summary)
+#   ts    epoch seconds (float) or None
+#   name  only for "tool": the bare tool name (used for searching)
+Msg = Dict[str, Any]
+# One session's index entry (what is cached in index.json and what Session wraps).
+# Keys: source ("claude"/"codex"), id, path, cwd, branch, title, first_ts, last_ts,
+#       n_user, n_asst (message counts), blob (lowercased search text, capped).
+# INDEX_VERSION must be bumped whenever these keys or their meaning change, so
+# stale caches are discarded instead of being misread.
+Summary = Dict[str, Any]
+# One rendered transcript row: (text, kind). kind picks the color/attribute:
+# title, meta, dim, text, user, asst, tool, result (see App.init_colors).
+Line = Tuple[str, str]
+# curses window (curses._CursesWindow is not importable at runtime).
+Window = Any
+# (y, x, height, width) screen region.
+Box = Tuple[int, int, int, int]
+
+# curses waits ESCDELAY ms after Esc to see whether it starts an escape sequence
+# (arrow keys etc.); the default of 1000ms makes Esc feel sluggish. Must be set
+# before curses initializes, and we respect a user-provided value.
+os.environ.setdefault("ESCDELAY", "25")
+
+INDEX_VERSION = 2          # bump when Summary keys/meaning change (see Summary above)
+BLOB_CAP = 200000          # max chars of lowercased search text kept per session
+RESULT_CAP = 4000          # max chars kept per tool result
+TITLE_MAX = 100            # titles derived from a first prompt are cut to this length
+FIRST_LINE_MAX = 160       # first_line() default: tool-argument summaries are cut here
+CMD_PEEK = 400             # how far into a user message to look for <command-name>
+RESULT_PREVIEW_LINES = 6   # tool-result lines shown before "... (N more lines)"
+TRANSCRIPT_CACHE_SIZE = 6  # parsed transcripts kept in memory (LRU)
+DATE_COL_WIDTH = 17        # "YYYY-MM-DD HH:MM" plus a space, in the session list
+TAG_COL_WIDTH = 3          # "CC " / "CX " in the session list
+SIDE_BY_SIDE_MIN_COLS = 100  # at least this wide: list | preview, else list over preview
+TAG: Dict[str, str] = {"claude": "CC", "codex": "CX"}
+LABEL: Dict[str, str] = {"claude": "Claude Code", "codex": "Codex"}
+ASSISTANT_NAME: Dict[str, str] = {"claude": "Claude", "codex": "Codex"}
+
+# User "messages" that the harness injects rather than the human typing them. They
+# would otherwise pollute titles and search, so parse_claude drops them.
+CLAUDE_NOISE: Tuple[str, ...] = (
+    "<local-command-caveat>", "<local-command-stdout>", "<local-command-stderr>",
+    "<system-reminder>", "<task-notification>", "<bash-input>", "<bash-stdout>",
+    "<bash-stderr>", "<command-message>", "<user-prompt-submit-hook>",
+    "Caveat:", "[Request interrupted", "This session is being continued",
+)
+# Codex injects context as user messages: a leading XML-ish tag wrapping the whole
+# message (CODEX_TAG, checked together with a trailing ">") or one of these prefixes.
+CODEX_TAG: Pattern[str] = re.compile(r"^<[A-Za-z_][\w\-]*[\s>/]")
+CODEX_NOISE: Tuple[str, ...] = ("# AGENTS.md", "<environment_context>", "<user_instructions>",
+               "<permissions", "<INSTRUCTIONS>")
+# Claude records a slash command as a user message containing these tags.
+CMD_NAME: Pattern[str] = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+CMD_ARGS: Pattern[str] = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
+# ISO-8601-ish timestamps with optional fraction and Z / +hh:mm / +hhmm offset.
+TS_RE: Pattern[str] = re.compile(
+    r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.(\d+))?\s*(Z|[+-]\d\d:?\d\d)?")
+
+
+# ---------------------------------------------------------------- helpers
+
+def parse_ts(v: Any) -> Optional[float]:
+    """Epoch seconds from an ISO-8601 string or a numeric epoch; None if unusable."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        # Epoch seconds are ~1.7e9 today; 1e11 seconds is the year ~5000, so anything
+        # larger must be milliseconds.
+        return v / 1000.0 if v > 1e11 else float(v)
+    if not isinstance(v, str):
+        return None
+    m = TS_RE.match(v)
+    if not m:
+        return None
+    try:
+        y, mo, d, h, mi, s = [int(m.group(i)) for i in range(1, 7)]
+        t: float = calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0))
+    except (ValueError, OverflowError):
+        return None
+    if m.group(7):
+        t += float("0." + m.group(7))
+    z = m.group(8)
+    if z and z != "Z":
+        sign = 1 if z[0] == "+" else -1
+        zz = z[1:].replace(":", "")
+        t -= sign * (int(zz[:2]) * 3600 + int(zz[2:4]) * 60)
+    return t
+
+
+def fmt_ts(ts: Optional[float], with_date: bool = True) -> str:
+    if not ts:
+        return "-"
+    try:
+        return datetime.datetime.fromtimestamp(ts).strftime(
+            "%Y-%m-%d %H:%M" if with_date else "%H:%M")
+    except (ValueError, OverflowError, OSError):
+        return "-"
+
+
+def clean(s: Any) -> str:
+    """Make text safe for a terminal cell grid."""
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.replace("\t", "    ").replace("\r", "")
+    return "".join(c if (c == "\n" or (ord(c) >= 32 and ord(c) != 127 and
+                                       not (0x80 <= ord(c) < 0xa0))) else " " for c in s)
+
+
+_wcache: Dict[str, int] = {}
+
+
+def char_width(c: str) -> int:
+    w = _wcache.get(c)
+    if w is None:
+        if unicodedata.combining(c):
+            w = 0
+        elif unicodedata.east_asian_width(c) in ("W", "F"):
+            w = 2
+        else:
+            w = 1
+        _wcache[c] = w
+    return w
+
+
+def str_width(s: str) -> int:
+    return sum(char_width(c) for c in s)
+
+
+def clip(s: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    out, w = [], 0
+    for c in s:
+        k = char_width(c)
+        if w + k > width:
+            break
+        out.append(c)
+        w += k
+    return "".join(out)
+
+
+def pad(s: str, width: int) -> str:
+    s = clip(s, width)
+    return s + " " * (width - str_width(s))
+
+
+def wrap(text: str, width: int) -> List[str]:
+    """Word-wrap text to a display width; blank-line runs collapse to one."""
+    width = max(width, 4)
+    lines: List[str] = []
+    for para in text.split("\n"):
+        para = para.rstrip()
+        if not para.strip():
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        if str_width(para) <= width:
+            lines.append(para)
+            continue
+        indent = len(para) - len(para.lstrip(" "))
+        indent = min(indent, width // 2)
+        cur = " " * indent
+        for word in para.strip().split(" "):
+            if not word:
+                continue
+            while str_width(word) > width - indent:
+                if cur.strip():
+                    lines.append(cur)
+                    cur = " " * indent
+                piece = clip(word, width - indent)
+                if not piece:
+                    piece, word = word[:1], word[1:]
+                else:
+                    word = word[len(piece):]
+                lines.append(" " * indent + piece)
+            if not cur.strip():
+                cur = " " * indent + word
+            elif str_width(cur) + 1 + str_width(word) <= width:
+                cur += " " + word
+            else:
+                lines.append(cur)
+                cur = " " * indent + word
+        if cur.strip():
+            lines.append(cur)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def first_line(s: Any, n: int = FIRST_LINE_MAX) -> str:
+    """First non-blank line of s, stripped and cut to n chars."""
+    for ln in str(s).split("\n"):
+        ln = ln.strip()
+        if ln:
+            return ln[:n]
+    return ""
+
+
+def one_line(s: Any) -> str:
+    """Collapse all whitespace runs (including newlines) to single spaces."""
+    return " ".join(str(s).split())
+
+
+def terms_of(query: Optional[str]) -> List[str]:
+    """Split a filter query into lowercase terms (all must match)."""
+    return [t for t in (query or "").lower().split() if t]
+
+
+def term_regex(terms: List[str]) -> Optional[Pattern[str]]:
+    """Case-insensitive regex matching any term, longest first (for highlighting)."""
+    if not terms:
+        return None
+    return re.compile("|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)),
+                      re.I)
+
+
+# Tool-call argument names worth showing, in priority order (first one present wins).
+TOOL_KEYS: Tuple[str, ...] = ("command", "cmd", "file_path", "path", "notebook_path", "pattern", "url",
+             "description", "query", "prompt", "text", "message", "target")
+
+
+def summarize_tool(name: Any, inp: Any) -> str:
+    """One-line "Name: key argument" summary of a tool call.
+
+    inp is a dict (Claude), or a dict / JSON string / plain string (Codex). The
+    argument shown is the first TOOL_KEYS entry present, else the first string value.
+    """
+    name = str(name or "tool")
+    val = ""
+    if isinstance(inp, str):
+        s = inp.strip()
+        if s.startswith("{"):
+            try:
+                inp = json.loads(s)
+            except ValueError:
+                pass
+        if isinstance(inp, str):
+            val = first_line(inp)
+    if isinstance(inp, dict):
+        for k in TOOL_KEYS:
+            v = inp.get(k)
+            if isinstance(v, str) and v.strip():
+                val = first_line(v)
+                break
+            if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+                val = first_line(" ".join(v))
+                break
+        else:
+            for v in inp.values():
+                if isinstance(v, str) and v.strip():
+                    val = first_line(v)
+                    break
+    return "%s: %s" % (name, val) if val else name
+
+
+def content_text(c: Any) -> str:
+    """Flatten tool_result / output content to text.
+
+    Content is a plain string or a list of strings / {"type":"text","text":...} blocks;
+    other block kinds (images etc.) are dropped.
+    """
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts: List[str] = []
+        for b in c:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict):
+                t = b.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+        return "\n".join(parts)
+    return ""
+
+
+# ---------------------------------------------------------------- parsing
+
+def iter_json(path: str) -> Iterator[Dict[str, Any]]:
+    """Yield each JSON-object line of a .jsonl file, skipping blank/garbled lines."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line[0] != "{":
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except OSError:
+        return
+
+
+def content_blocks(content: Any) -> Optional[List[Any]]:
+    """Normalize Claude message content to a block list: a bare string becomes one text
+    block; anything that is neither string nor list yields None (caller skips it)."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return content if isinstance(content, list) else None
+
+
+def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
+    """Parse a Claude Code transcript (~/.claude/projects/<project-dir>/<uuid>.jsonl).
+
+    One JSON object per line. Records used (everything else is ignored):
+
+        {"type": "custom-title", "customTitle": "Name set with /rename"}
+        {"type": "ai-title", "aiTitle": "Generated title"}
+        {"type": "summary", "summary": "Compaction summary"}
+        {"type": "user", "cwd": "/work/proj", "gitBranch": "main",
+         "timestamp": "2025-03-01T10:00:00.000Z", "isSidechain": false, "isMeta": false,
+         "message": {"role": "user", "content": "text"
+                     | [{"type": "text", "text": "..."},
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "..."}]}}
+        {"type": "assistant", ...,
+         "message": {"role": "assistant", "content": "text"
+                     | [{"type": "text", "text": "..."},
+                        {"type": "tool_use", "id": "t1", "name": "Read",
+                         "input": {"file_path": "/x"}}]}}
+
+    Skipped on purpose:
+      * isSidechain records: subagent transcripts interleaved in the file; they are not
+        the conversation with you.
+      * isMeta records: synthetic messages the harness adds. Their cwd/branch are
+        still harvested, but not their text or timestamps.
+      * gitBranch "HEAD": a detached HEAD, which says nothing about the branch.
+      * harness-injected user text (CLAUDE_NOISE: system reminders, hook output,
+        "Caveat:" notices, ...).
+    Slash commands arrive as user text with <command-name>/<command-args> tags and
+    become "cmd" messages.
+
+    The session id is the filename stem. Title priority: custom-title > ai-title >
+    summary > the first real prompt (shortened to TITLE_MAX). Later records of the
+    same title type replace earlier ones.
+    """
+    sid = os.path.basename(path)[:-6]
+    cwd: Optional[str] = None
+    branch: Optional[str] = None
+    custom: Optional[str] = None
+    ai: Optional[str] = None
+    summ: Optional[str] = None
+    first_prompt: Optional[str] = None
+    first_ts: Optional[float] = None
+    last_ts: Optional[float] = None
+    msgs: List[Msg] = []
+    for record in iter_json(path):
+        rtype = record.get("type")
+        if rtype == "custom-title" and record.get("customTitle"):
+            custom = record["customTitle"]
+            continue
+        if rtype == "ai-title" and record.get("aiTitle"):
+            ai = record["aiTitle"]
+            continue
+        if rtype == "summary" and record.get("summary"):
+            summ = record["summary"]
+            continue
+        if rtype not in ("user", "assistant"):
+            continue
+        if record.get("isSidechain"):
+            continue
+        if not cwd and isinstance(record.get("cwd"), str):
+            cwd = record["cwd"]
+        if not branch and isinstance(record.get("gitBranch"), str) and record["gitBranch"] != "HEAD":
+            branch = record["gitBranch"]
+        if record.get("isMeta"):
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        ts = parse_ts(record.get("timestamp"))
+        if ts:
+            first_ts = first_ts or ts
+            last_ts = ts
+        blocks = content_blocks(message.get("content"))
+        if blocks is None:
+            continue
+        if rtype == "user":
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    text = block.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    stripped = text.lstrip()
+                    # Peek only at the start: a command tag deep inside a long prompt is
+                    # just text the user pasted, not a slash command.
+                    head = stripped[:CMD_PEEK]
+                    cm = CMD_NAME.search(head) if "<command-name>" in head else None
+                    if cm:
+                        am = CMD_ARGS.search(stripped)
+                        cmd = cm.group(1) + ((" " + one_line(am.group(1))) if am and am.group(1) else "")
+                        msgs.append({"role": "cmd", "text": cmd, "ts": ts})
+                    elif stripped.startswith(CLAUDE_NOISE):
+                        continue
+                    else:
+                        msgs.append({"role": "user", "text": text.strip(), "ts": ts})
+                        if first_prompt is None:
+                            first_prompt = text.strip()
+                elif block_type == "tool_result":
+                    msgs.append({"role": "result",
+                                 "text": content_text(block.get("content"))[:RESULT_CAP], "ts": ts})
+        else:
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text" and isinstance(block.get("text"), str) and block["text"].strip():
+                    msgs.append({"role": "assistant", "text": block["text"].strip(), "ts": ts})
+                elif block_type == "tool_use":
+                    msgs.append({"role": "tool", "name": str(block.get("name") or "tool"),
+                                 "text": summarize_tool(block.get("name"), block.get("input")), "ts": ts})
+    title = custom or ai or summ or (one_line(first_prompt)[:TITLE_MAX] if first_prompt else None)
+    return make_summary("claude", sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
+
+
+def codex_user_noise(text: str) -> bool:
+    """True for Codex user messages that are injected context, not typed prompts."""
+    s = text.lstrip()
+    return s.startswith(CODEX_NOISE) or bool(CODEX_TAG.match(s) and s.rstrip().endswith(">"))
+
+
+def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
+    """Parse a Codex rollout (~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl).
+
+    One JSON object per line, {"timestamp", "type", "payload"}. Records used:
+
+        {"type": "session_meta", "payload": {"id": "<uuid>", "timestamp": "...",
+                                              "cwd": "/work/proj", "git": {"branch": "main"}}}
+        {"type": "turn_context", "payload": {"cwd": "/work/proj", ...}}
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user" | "assistant",
+            "content": [{"type": "input_text" | "output_text", "text": "..."}]}}
+        {"type": "response_item", "payload": {
+            "type": "function_call", "name": "shell", "arguments": "{\\"command\\": [...]}"}}
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch..."}}
+        {"type": "response_item", "payload": {
+            "type": "function_call_output" | "custom_tool_call_output", "output": "..."}}
+
+    Skipped: other roles (developer/system), other record types, and user messages that
+    are injected context (see codex_user_noise: AGENTS.md text, <environment_context>...).
+
+    The id comes from session_meta when present. Otherwise it is the last 36 characters
+    of the filename stem: rollout-<timestamp>-<uuid> always ends in a 36-char UUID.
+    Codex has no title records, so the title is the first user prompt (or the first
+    assistant message); load_sessions() overrides it with session_index.jsonl names.
+    """
+    stem = os.path.basename(path)[:-6]
+    sid = stem[-36:] if len(stem) >= 36 else stem
+    cwd: Optional[str] = None
+    branch: Optional[str] = None
+    first_prompt: Optional[str] = None
+    first_ts: Optional[float] = None
+    last_ts: Optional[float] = None
+    msgs: List[Msg] = []
+    for record in iter_json(path):
+        rtype = record.get("type")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        ts = parse_ts(record.get("timestamp"))
+        if rtype == "session_meta":
+            if isinstance(payload.get("id"), str):
+                sid = payload["id"]
+            if isinstance(payload.get("cwd"), str):
+                cwd = payload["cwd"]
+            git = payload.get("git")
+            if isinstance(git, dict) and isinstance(git.get("branch"), str):
+                branch = git["branch"]
+            first_ts = parse_ts(payload.get("timestamp")) or first_ts
+            continue
+        if rtype == "turn_context" and not cwd and isinstance(payload.get("cwd"), str):
+            cwd = payload["cwd"]
+            continue
+        if rtype != "response_item":
+            continue
+        ptype = payload.get("type")
+        if ptype == "message":
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            blocks = payload.get("content")
+            if isinstance(blocks, str):
+                blocks = [{"text": blocks}]
+            texts = [block["text"] for block in (blocks or []) if isinstance(block, dict)
+                     and isinstance(block.get("text"), str) and block["text"].strip()]
+            if not texts:
+                continue
+            text = "\n".join(texts).strip()
+            if role == "user" and codex_user_noise(text):
+                continue
+            if ts:
+                first_ts = first_ts or ts
+                last_ts = ts
+            msgs.append({"role": role, "text": text, "ts": ts})
+            if role == "user" and first_prompt is None:
+                first_prompt = text
+        elif ptype in ("function_call", "custom_tool_call"):
+            inp = payload.get("arguments") if ptype == "function_call" else payload.get("input")
+            if inp is None:
+                inp = payload.get("arguments", payload.get("input"))
+            if ts:
+                last_ts = ts
+            msgs.append({"role": "tool", "name": str(payload.get("name") or "tool"),
+                         "text": summarize_tool(payload.get("name"), inp), "ts": ts})
+        elif ptype in ("function_call_output", "custom_tool_call_output"):
+            msgs.append({"role": "result", "text": content_text(payload.get("output"))[:RESULT_CAP],
+                         "ts": ts})
+    if not first_prompt:
+        first_prompt = next((msg["text"] for msg in msgs if msg["role"] == "assistant"), None)
+    title = one_line(first_prompt)[:TITLE_MAX] if first_prompt else None
+    return make_summary("codex", sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
+
+
+def make_summary(source: str, sid: str, path: str, cwd: Optional[str], branch: Optional[str],
+           title: Optional[str], first_ts: Optional[float], last_ts: Optional[float],
+           msgs: List[Msg]) -> Summary:
+    """Build the index Summary from parsed fields and messages."""
+    n_user = sum(1 for m in msgs if m["role"] == "user")
+    n_asst = sum(1 for m in msgs if m["role"] == "assistant")
+    # "blob" is the text the filter searches: prompts, replies and tool names (not tool
+    # results: too big and too noisy), lowercased once here, capped at BLOB_CAP.
+    blob: List[str] = []
+    size = 0
+    for m in msgs:
+        if m["role"] in ("user", "assistant"):
+            piece = m["text"]
+        elif m["role"] == "tool":
+            piece = m.get("name", "")
+        else:
+            continue
+        blob.append(piece)
+        size += len(piece) + 1
+        if size > BLOB_CAP:
+            break
+    try:
+        st = os.stat(path)
+        mtime = st.st_mtime
+    except OSError:
+        mtime = 0
+    return {
+        "source": source, "id": sid, "path": path, "cwd": cwd or "", "branch": branch or "",
+        "title": one_line(title or ""), "first_ts": first_ts or mtime, "last_ts": last_ts or first_ts or mtime,
+        "n_user": n_user, "n_asst": n_asst, "blob": "\n".join(blob)[:BLOB_CAP].lower(),
+    }
+
+
+def parse_any(source: str, path: str) -> Tuple[Summary, List[Msg]]:
+    return parse_claude(path) if source == "claude" else parse_codex(path)
+
+
+# ---------------------------------------------------------------- index
+
+class Session(object):
+    """A session as the UI sees it: the index Summary fields plus derived search text."""
+    # Fields come from the index summary (see make_summary()) via __dict__.update.
+    source: str
+    id: str
+    path: str
+    cwd: str
+    branch: str
+    title: str
+    first_ts: float
+    last_ts: float
+    n_user: int
+    n_asst: int
+    blob: str
+    project: str
+    search_text: str
+
+    def __init__(self, d: Summary) -> None:
+        self.__dict__.update(d)
+        self.project = os.path.basename(self.cwd.rstrip("/")) if self.cwd else "-"
+        if not self.title:
+            self.title = "(untitled)"
+        self.search_text = "\n".join((self.title, self.project, self.cwd, self.blob)).lower()
+
+    def resume_argv(self) -> List[str]:
+        return build_resume_argv(self.source, self.id)[0]
+
+    def resume_warning(self) -> Optional[str]:
+        """Why the configured resume command was unusable (default is used), or None."""
+        return build_resume_argv(self.source, self.id)[1]
+
+    def resume_cmd(self) -> str:
+        cmd = " ".join(shell_quote(w) for w in self.resume_argv())
+        return ("cd %s && %s" % (shell_quote(self.cwd), cmd)) if self.cwd else cmd
+
+
+# source -> command template from --claude-cmd/--codex-cmd. A module global, written once
+# by main() before anything reads it, because resume commands are built deep inside
+# Session/App; threading it through every layer would add plumbing for no benefit.
+CMD_OVERRIDES: Dict[str, str] = {}
+DEFAULT_CMDS: Dict[str, str] = {"claude": "claude", "codex": "codex"}
+DEFAULT_RESUME_ARGS: Dict[str, List[str]] = {"claude": ["--resume", "{id}"], "codex": ["resume", "{id}"]}
+
+
+def resume_template(source: str) -> str:
+    """Command template: CLI flag, then AI_SESSIONS_<SRC>_CMD, then the bare command."""
+    return (CMD_OVERRIDES.get(source)
+            or os.environ.get("AI_SESSIONS_%s_CMD" % source.upper())
+            or DEFAULT_CMDS[source])
+
+
+def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
+    """Returns (argv, warning). warning is None unless the template was unusable."""
+    warn: Optional[str] = None
+    try:
+        words = shlex.split(resume_template(source))
+    except ValueError as e:
+        words, warn = [], "bad %s command: %s" % (source, e)
+    if not words:
+        words = [DEFAULT_CMDS[source]]
+        warn = warn or "empty %s command" % source
+    if not any("{id}" in w for w in words):
+        words = words + DEFAULT_RESUME_ARGS[source]
+    return [w.replace("{id}", sid) for w in words], warn
+
+
+def shell_quote(s: str) -> str:
+    if re.match(r"^[\w@%+=:,./-]+$", s):
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def claude_dir() -> str:
+    return os.path.expanduser(os.environ.get("AI_SESSIONS_CLAUDE_DIR") or "~/.claude/projects")
+
+
+def codex_dir() -> str:
+    return os.path.expanduser(os.environ.get("AI_SESSIONS_CODEX_DIR") or "~/.codex")
+
+
+def cache_path() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "ai-sessions", "index.json")
+
+
+def discover() -> List[Tuple[str, str]]:
+    """List every transcript file as (source, path) without opening any of them."""
+    found: List[Tuple[str, str]] = []
+    root = claude_dir()
+    try:
+        for d in os.scandir(root):
+            # ~/.claude/projects/memory holds memory files, not session transcripts.
+            if not d.is_dir(follow_symlinks=True) or d.name == "memory":
+                continue
+            try:
+                for f in os.scandir(d.path):
+                    if f.name.endswith(".jsonl") and f.is_file():
+                        found.append(("claude", f.path))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    sess = os.path.join(codex_dir(), "sessions")
+    for dp, _dn, fn in os.walk(sess):
+        for n in fn:
+            if n.startswith("rollout-") and n.endswith(".jsonl"):
+                found.append(("codex", os.path.join(dp, n)))
+    return found
+
+
+def read_codex_titles() -> Dict[str, str]:
+    """Map Codex session id -> thread name from session_index.jsonl (may be absent)."""
+    names: Dict[str, str] = {}
+    for o in iter_json(os.path.join(codex_dir(), "session_index.jsonl")):
+        if isinstance(o.get("id"), str) and isinstance(o.get("thread_name"), str) \
+                and o["thread_name"].strip():
+            names[o["id"]] = one_line(o["thread_name"])
+    return names
+
+
+def load_sessions(progress: bool = False) -> List[Session]:
+    """Return all sessions that have at least one user/assistant message.
+
+    Parsing every transcript on each start would be slow, so summaries are cached in
+    $XDG_CACHE_HOME/ai-sessions/index.json, keyed by file path. An entry is reused only
+    if the file's mtime and size and the source (claude/codex) are unchanged; otherwise
+    the file is re-parsed. Entries for files that vanished are pruned, but only under
+    the roots scanned this run, so pointing AI_SESSIONS_*_DIR elsewhere temporarily does
+    not discard the cache for the real dirs. The cache is rewritten atomically
+    (temp file + rename) and only when something changed. A cache from another
+    INDEX_VERSION, or a corrupt one, is ignored.
+
+    Codex titles from session_index.jsonl are applied here at load time, after the
+    cache, rather than stored in it: that file changes independently of the rollouts,
+    so caching its names would leave them stale.
+    """
+    cp = cache_path()
+    cache: Dict[str, Any] = {}
+    try:
+        with open(cp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == INDEX_VERSION:
+            cache = data.get("files") or {}
+    except (OSError, ValueError):
+        cache = {}
+    found = discover()
+    seen = set()
+    result: List[Session] = []
+    dirty = False
+    todo: List[Tuple[str, str, os.stat_result]] = []
+    entries: Dict[str, Dict[str, Any]] = {}
+    for source, path in found:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        seen.add(path)
+        e = cache.get(path)
+        if isinstance(e, dict) and e.get("mtime") == st.st_mtime and e.get("size") == st.st_size \
+                and isinstance(e.get("summary"), dict) and e["summary"].get("source") == source:
+            entries[path] = e
+        else:
+            todo.append((source, path, st))
+    if todo and progress:
+        sys.stderr.write("ai-sessions: indexing %d file(s)...\n" % len(todo))
+    for source, path, st in todo:
+        try:
+            summary, _ = parse_any(source, path)
+        except Exception:  # never let one bad file break the browser
+            continue
+        entries[path] = {"mtime": st.st_mtime, "size": st.st_size, "summary": summary}
+        dirty = True
+    roots = (claude_dir(), os.path.join(codex_dir(), "sessions"))
+    merged = dict(cache)
+    merged.update(entries)
+    for p in list(merged):
+        if p not in seen and p.startswith(roots):
+            del merged[p]
+            dirty = True
+    if dirty:
+        try:
+            os.makedirs(os.path.dirname(cp), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cp), prefix=".index-", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"version": INDEX_VERSION, "files": merged}, f)
+            os.replace(tmp, cp)
+        except (OSError, TypeError, ValueError):
+            pass
+    titles = read_codex_titles()
+    for path, e in entries.items():
+        s = dict(e["summary"])
+        if s["source"] == "codex" and s["id"] in titles:
+            s["title"] = titles[s["id"]]
+        if s["n_user"] + s["n_asst"] == 0:
+            continue
+        result.append(Session(s))
+    return result
+
+
+def filter_sessions(sessions: List[Session], query: str = "", source: str = "all",
+                    project: Optional[str] = None) -> List[Session]:
+    """Sessions matching source ("all"/"claude"/"codex"), exact project cwd, and query.
+
+    The query is split on whitespace; every term must appear (case-insensitive
+    substring) in the session's title, project, cwd or transcript text.
+    """
+    terms = terms_of(query)
+    out: List[Session] = []
+    for s in sessions:
+        if source != "all" and s.source != source:
+            continue
+        if project is not None and s.cwd != project:
+            continue
+        if terms and not all(t in s.search_text for t in terms):
+            continue
+        out.append(s)
+    return out
+
+
+def sort_sessions(sessions: List[Session], mode: str = "last") -> List[Session]:
+    key: Callable[[Session], float] = (
+        (lambda s: s.last_ts) if mode == "last" else (lambda s: s.first_ts))
+    return sorted(sessions, key=key, reverse=True)
+
+
+# ---------------------------------------------------------------- rendering
+
+# LRU cache of fully parsed transcripts (they are not stored in the index), keyed by
+# (path, mtime) so a transcript that is still being written is re-read.
+_parsed: "collections.OrderedDict[Tuple[str, float], List[Msg]]" = collections.OrderedDict()
+
+
+def get_transcript(s: Session) -> List[Msg]:
+    """Messages of a session, parsed on demand and kept in a small LRU cache."""
+    try:
+        mt = os.stat(s.path).st_mtime
+    except OSError:
+        mt = 0
+    k = (s.path, mt)
+    if k in _parsed:
+        _parsed.move_to_end(k)
+        return _parsed[k]
+    try:
+        _, msgs = parse_any(s.source, s.path)
+    except Exception:
+        msgs = []
+    _parsed[k] = msgs
+    while len(_parsed) > TRANSCRIPT_CACHE_SIZE:
+        _parsed.popitem(last=False)
+    return msgs
+
+
+def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
+           mine_only: bool = False) -> Tuple[List[Line], int]:
+    """Return (lines, body_start) for a session at the given display width.
+
+    lines are (text, kind) pairs, already wrapped/clipped to width. The first
+    body_start lines are the header (title, id, dir, branch, dates, counts, rule);
+    the transcript body follows. Kinds: title, meta, dim (header); user / asst (speaker
+    labels); text (message body); tool (calls and slash commands); result (tool output).
+    show_results includes tool results; mine_only keeps only your own input (prompts
+    and slash commands).
+    """
+    width = max(width, 10)
+    lines: List[Line] = []
+
+    def add_wrapped(text: str, kind: str, prefix: str = "") -> None:
+        for ln in wrap(text, width - len(prefix)):
+            lines.append(((prefix + ln) if ln else "", kind))
+
+    add_wrapped(s.title, "title")
+    lines.append(("%s   %s" % (LABEL[s.source], s.id), "meta"))
+    add_wrapped("Dir:     " + (s.cwd or "-"), "meta")
+    if s.branch:
+        add_wrapped("Branch:  " + s.branch, "meta")
+    lines.append(("Started: %s   Updated: %s" % (fmt_ts(s.first_ts), fmt_ts(s.last_ts)), "meta"))
+    lines.append(("Messages: %d you, %d %s" % (s.n_user, s.n_asst, ASSISTANT_NAME[s.source].lower()),
+                  "meta"))
+    lines.append(("-" * min(width, 200), "dim"))
+    body_start = len(lines)
+    for m in msgs:
+        r = m["role"]
+        if r == "result" and not show_results:
+            continue
+        if mine_only and r not in ("user", "cmd"):
+            continue
+        if r in ("user", "assistant"):
+            if lines and lines[-1][0] != "":
+                lines.append(("", "text"))
+            who = "You:" if r == "user" else ASSISTANT_NAME[s.source] + ":"
+            lines.append((who + ("  " + fmt_ts(m["ts"], False) if m.get("ts") else ""),
+                          "user" if r == "user" else "asst"))
+            add_wrapped(m["text"], "text", "  ")
+        elif r == "cmd":
+            lines.append(("  > " + clip(clean(m["text"]), width - 4), "tool"))
+        elif r == "tool":
+            lines.append(("  → " + clip(clean(m["text"]), width - 4), "tool"))
+        elif r == "result":
+            body = [x for x in clean(m["text"]).split("\n") if x.strip()]
+            if not body:
+                body = ["(empty)"]
+            for x in body[:RESULT_PREVIEW_LINES]:
+                lines.append(("    ← " + clip(x.rstrip(), width - 6), "result"))
+            if len(body) > RESULT_PREVIEW_LINES:
+                lines.append(("    ← ... (%d more lines)" % (len(body) - RESULT_PREVIEW_LINES),
+                              "result"))
+    return lines, body_start
+
+
+def hit_lines(lines: List[Line], start: int, terms: List[str]) -> List[int]:
+    """Indexes of body lines (from `start`, so never the header) containing any term."""
+    if not terms:
+        return []
+    return [i for i in range(start, len(lines))
+            if lines[i][1] in ("text", "tool", "result", "user", "asst")
+            and any(t in lines[i][0].lower() for t in terms)]
+
+
+# ---------------------------------------------------------------- clipboard
+
+def copy_clipboard(text: str) -> Optional[str]:
+    """Copy text with the first available tool; return its name, or None if none worked."""
+    cands: List[List[str]] = [["pbcopy"]]
+    if os.environ.get("WAYLAND_DISPLAY"):
+        cands.append(["wl-copy"])
+    cands += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"],
+              ["wl-copy"]]
+    for cmd in cands:
+        if shutil.which(cmd[0]):
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                p.communicate(text.encode("utf-8"), timeout=5)
+                if p.returncode == 0:
+                    return cmd[0]
+            except (OSError, subprocess.SubprocessError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------- TUI
+
+HELP: List[str] = [
+    "ai-sessions - browse Claude Code and Codex transcripts",
+    "",
+    "List:",
+    "  Up/Down j/k      move            PgUp/PgDn   page",
+    "  g/G Home/End     first / last    J/K         scroll preview",
+    "  /                filter (terms ANDed; Enter accept, Esc clear, ^U erase)",
+    "  Tab              source: all > Claude Code > Codex",
+    "  p                toggle project filter (selected session's project)",
+    "  s                sort: last activity / start time",
+    "  t                show tool results in transcript (calls always shown)",
+    "  u                show only your input (prompts and slash commands)",
+    "  Enter / v        full-screen viewer",
+    "  r                resume session with the configured command, in its cwd",
+    "  e                edit resume command line, then resume",
+    "  y                copy resume command to clipboard",
+    "  R                rescan      ?  help      q  quit",
+    "",
+    "Viewer:",
+    "  j/k Up/Down PgUp/PgDn space b g/G   scroll",
+    "  /  search     n/N  next/previous hit     t  toggle tool results",
+    "  u  toggle showing only your input",
+    "  r  resume         e  edit resume command line, then resume",
+    "  y  copy resume command          ?  help",
+    "  q / Esc          back",
+    "",
+    "Press any key.",
+]
+
+
+class App(object):
+    def __init__(self, scr: Window, sessions: List[Session], query: str,
+                 source: str = "all") -> None:
+        self.scr = scr
+        self.all = sessions
+        self.query = query
+        self.source = source
+        self.project: Optional[str] = None
+        self.sort = "last"
+        self.show_results = False
+        self.mine_only = False
+        self.sel = 0
+        self.top = 0
+        self.preview_offset = 0
+        self.status = ""
+        self.resume: Optional[Session] = None
+        self.resume_override: Optional[List[str]] = None
+        self.view: List[Session] = []
+        self._preview_cache_key: Optional[Tuple[Any, ...]] = None
+        self._preview_cache: Tuple[List[Line], int, List[int]] = ([], 0, [])
+        self._preview_scroll_key: Optional[Tuple[Any, ...]] = None
+        self.attrs: Dict[str, int] = {}
+        self.init_colors()
+        self.refilter()
+        self.keymap = self.build_keymap()
+
+    # -- setup
+    def init_colors(self) -> None:
+        attrs: Dict[str, int] = {"plain": 0, "dim": curses.A_DIM, "bold": curses.A_BOLD, "rev": curses.A_REVERSE,
+             "cc": curses.A_BOLD, "cx": curses.A_UNDERLINE, "user": curses.A_BOLD,
+             "asst": curses.A_BOLD, "hl": curses.A_REVERSE | curses.A_BOLD,
+             "title": curses.A_BOLD, "tool": curses.A_DIM, "result": curses.A_DIM,
+             "meta": 0, "head": curses.A_REVERSE}
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                try:
+                    curses.use_default_colors()
+                    bg = -1
+                except curses.error:
+                    bg = curses.COLOR_BLACK
+                pairs = [(1, curses.COLOR_GREEN, bg), (2, curses.COLOR_MAGENTA, bg),
+                         (3, curses.COLOR_GREEN, bg), (4, curses.COLOR_CYAN, bg),
+                         (5, curses.COLOR_BLACK, curses.COLOR_YELLOW),
+                         (6, curses.COLOR_YELLOW, bg), (7, curses.COLOR_WHITE, curses.COLOR_BLUE)]
+                for n, f, b in pairs:
+                    curses.init_pair(n, f, b)
+                attrs["cc"] = curses.color_pair(1) | curses.A_BOLD
+                attrs["cx"] = curses.color_pair(2) | curses.A_BOLD
+                attrs["user"] = curses.color_pair(3) | curses.A_BOLD
+                attrs["asst"] = curses.color_pair(4) | curses.A_BOLD
+                attrs["hl"] = curses.color_pair(5)
+                attrs["title"] = curses.A_BOLD
+                attrs["tool"] = curses.color_pair(6)
+                attrs["result"] = curses.A_DIM
+                attrs["head"] = curses.color_pair(7) | curses.A_BOLD
+        except curses.error:
+            pass
+        self.attrs = attrs
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+    # -- drawing primitives
+    def put(self, y: int, x: int, s: str, attr: int = 0) -> None:
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:
+            pass
+
+    def text(self, y: int, x: int, s: str, maxw: int, attr: int,
+             pat: Optional[Pattern[str]] = None) -> None:
+        s = clip(clean(s).replace("\n", " "), maxw)
+        if not s or maxw <= 0:
+            return
+        if pat is None:
+            self.put(y, x, s, attr)
+            return
+        pos = 0
+        for m in pat.finditer(s):
+            if m.start() > pos:
+                self.put(y, x + str_width(s[:pos]), s[pos:m.start()], attr)
+            self.put(y, x + str_width(s[:m.start()]), m.group(0), self.attrs["hl"])
+            pos = m.end()
+        if pos < len(s):
+            self.put(y, x + str_width(s[:pos]), s[pos:], attr)
+
+    def fill(self, y: int, attr: int) -> None:
+        """Paint row y with attr across the full width (for the header/footer bars)."""
+        h, w = self.scr.getmaxyx()
+        self.put(y, 0, " " * (w - 1), attr)
+        # addstr into the bottom-right cell raises (the cursor cannot advance past it),
+        # so the last column is written with addch; the error it may also raise is
+        # harmless because the cell has already been drawn.
+        try:
+            self.scr.addch(y, w - 1, " ", attr)
+        except curses.error:
+            pass
+
+    # -- state
+    def refilter(self, keep: bool = True) -> None:
+        cur = self.view[self.sel].path if (keep and self.view and self.sel < len(self.view)) else None
+        v = filter_sessions(self.all, self.query, self.source, self.project)
+        self.view = sort_sessions(v, self.sort)
+        self.sel = 0
+        if cur:
+            for i, s in enumerate(self.view):
+                if s.path == cur:
+                    self.sel = i
+                    break
+        self.top = 0
+
+    def current(self) -> Optional[Session]:
+        return self.view[self.sel] if self.view and 0 <= self.sel < len(self.view) else None
+
+    def filter_desc(self) -> str:
+        parts: List[str] = []
+        if self.source != "all":
+            parts.append("source=" + LABEL[self.source])
+        if self.project is not None:
+            parts.append("project=" + (os.path.basename(self.project.rstrip("/")) or "-"))
+        if self.query:
+            parts.append("/" + self.query)
+        return " ".join(parts) if parts else "none"
+
+    # -- key input
+    def key(self) -> Optional[str]:
+        try:
+            k = self.scr.get_wch()
+        except KeyboardInterrupt:
+            return "CTRL_C"
+        except curses.error:
+            return None
+        if isinstance(k, str):
+            return {"\n": "ENTER", "\r": "ENTER", "\x1b": "ESC", "\x7f": "BS", "\b": "BS",
+                    "\x15": "CU", "\t": "TAB", "\x03": "CTRL_C"}.get(k, k)
+        names: Dict[int, str] = {curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_PPAGE: "PGUP",
+                 curses.KEY_NPAGE: "PGDN", curses.KEY_HOME: "HOME", curses.KEY_END: "END",
+                 curses.KEY_RESIZE: "RESIZE", curses.KEY_BACKSPACE: "BS", curses.KEY_ENTER: "ENTER",
+                 }
+        for nm, val in (("KEY_SR", "SUP"), ("KEY_SF", "SDOWN"), ("KEY_BTAB", "TAB")):
+            if hasattr(curses, nm):
+                names[getattr(curses, nm)] = val
+        # Unmapped special keys (F-keys etc.) get a name no keymap binds, so they are
+        # ignored; they must not collide with a printable key such as "?" (help).
+        return names.get(k, "UNKNOWN")
+
+    def edit(self, buf: str, k: Optional[str]) -> Tuple[str, Optional[str]]:
+        """Apply a line-edit key to buf; return (new, done) where done in (None,'ok','cancel')."""
+        if k == "ENTER":
+            return buf, "ok"
+        if k == "ESC" or k == "CTRL_C":
+            return buf, "cancel"
+        if k == "BS":
+            return buf[:-1], None
+        if k == "CU":
+            return "", None
+        if isinstance(k, str) and len(k) == 1 and k.isprintable():
+            return buf + k, None
+        return buf, None
+
+    # -- layout
+    def layout(self) -> Dict[str, Any]:
+        h, w = self.scr.getmaxyx()
+        body_top, body_bot = 1, h - 2  # inclusive rows
+        bh = body_bot - body_top + 1
+        if w >= SIDE_BY_SIDE_MIN_COLS:
+            lw = int(w * 0.45)
+            return {"mode": "side", "list": (body_top, 0, bh, lw),
+                    "prev": (body_top, lw + 1, bh, w - lw - 1), "sep": lw}
+        lh = max(3, bh // 2)
+        return {"mode": "stack", "list": (body_top, 0, lh, w),
+                "prev": (body_top + lh + 1, 0, bh - lh - 1, w), "sep": body_top + lh}
+
+    def draw(self) -> None:
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 6 or w < 24:
+            self.put(0, 0, clip("terminal too small", max(w - 1, 1)))
+            scr.refresh()
+            return
+        pat = term_regex(terms_of(self.query))
+        total = len(self.all)
+        self.fill(0, self.attrs["head"])
+        hdr = " ai-sessions  %d/%d sessions  filter: %s  sort: %s%s" % (
+            len(self.view), total, self.filter_desc(),
+            "last activity" if self.sort == "last" else "start time",
+            "  [results]" if self.show_results else "") + ("  [mine]" if self.mine_only else "")
+        self.put(0, 0, clip(hdr, w - 1), self.attrs["head"])
+        lay = self.layout()
+        self.draw_list(lay["list"], pat)
+        if lay["mode"] == "side":
+            for y in range(1, h - 1):
+                self.put(y, lay["sep"], "|", self.attrs["dim"])
+        else:
+            self.put(lay["sep"], 0, "-" * (w - 1), self.attrs["dim"])
+        self.draw_preview(lay["prev"], pat)
+        self.fill(h - 1, self.attrs["head"])
+        foot = self.status or (" j/k move  / filter  Tab source  p project  s sort  t results  u mine  "
+                               "Enter view  r resume  e edit+resume  y copy  R rescan  ? help  q quit")
+        self.put(h - 1, 0, clip(foot, w - 1), self.attrs["head"])
+        scr.refresh()
+
+    def draw_list(self, box: Box, pat: Optional[Pattern[str]]) -> None:
+        y0, x0, bh, bw = box
+        if bw < 20 or bh < 1:
+            return
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + bh:
+            self.top = self.sel - bh + 1
+        if not self.view:
+            self.put(y0, x0, clip("(no matching sessions)", bw - 1), self.attrs["dim"])
+            return
+        projw = min(14, max(6, bw // 6))
+        for i in range(bh):
+            idx = self.top + i
+            if idx >= len(self.view):
+                break
+            s = self.view[idx]
+            y = y0 + i
+            cur = idx == self.sel
+            extra = curses.A_REVERSE if cur else 0
+            if cur:
+                self.put(y, x0, " " * (bw - 1), extra)
+            x = x0
+            self.put(y, x, fmt_ts(s.last_ts if self.sort == "last" else s.first_ts), extra | self.attrs["dim"])
+            x += DATE_COL_WIDTH
+            self.put(y, x, TAG[s.source], extra | self.attrs["cc" if s.source == "claude" else "cx"])
+            x += TAG_COL_WIDTH
+            self.text(y, x, pad(s.project, projw), projw, extra, pat)
+            x += projw + 1
+            self.text(y, x, s.title, bw - 1 - (x - x0), extra, pat)
+
+    def preview_lines(self, s: Session, width: int,
+                      pat_terms: List[str]) -> Tuple[List[Line], int, List[int]]:
+        key = (s.path, s.last_ts, width, self.show_results, self.mine_only, tuple(pat_terms))
+        if self._preview_cache_key == key:
+            return self._preview_cache
+        msgs = get_transcript(s)
+        lines, start = render(s, msgs, width, self.show_results, self.mine_only)
+        hits = hit_lines(lines, start, pat_terms)
+        self._preview_cache_key = key
+        self._preview_cache = (lines, start, hits)
+        return self._preview_cache
+
+    def draw_preview(self, box: Box, pat: Optional[Pattern[str]]) -> None:
+        y0, x0, bh, bw = box
+        s = self.current()
+        if s is None or bh < 1 or bw < 12:
+            return
+        terms = terms_of(self.query)
+        lines, start, hits = self.preview_lines(s, bw - 1, terms)
+        selkey = (s.path, tuple(terms), self.show_results, self.mine_only)
+        if selkey != self._preview_scroll_key:
+            self._preview_scroll_key = selkey
+            self.preview_offset = max(0, hits[0] - 2) if hits else 0
+        self.preview_offset = max(0, min(self.preview_offset, max(0, len(lines) - bh)))
+        for i in range(bh):
+            j = self.preview_offset + i
+            if j >= len(lines):
+                break
+            t, kind = lines[j]
+            self.text(y0 + i, x0, t, bw - 1, self.attrs.get(kind, 0), pat)
+
+    # -- actions
+    def move(self, d: int) -> None:
+        if self.view:
+            self.sel = max(0, min(len(self.view) - 1, self.sel + d))
+
+    def list_height(self) -> int:
+        return max(1, self.layout()["list"][2])
+
+    def preview_height(self) -> int:
+        return max(1, self.layout()["prev"][2])
+
+    # -- key handlers: each returns True to leave the main loop (quit / resume chosen)
+    def on_quit(self) -> bool:
+        return True
+
+    def on_help(self) -> None:
+        self.help()
+
+    def on_down(self) -> None:
+        self.move(1)
+
+    def on_up(self) -> None:
+        self.move(-1)
+
+    def on_page_down(self) -> None:
+        self.move(self.list_height() - 1)
+
+    def on_page_up(self) -> None:
+        self.move(-(self.list_height() - 1))
+
+    def on_first(self) -> None:
+        self.sel = 0
+
+    def on_last(self) -> None:
+        self.sel = max(0, len(self.view) - 1)
+
+    def on_preview_down(self) -> None:
+        self.preview_offset += max(1, self.preview_height() // 2)
+
+    def on_preview_up(self) -> None:
+        self.preview_offset = max(0, self.preview_offset - max(1, self.preview_height() // 2))
+
+    def on_filter(self) -> None:
+        self.filter_mode()
+
+    def on_clear_filter(self) -> None:
+        if self.query:
+            self.query = ""
+            self.refilter()
+
+    def on_cycle_source(self) -> None:
+        order = ["all", "claude", "codex"]
+        self.source = order[(order.index(self.source) + 1) % len(order)]
+        self.refilter()
+
+    def on_toggle_project(self) -> None:
+        s = self.current()
+        if self.project is not None:
+            self.project = None
+        elif s is not None and s.cwd:
+            self.project = s.cwd
+        self.refilter()
+
+    def on_toggle_sort(self) -> None:
+        self.sort = "start" if self.sort == "last" else "last"
+        self.refilter()
+
+    def on_toggle_results(self) -> None:
+        self.show_results = not self.show_results
+        self.status = " tool results %s" % ("shown" if self.show_results else "hidden")
+
+    def on_toggle_mine(self) -> None:
+        self.mine_only = not self.mine_only
+        self.status = " showing %s" % ("only your input" if self.mine_only else "full transcript")
+
+    def on_rescan(self) -> None:
+        self.all = load_sessions()
+        self.refilter()
+        self.status = " rescanned: %d sessions" % len(self.all)
+
+    def on_open(self) -> bool:
+        s = self.current()
+        return s is not None and self.viewer(s)
+
+    def on_resume(self) -> bool:
+        s = self.current()
+        if s is None or not self.can_resume(s):
+            return False
+        self.resume = s
+        return True
+
+    def on_edit_resume(self) -> bool:
+        s = self.current()
+        if s is None or not self.can_resume(s):
+            return False
+        argv = self.edit_resume_command(s)
+        if argv is None:
+            return False
+        self.resume = s
+        self.resume_override = argv
+        return True
+
+    def on_copy(self) -> None:
+        s = self.current()
+        if s is not None:
+            self.copy_resume_command(s)
+
+    def copy_resume_command(self, s: Session) -> None:
+        """Copy s's resume command to the clipboard, reporting the outcome in the status."""
+        how = copy_clipboard(s.resume_cmd())
+        self.status = (" copied via %s: %s" % (how, s.resume_cmd())) if how \
+            else " no clipboard tool found (pbcopy/wl-copy/xclip/xsel)"
+
+    def can_resume(self, s: Session) -> bool:
+        """Resuming runs in the session's cwd; refuse (with a status message) if it is gone."""
+        if s.cwd and not os.path.isdir(s.cwd):
+            self.status = " cwd no longer exists: " + s.cwd
+            return False
+        return True
+
+    def edit_resume_command(self, s: Session, redraw_screen: bool = True) -> Optional[List[str]]:
+        """Let the user edit the resume command line; return its argv, or None if cancelled."""
+        initial = " ".join(shell_quote(w) for w in s.resume_argv())
+        while True:
+            buf, ok = self.prompt("resume: ", initial, redraw_screen=redraw_screen)
+            if not ok:
+                self.status = " resume cancelled"
+                return None
+            try:
+                argv = shlex.split(buf)
+            except ValueError as e:
+                self.status = " bad command: %s" % e
+                initial = buf  # keep what was typed so it can be fixed
+                continue
+            if not argv:
+                self.status = " resume cancelled"
+                return None
+            return argv
+
+    def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
+        """Key name (see App.key) -> handler for the session list."""
+        bindings: List[Tuple[Tuple[str, ...], Callable[[], Optional[bool]]]] = [
+            (("q", "CTRL_C"), self.on_quit),
+            (("?",), self.on_help),
+            (("j", "DOWN"), self.on_down),
+            (("k", "UP"), self.on_up),
+            (("PGDN",), self.on_page_down),
+            (("PGUP",), self.on_page_up),
+            (("g", "HOME"), self.on_first),
+            (("G", "END"), self.on_last),
+            (("J", "SDOWN"), self.on_preview_down),
+            (("K", "SUP"), self.on_preview_up),
+            (("/",), self.on_filter),
+            (("ESC",), self.on_clear_filter),
+            (("TAB",), self.on_cycle_source),
+            (("p",), self.on_toggle_project),
+            (("s",), self.on_toggle_sort),
+            (("t",), self.on_toggle_results),
+            (("u",), self.on_toggle_mine),
+            (("R",), self.on_rescan),
+            (("ENTER", "v"), self.on_open),
+            (("r",), self.on_resume),
+            (("e",), self.on_edit_resume),
+            (("y",), self.on_copy),
+        ]
+        return {name: fn for names, fn in bindings for name in names}
+
+    def run(self) -> None:
+        """Main loop: draw, read a key, dispatch. Returns on quit or when a resume is chosen."""
+        while True:
+            self.draw()
+            k = self.key()
+            self.status = ""  # status messages last for one keypress
+            if k is None or k == "RESIZE":
+                continue
+            handler = self.keymap.get(k)
+            if handler is not None and handler():
+                return
+
+    def prompt(self, label: str, initial: str, live: Optional[Callable[[str], None]] = None,
+               redraw_screen: bool = True) -> Tuple[str, bool]:
+        """Footer line editor. Returns (text, accepted); Esc/^C cancel, ^U erases.
+
+        live(text) is called after each edit (the filter prompt re-filters as you type).
+        redraw_screen=True repaints the whole list view each keystroke (so live changes
+        show); the full-screen viewer passes False to keep its already-drawn frame and
+        only repaint the footer.
+        """
+        buf = initial
+        while True:
+            if redraw_screen:
+                self.draw()
+            h, w = self.scr.getmaxyx()
+            if h >= 2 and w > 2:
+                self.fill(h - 1, self.attrs["head"])
+                shown = label + buf
+                self.put(h - 1, 0, clip(" " + shown, w - 2), self.attrs["head"])
+                self.put(h - 1, min(w - 2, 1 + str_width(clip(shown, w - 3))), "_",
+                         self.attrs["head"])
+                self.scr.refresh()
+            k = self.key()
+            if k is None or k == "RESIZE":
+                continue
+            buf, done = self.edit(buf, k)
+            if done == "ok":
+                return buf, True
+            if done == "cancel":
+                return buf, False
+            if live is not None:
+                live(buf)
+
+    def filter_mode(self) -> None:
+        def live(b: str) -> None:
+            self.query = b
+            self.refilter()
+        buf, ok = self.prompt("/", self.query, live)
+        self.query = buf if ok else ""  # Esc clears the filter rather than restoring it
+        self.refilter()
+
+    def help(self) -> None:
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        for i, ln in enumerate(HELP[:h - 1]):
+            self.put(i, 1, clip(ln, w - 2), self.attrs["bold"] if i == 0 else 0)
+        self.scr.refresh()
+        while True:
+            k = self.key()
+            if k not in (None, "RESIZE"):
+                return
+
+    def viewer(self, s: Session) -> bool:
+        """Open the full-screen viewer; True if a resume was chosen from it."""
+        Viewer(self, s).run()
+        return self.resume is not None
+
+
+class Viewer(object):
+    """Full-screen transcript viewer with search, opened from the list with Enter.
+
+    Shares the App's window, colors and drawing helpers. Its t / u toggles change
+    app.show_results / app.mine_only, which persist when you return to the list.
+    The search query starts as the list filter but is local to the viewer.
+    Its y and ? copy the resume command and show help, as in the list.
+    Its r / e set app.resume (and app.resume_override) and leave the viewer, which
+    then also ends the list's main loop.
+    """
+
+    def __init__(self, app: App, s: Session) -> None:
+        self.app = app
+        self.session = s
+        self.msgs = get_transcript(s)
+        self.query = app.query
+        self.offset = 0          # first visible line
+        self.hit_index = -1      # current search hit (-1: none chosen yet)
+        self.body_height = 1     # visible rows, set by draw()
+        self.status = ""
+        self.lines: List[Line] = []
+        self.hits: List[int] = []
+        # Re-render only when one of (width, results, mine, terms) changes.
+        self._render_key: Optional[Tuple[Any, ...]] = None
+        self.keymap = self.build_keymap()
+
+    # -- key handlers: True means "leave the viewer"
+    def on_back(self) -> bool:
+        return True
+
+    def on_line_down(self) -> None:
+        self.offset += 1
+
+    def on_line_up(self) -> None:
+        self.offset -= 1
+
+    def on_page_down(self) -> None:
+        self.offset += self.body_height - 1
+
+    def on_page_up(self) -> None:
+        self.offset -= self.body_height - 1
+
+    def on_top(self) -> None:
+        self.offset = 0
+
+    def on_bottom(self) -> None:
+        self.offset = len(self.lines)  # draw() clamps to the last page
+
+    def on_toggle_results(self) -> None:
+        self.app.show_results = not self.app.show_results
+
+    def on_toggle_mine(self) -> None:
+        self.app.mine_only = not self.app.mine_only
+
+    def on_resume(self) -> bool:
+        if not self.app.can_resume(self.session):
+            self.take_app_status()
+            return False
+        self.app.resume = self.session
+        return True
+
+    def on_edit_resume(self) -> bool:
+        app = self.app
+        if not app.can_resume(self.session):
+            self.take_app_status()
+            return False
+        argv = app.edit_resume_command(self.session, redraw_screen=False)
+        if argv is None:
+            self.take_app_status()
+            return False
+        app.resume = self.session
+        app.resume_override = argv
+        return True
+
+    def on_copy(self) -> None:
+        self.app.copy_resume_command(self.session)
+        self.take_app_status()
+
+    def on_help(self) -> None:
+        self.app.help()
+
+    def take_app_status(self) -> None:
+        """Show a status message the App's shared helpers left, in the viewer's footer."""
+        self.status, self.app.status = self.app.status, ""
+
+    def on_next_hit(self) -> None:
+        self.goto_hit(1)
+
+    def on_prev_hit(self) -> None:
+        self.goto_hit(-1)
+
+    def goto_hit(self, step: int) -> None:
+        if self.hits:
+            self.hit_index = (self.hit_index + step) % len(self.hits)
+            self.offset = max(0, self.hits[self.hit_index] - self.body_height // 3)
+
+    def on_search(self) -> None:
+        buf, ok = self.app.prompt("/", self.query, redraw_screen=False)
+        if ok:
+            self.query = buf
+            self.hit_index = -1
+            self._render_key = None  # force a re-render with the new terms
+
+    def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
+        bindings: List[Tuple[Tuple[str, ...], Callable[[], Optional[bool]]]] = [
+            (("q", "ESC", "CTRL_C"), self.on_back),
+            (("j", "DOWN", "ENTER"), self.on_line_down),
+            (("k", "UP"), self.on_line_up),
+            (("PGDN", " ", "f"), self.on_page_down),
+            (("PGUP", "b"), self.on_page_up),
+            (("g", "HOME"), self.on_top),
+            (("G", "END"), self.on_bottom),
+            (("t",), self.on_toggle_results),
+            (("u",), self.on_toggle_mine),
+            (("n",), self.on_next_hit),
+            (("N",), self.on_prev_hit),
+            (("/",), self.on_search),
+            (("r",), self.on_resume),
+            (("e",), self.on_edit_resume),
+            (("y",), self.on_copy),
+            (("?",), self.on_help),
+        ]
+        return {name: fn for names, fn in bindings for name in names}
+
+    def handle_key(self, k: str) -> bool:
+        handler = self.keymap.get(k)
+        return handler is not None and bool(handler())
+
+    # -- drawing
+    def draw(self, h: int, w: int) -> None:
+        app = self.app
+        terms = terms_of(self.query)
+        render_key = (w, app.show_results, app.mine_only, tuple(terms))
+        if render_key != self._render_key:
+            self._render_key = render_key
+            self.lines, start = render(self.session, self.msgs, w - 1, app.show_results,
+                                       app.mine_only)
+            self.hits = hit_lines(self.lines, start, terms)
+            if self.hit_index >= len(self.hits):
+                self.hit_index = -1
+            if self.hits and self.hit_index < 0:
+                self.hit_index = 0
+                self.offset = max(0, self.hits[0] - h // 3)
+        bh = self.body_height = h - 2
+        self.offset = max(0, min(self.offset, max(0, len(self.lines) - bh)))
+        pat = term_regex(terms)
+        app.scr.erase()
+        app.fill(0, app.attrs["head"])
+        title = clip(self.session.title, max(0, w - 40))
+        hit_text = ("hit %d/%d" % (self.hit_index + 1, len(self.hits))) if self.hits else \
+            ("no hits" if terms else "")
+        app.put(0, 0, clip(" %s %s  %s" % (TAG[self.session.source], title, hit_text), w - 1),
+                app.attrs["head"])
+        for i in range(bh):
+            j = self.offset + i
+            if j >= len(self.lines):
+                break
+            t, kind = self.lines[j]
+            app.text(1 + i, 0, t, w - 1, app.attrs.get(kind, 0), pat)
+        app.fill(h - 1, app.attrs["head"])
+        pct = 100 if len(self.lines) <= bh else int(100 * (self.offset + bh) / len(self.lines))
+        foot = self.status or (" j/k scroll  spc/b page  g/G ends  / search  n/N hit  "
+                               "t results  u mine  r/e resume  y copy  ? help  q back  [%d%%]" % min(pct, 100))
+        app.put(h - 1, 0, clip(foot, w - 1), app.attrs["head"])
+        app.scr.refresh()
+        self.status = ""
+
+    def run(self) -> None:
+        app = self.app
+        while True:
+            h, w = app.scr.getmaxyx()
+            if h < 4 or w < 12:
+                app.scr.erase()
+                app.put(0, 0, "too small")
+                app.scr.refresh()
+                if app.key() in ("q", "ESC", "CTRL_C"):
+                    return
+                continue
+            self.draw(h, w)
+            k = app.key()
+            if k is None or k == "RESIZE":
+                continue
+            if self.handle_key(k):
+                return
+
+
+def browse(scr: Window, sessions: List[Session], query: str,
+           source: str) -> Tuple[Optional[Session], Optional[List[str]]]:
+    """Run the interactive browser (called inside curses.wrapper).
+
+    Returns (session chosen for resume or None, edited resume argv or None).
+    """
+    scr.keypad(True)
+    app = App(scr, sessions, query, source)
+    app.run()
+    return app.resume, app.resume_override
+
+
+def run_tui(query: str, source: Optional[str] = None) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.stderr.write("ai-sessions: interactive mode needs a terminal (try --list)\n")
+        return 2
+    sessions = load_sessions(progress=True)
+    try:
+        chosen, argv_override = curses.wrapper(browse, sessions, query, source or "all")
+    except KeyboardInterrupt:
+        return 130
+    if chosen is not None:
+        # The terminal is restored by now; replace this process with the resumed CLI,
+        # started in the session's own directory (Claude finds sessions per cwd).
+        if chosen.cwd and os.path.isdir(chosen.cwd):
+            os.chdir(chosen.cwd)
+        argv = argv_override or chosen.resume_argv()
+        if not argv_override:
+            warning = chosen.resume_warning()
+            if warning:
+                sys.stderr.write("ai-sessions: %s; using default\n" % warning)
+        if not shutil.which(argv[0]):
+            sys.stderr.write("ai-sessions: %s not found in PATH\n" % argv[0])
+            return 127
+        os.execvp(argv[0], argv)
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+def cmd_list(sessions: List[Session], query: str, source: Optional[str]) -> int:
+    for s in sort_sessions(filter_sessions(sessions, query, source or "all")):
+        row = (fmt_ts(s.last_ts), s.source, s.id, s.project, s.title)
+        sys.stdout.write("\t".join(one_line(c) for c in row) + "\n")
+    return 0
+
+
+def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool = False) -> int:
+    ms = [s for s in sessions if s.id == ident] or [s for s in sessions if s.id.startswith(ident)]
+    if not ms:
+        sys.stderr.write("ai-sessions: no session matches %r\n" % ident)
+        return 1
+    if len(ms) > 1:
+        sys.stderr.write("ai-sessions: %r is ambiguous:\n" % ident)
+        for s in ms:
+            sys.stderr.write("  %s %s %s\n" % (s.source, s.id, s.title))
+        return 1
+    s = ms[0]
+    lines, _ = render(s, get_transcript(s), 100, tools, mine_only)
+    sys.stdout.write("\n".join(t for t, _ in lines) + "\n")
+    return 0
+
+
+def main() -> int:
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    ap = argparse.ArgumentParser(
+        prog="ai-sessions",
+        description="Browse and search Claude Code and Codex CLI session transcripts. "
+                    "With no --list/--show, launches a curses browser (? for keys).")
+    ap.add_argument("query", nargs="*", help="initial filter (TUI) or search terms (with --list)")
+    ap.add_argument("--list", action="store_true",
+                    help="print tab-separated rows: date, source, id, project, title")
+    ap.add_argument("--search", metavar="QUERY", help="with --list: only sessions matching QUERY")
+    ap.add_argument("--source", choices=("claude", "codex"), help="restrict to one source")
+    ap.add_argument("--show", metavar="ID", help="print a transcript (id or unique prefix)")
+    ap.add_argument("--tools", action="store_true", help="with --show: include tool results")
+    ap.add_argument("--mine", action="store_true",
+                    help="with --show: only your input (prompts and slash commands)")
+    ap.add_argument("--claude-cmd", metavar="CMD",
+                    help="command to resume Claude sessions (default: $AI_SESSIONS_CLAUDE_CMD or "
+                         "'claude'); {id} is replaced by the session id, else '--resume ID' is appended")
+    ap.add_argument("--codex-cmd", metavar="CMD",
+                    help="command to resume Codex sessions (default: $AI_SESSIONS_CODEX_CMD or "
+                         "'codex'); {id} is replaced by the session id, else 'resume ID' is appended")
+    args = ap.parse_args()
+    if args.claude_cmd:
+        CMD_OVERRIDES["claude"] = args.claude_cmd
+    if args.codex_cmd:
+        CMD_OVERRIDES["codex"] = args.codex_cmd
+    stream: Any
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    q = " ".join(([args.search] if args.search else []) + args.query)
+    if args.list or args.show:
+        sessions = load_sessions()
+        if args.source:
+            sessions = [s for s in sessions if s.source == args.source]
+        try:
+            if args.show:
+                return cmd_show(sessions, args.show, args.tools, args.mine)
+            return cmd_list(sessions, q, args.source)
+        except BrokenPipeError:
+            try:
+                sys.stdout = None
+            except Exception:
+                pass
+            return 0
+    return run_tui(q, args.source)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,2 @@
+{"type":"summary","summary":"Empty session is omitted"}
+{"type":"user","cwd":"/work/beta","timestamp":"2025-03-05T08:00:00Z","message":{"role":"user","content":"<local-command-caveat>only noise</local-command-caveat>"}}
