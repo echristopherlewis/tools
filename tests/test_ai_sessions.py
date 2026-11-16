@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for scripts/ai-sessions (stdlib unittest, Python 3.6+).
+"""Tests for ai-sessions (stdlib unittest, Python 3.6+).
 
-Run from the repo root:  python3 scripts/tests/test_ai_sessions.py
+Run from the repo root:  python3 tests/test_ai_sessions.py
 
 Every test points AI_SESSIONS_CLAUDE_DIR / AI_SESSIONS_CODEX_DIR / XDG_CACHE_HOME at
 temporary directories, so the real ~/.claude, ~/.codex and ~/.cache are never read or
@@ -29,7 +29,7 @@ FIXTURES = os.path.join(HERE, "fixtures", "ai-sessions")
 
 
 def _load_module() -> Any:
-    """Import scripts/ai-sessions (no .py suffix) as a module."""
+    """Import ai-sessions (no .py suffix) as a module."""
     from importlib.machinery import SourceFileLoader
     loader = SourceFileLoader("ai_sessions", SCRIPT)
     spec = importlib.util.spec_from_loader("ai_sessions", loader)
