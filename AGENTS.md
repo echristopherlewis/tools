@@ -8,8 +8,11 @@ Small standalone CLI tools; see [README.md](README.md).
   no `from __future__ import annotations`), portable across macOS and Linux (BSD/GNU-compatible flags).
 - Always use type hints on Python function parameters and return values (and on
   variables where the type isn't obvious).
-- Give every non-trivial function a docstring that says what it does, with an example
-  input and the output it produces.
+- Write code that is easy for humans to understand: clear names, straightforward control
+  flow, and comments where the intent isn't obvious.
+- Give every non-trivial function a docstring that says what it does, describes each
+  argument and what is returned (if anything), and gives an example input and the output
+  it produces.
 - Keep all `.md` files (README, AGENTS.md, etc.) consistent with the project whenever
   behavior, structure, or conventions change. In particular, keep README in sync with
   behavior and environment variables (the `ai-sessions` module docstring lists them too).

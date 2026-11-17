@@ -106,6 +106,13 @@ TS_RE: Pattern[str] = re.compile(
 def parse_ts(v: Any) -> Optional[float]:
     """Epoch seconds from an ISO-8601 string or a numeric epoch; None if unusable.
 
+    Args:
+        v: ISO-8601 string (optional fraction, Z or +hh:mm offset) or a numeric epoch. Numbers above
+            1e11 are taken as milliseconds. Anything else gives None.
+
+    Returns:
+        Epoch seconds as a float, or None if v cannot be read as a time.
+
     Examples:
         parse_ts("2025-03-01T10:00:00.000Z") -> 1740823200.0
         parse_ts("2025-03-01T10:00:00+02:00") -> 1740816000
@@ -142,6 +149,13 @@ def fmt_ts(ts: Optional[float], with_date: bool = True) -> str:
     """Format an epoch timestamp as local time ("YYYY-MM-DD HH:MM", or "HH:MM" without the
     date); "-" when it is missing, zero or out of range.
 
+    Args:
+        ts: Epoch seconds, or None/0 for "unknown".
+        with_date: True for "YYYY-MM-DD HH:MM", False for just "HH:MM".
+
+    Returns:
+        The local-time text, or "-" when ts is missing, zero or out of range.
+
     Examples (local timezone UTC):
         fmt_ts(1740823200.0) -> "2025-03-01 10:00"
         fmt_ts(1740823200.0, with_date=False) -> "10:00"
@@ -159,6 +173,13 @@ def fmt_ts(ts: Optional[float], with_date: bool = True) -> str:
 def clean(s: Any) -> str:
     """Make text safe for a terminal cell grid.
 
+    Args:
+        s: Text to sanitize; non-strings are converted with str().
+
+    Returns:
+        s with tabs as 4 spaces, carriage returns removed and other control characters replaced by
+        spaces. Newlines are kept.
+
     Example: clean("a\\tb\\x07c") -> "a    b c"   (tab -> 4 spaces, control char -> space)
     """
     if not isinstance(s, str):
@@ -174,6 +195,12 @@ _wcache: Dict[str, int] = {}
 def char_width(c: str) -> int:
     """Terminal columns one character occupies: 0 for combining marks, 2 for wide/fullwidth
     (CJK), else 1. Results are memoized in _wcache.
+
+    Args:
+        c: A single character.
+
+    Returns:
+        The width in terminal columns: 0, 1 or 2.
 
     Examples: char_width("a") -> 1; char_width("日") -> 2; char_width("\\u0301") -> 0
     """
@@ -196,6 +223,9 @@ def str_width(s: str) -> int:
 def rule_chars() -> Tuple[str, str]:
     """(horizontal, vertical) separator characters: box-drawing when UTF-8, else ASCII.
 
+    Returns:
+        A (horizontal, vertical) pair of one-character strings.
+
     Examples: with a UTF-8 locale -> ("─", "│"); with an ASCII locale -> ("-", "|")
     """
     enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
@@ -204,6 +234,13 @@ def rule_chars() -> Tuple[str, str]:
 
 def clip(s: str, width: int) -> str:
     """Cut s to at most width display columns (wide chars count as 2).
+
+    Args:
+        s: Text to cut.
+        width: Maximum display width in terminal columns; <= 0 gives "".
+
+    Returns:
+        The longest prefix of s that fits in width columns.
 
     Examples:
         clip("日本語abc", 5) -> "日本"
@@ -225,6 +262,13 @@ def clip(s: str, width: int) -> str:
 def pad(s: str, width: int) -> str:
     """Clip s to width display columns, then right-pad with spaces to exactly width.
 
+    Args:
+        s: Text to fit.
+        width: Exact display width wanted, in terminal columns.
+
+    Returns:
+        s clipped to width columns, then padded with trailing spaces to exactly width.
+
     Examples:
         pad("ab", 5) -> "ab   "
         pad("日本語", 5) -> "日本 "   (the third wide char would not fit)
@@ -235,6 +279,14 @@ def pad(s: str, width: int) -> str:
 
 def wrap(text: str, width: int) -> List[str]:
     """Word-wrap text to a display width; blank-line runs collapse to one.
+
+    Args:
+        text: Text to wrap; may contain newlines. Leading indentation of a line is kept on its
+            continuation lines (up to half the width).
+        width: Display width in terminal columns; values below 4 are treated as 4.
+
+    Returns:
+        The wrapped lines, with no trailing blank lines.
 
     Examples:
         wrap("the quick brown fox jumps", 10) -> ["the quick", "brown fox", "jumps"]
@@ -285,6 +337,13 @@ def wrap(text: str, width: int) -> List[str]:
 def first_line(s: Any, n: int = FIRST_LINE_MAX) -> str:
     """First non-blank line of s, stripped and cut to n chars.
 
+    Args:
+        s: Any value; it is converted with str().
+        n: Maximum number of characters to keep (default FIRST_LINE_MAX).
+
+    Returns:
+        The first non-blank line, stripped and cut to n characters; "" if there is none.
+
     Examples:
         first_line("\\n  hi there \\nmore") -> "hi there"
         first_line("abcdef", 3) -> "abc"
@@ -299,6 +358,12 @@ def first_line(s: Any, n: int = FIRST_LINE_MAX) -> str:
 def one_line(s: Any) -> str:
     """Collapse all whitespace runs (including newlines) to single spaces.
 
+    Args:
+        s: Any value; it is converted with str().
+
+    Returns:
+        s with every whitespace run replaced by a single space, and the ends stripped.
+
     Example: one_line("a \\n b\\t c") -> "a b c"
     """
     return " ".join(str(s).split())
@@ -307,6 +372,12 @@ def one_line(s: Any) -> str:
 def terms_of(query: Optional[str]) -> List[str]:
     """Split a filter query into lowercase terms (all must match).
 
+    Args:
+        query: The raw filter text, or None.
+
+    Returns:
+        The whitespace-separated words of query, lowercased; [] when query is empty or None.
+
     Examples: terms_of("Foo  BAR") -> ["foo", "bar"]; terms_of(None) -> []
     """
     return [t for t in (query or "").lower().split() if t]
@@ -314,6 +385,12 @@ def terms_of(query: Optional[str]) -> List[str]:
 
 def term_regex(terms: List[str]) -> Optional[Pattern[str]]:
     """Case-insensitive regex matching any term, longest first (for highlighting).
+
+    Args:
+        terms: Lowercase search terms, such as the result of terms_of().
+
+    Returns:
+        A compiled case-insensitive regex that matches any term, or None if terms is empty.
 
     Examples:
         term_regex(["fo", "foobar"]).pattern -> "foobar|fo"
@@ -335,6 +412,14 @@ def summarize_tool(name: Any, inp: Any) -> str:
 
     inp is a dict (Claude), or a dict / JSON string / plain string (Codex). The
     argument shown is the first TOOL_KEYS entry present, else the first string value.
+
+    Args:
+        name: The tool name; None or empty becomes "tool".
+        inp: The tool's input: a dict, a JSON string (decoded if it starts with "{"), a plain
+            string, or anything else (then no argument is shown).
+
+    Returns:
+        "Name: argument", or just "Name" when no argument can be found.
 
     Examples:
         summarize_tool("Read", {"file_path": "/x"}) -> "Read: /x"
@@ -376,6 +461,12 @@ def content_text(c: Any) -> str:
     Content is a plain string or a list of strings / {"type":"text","text":...} blocks;
     other block kinds (images etc.) are dropped.
 
+    Args:
+        c: A string, a list of strings / {"type": "text", "text": ...} blocks, or anything else.
+
+    Returns:
+        The text parts joined with newlines; "" for unsupported content.
+
     Examples:
         content_text([{"type": "text", "text": "a"}, "b", {"type": "image"}]) -> "a\\nb"
         content_text("x") -> "x"
@@ -401,6 +492,12 @@ def content_text(c: Any) -> str:
 def iter_json(path: str) -> Iterator[Dict[str, Any]]:
     """Yield each JSON-object line of a .jsonl file, skipping blank/garbled lines.
 
+    Args:
+        path: Path of a .jsonl file (one JSON value per line).
+
+    Yields:
+        Each line that decodes to a JSON object (dict), in file order.
+
     Example: for a file whose lines are `{"type": "user"}`, `garbage`, `` and `[1]`,
     iter_json(path) yields only {"type": "user"}; a missing file yields nothing.
     """
@@ -423,6 +520,12 @@ def iter_json(path: str) -> Iterator[Dict[str, Any]]:
 def content_blocks(content: Any) -> Optional[List[Any]]:
     """Normalize Claude message content to a block list: a bare string becomes one text
     block; anything that is neither string nor list yields None (caller skips it).
+
+    Args:
+        content: A Claude message's "content": a string, a list of blocks, or something else.
+
+    Returns:
+        A list of blocks, or None if content is neither a string nor a list.
 
     Examples:
         content_blocks("hi") -> [{"type": "text", "text": "hi"}]
@@ -467,6 +570,14 @@ def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
     The session id is the filename stem. Title priority: custom-title > ai-title >
     summary > the first real prompt (shortened to TITLE_MAX). Later records of the
     same title type replace earlier ones.
+
+    Args:
+        path: Path of the Claude Code .jsonl transcript. The session id is its filename without
+            ".jsonl".
+
+    Returns:
+        A (summary, messages) tuple: summary is the index Summary (via make_summary), messages is
+        the list of Msg dicts in file order.
 
     Example: for ~/.claude/projects/-work-proj/abc.jsonl holding one user line
     {"type": "user", "cwd": "/work/proj", "timestamp": "2025-03-01T10:00:00Z",
@@ -562,6 +673,13 @@ def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
 def codex_user_noise(text: str) -> bool:
     """True for Codex user messages that are injected context, not typed prompts.
 
+    Args:
+        text: The text of a Codex user message.
+
+    Returns:
+        True if it is injected context (AGENTS.md text, an XML-style wrapper tag, ...) rather than
+        something the user typed.
+
     Examples:
         codex_user_noise("<environment_context>cwd: /x</environment_context>") -> True
         codex_user_noise("# AGENTS.md instructions for /x") -> True
@@ -596,6 +714,13 @@ def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
     of the filename stem: rollout-<timestamp>-<uuid> always ends in a 36-char UUID.
     Codex has no title records, so the title is the first user prompt (or the first
     assistant message); load_sessions() overrides it with session_index.jsonl names.
+
+    Args:
+        path: Path of the Codex rollout .jsonl file.
+
+    Returns:
+        A (summary, messages) tuple: summary is the index Summary (via make_summary), messages is
+        the list of Msg dicts in file order.
 
     Example: for ~/.codex/sessions/2025/03/01/rollout-2025-03-01T10-00-00-<uuid>.jsonl with a
     session_meta record (id "<uuid>", cwd "/work/proj"), a user message "fix the bug" and a
@@ -678,6 +803,21 @@ def make_summary(source: str, sid: str, path: str, cwd: Optional[str], branch: O
            msgs: List[Msg]) -> Summary:
     """Build the index Summary from parsed fields and messages.
 
+    Args:
+        source: "claude" or "codex".
+        sid: The session id.
+        path: Transcript file path (its mtime is the fallback for missing timestamps).
+        cwd: Working directory, or None if unknown.
+        branch: Git branch, or None.
+        title: Session title, or None.
+        first_ts: Epoch seconds of the first message, or None.
+        last_ts: Epoch seconds of the last message, or None.
+        msgs: The parsed Msg list, used for the message counts and the search blob.
+
+    Returns:
+        The Summary dict. Missing text fields become ""; missing timestamps fall back to the file's
+        mtime (or 0).
+
     Example: make_summary("claude", "abc", "/p/abc.jsonl", "/work/proj", None, "Fix bug",
     1.0, 2.0, [user "fix the bug", assistant "ok", tool Read]) ->
     {"source": "claude", "id": "abc", "path": "/p/abc.jsonl", "cwd": "/work/proj",
@@ -739,6 +879,9 @@ class Session(object):
     def __init__(self, d: Summary) -> None:
         """Build a Session from an index Summary dict, adding project, title fallback and search_text.
 
+        Args:
+            d: A Summary dict, as built by make_summary() or loaded from the index.
+
         Example: Session({"source": "claude", "id": "a1", "cwd": "/work/proj", "title": "",
         "blob": "Fix", ...}) -> .project == "proj", .title == "(untitled)",
         .search_text == "(untitled)\\nproj\\n/work/proj\\nfix"; with cwd "" -> .project == "-"
@@ -753,11 +896,19 @@ class Session(object):
         return build_resume_argv(self.source, self.id)[0]
 
     def resume_warning(self) -> Optional[str]:
-        """Why the configured resume command was unusable (default is used), or None."""
+        """Why the configured resume command was unusable (default is used), or None.
+
+        Returns:
+            A short message if the configured command was unusable, else None.
+        """
         return build_resume_argv(self.source, self.id)[1]
 
     def resume_cmd(self) -> str:
         """Shell command line that resumes this session, prefixed with a cd into its cwd.
+
+        Returns:
+            A shell command line such as "cd /dir && claude --resume ID"; no "cd" part when the
+            session has no cwd.
 
         Examples:
             claude session a1 in /work/proj -> "cd /work/proj && claude --resume a1"
@@ -778,6 +929,13 @@ DEFAULT_RESUME_ARGS: Dict[str, List[str]] = {"claude": ["--resume", "{id}"], "co
 def resume_template(source: str) -> str:
     """Command template: CLI flag, then AI_SESSIONS_<SRC>_CMD, then the bare command.
 
+    Args:
+        source: "claude" or "codex".
+
+    Returns:
+        The command template: the --claude-cmd/--codex-cmd flag if given, else the
+        AI_SESSIONS_<SOURCE>_CMD variable, else the bare command name.
+
     Examples:
         with no override and no env var: resume_template("claude") -> "claude"
         with AI_SESSIONS_CLAUDE_CMD="mycl --x {id}": resume_template("claude") -> "mycl --x {id}"
@@ -789,6 +947,14 @@ def resume_template(source: str) -> str:
 
 def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
     """Returns (argv, warning). warning is None unless the template was unusable.
+
+    Args:
+        source: "claude" or "codex".
+        sid: Session id, substituted for "{id}" in the command template.
+
+    Returns:
+        An (argv, warning) tuple: argv is the command as a list of words; warning is a message when
+        the template was unparsable or empty (the default command is used), else None.
 
     Examples:
         build_resume_argv("claude", "abc") -> (["claude", "--resume", "abc"], None)
@@ -815,6 +981,12 @@ def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
 def shell_quote(s: str) -> str:
     """Quote s for a POSIX shell, leaving it bare when it only has safe characters.
 
+    Args:
+        s: Any string.
+
+    Returns:
+        s unchanged if it has only safe characters, otherwise s wrapped in single quotes.
+
     Examples:
         shell_quote("/tmp/x") -> "/tmp/x"
         shell_quote("a b") -> "'a b'"
@@ -836,6 +1008,9 @@ def codex_dir() -> str:
 def cache_path() -> str:
     """Location of the summary index: $XDG_CACHE_HOME (default ~/.cache) / ai-sessions / index.json.
 
+    Returns:
+        The absolute path of the index file.
+
     Example: with XDG_CACHE_HOME=/c -> "/c/ai-sessions/index.json"
     """
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
@@ -844,6 +1019,9 @@ def cache_path() -> str:
 
 def discover() -> List[Tuple[str, str]]:
     """List every transcript file as (source, path) without opening any of them.
+
+    Returns:
+        A list of (source, path) pairs, one per transcript file found.
 
     Example: with ~/.claude/projects/-work-proj/abc.jsonl and
     ~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl on disk ->
@@ -876,6 +1054,10 @@ def discover() -> List[Tuple[str, str]]:
 def read_codex_titles() -> Dict[str, str]:
     """Map Codex session id -> thread name from session_index.jsonl (may be absent).
 
+    Returns:
+        A dict mapping session id to a one-line title; empty if the file is missing or has no usable
+        entries.
+
     Example: a session_index.jsonl line {"id": "u1", "thread_name": "Fix\\nbug"} ->
     {"u1": "Fix bug"}; a missing file -> {}
     """
@@ -902,6 +1084,12 @@ def load_sessions(progress: bool = False) -> List[Session]:
     Codex titles from session_index.jsonl are applied here at load time, after the
     cache, rather than stored in it: that file changes independently of the rollouts,
     so caching its names would leave them stale.
+
+    Args:
+        progress: If True, print an "indexing N file(s)" notice to stderr when files need parsing.
+
+    Returns:
+        A list of Session objects (unsorted), omitting sessions with no user or assistant messages.
 
     Example: with one Claude transcript (user + assistant message) under
     AI_SESSIONS_CLAUDE_DIR and an empty cache -> [Session(source="claude", ...)], and
@@ -977,6 +1165,15 @@ def filter_sessions(sessions: List[Session], query: str = "", source: str = "all
     The query is split on whitespace; every term must appear (case-insensitive
     substring) in the session's title, project, cwd or transcript text.
 
+    Args:
+        sessions: The sessions to filter.
+        query: Whitespace-separated terms; all must match. "" matches everything.
+        source: "all", "claude" or "codex".
+        project: Exact working directory to require, or None for any.
+
+    Returns:
+        The matching sessions, in their original order.
+
     Examples (sessions A = claude "Fix bug" in /work/proj, B = codex "Add tests" in /work/other):
         filter_sessions([A, B], "fix") -> [A]
         filter_sessions([A, B], "", source="codex") -> [B]
@@ -998,6 +1195,13 @@ def filter_sessions(sessions: List[Session], query: str = "", source: str = "all
 def sort_sessions(sessions: List[Session], mode: str = "last") -> List[Session]:
     """Newest first, by last activity (mode "last") or by start time (any other mode, e.g. "start").
 
+    Args:
+        sessions: The sessions to sort.
+        mode: "last" (default) sorts by last activity; any other value sorts by start time.
+
+    Returns:
+        A new list, newest first.
+
     Example: A(first_ts=1, last_ts=2), B(first_ts=5, last_ts=3):
         sort_sessions([A, B]) -> [B, A]; sort_sessions([A, B], "start") -> [B, A]
         with B(first_ts=0, last_ts=3): sort_sessions([A, B], "start") -> [A, B]
@@ -1016,6 +1220,12 @@ _parsed: "collections.OrderedDict[Tuple[str, float], List[Msg]]" = collections.O
 
 def get_transcript(s: Session) -> List[Msg]:
     """Messages of a session, parsed on demand and kept in a small LRU cache.
+
+    Args:
+        s: The session whose transcript file to parse.
+
+    Returns:
+        The list of Msg dicts; [] if the file cannot be parsed.
 
     Example: get_transcript(s) parses s.path and returns [{"role": "user", "text": "fix the
     bug", "ts": 1.7e9}, ...]; calling it again with the file unchanged returns the cached list.
@@ -1048,6 +1258,17 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
     labels); text (message body); tool (calls and slash commands); result (tool output).
     show_results includes tool results; mine_only keeps only your own input (prompts
     and slash commands).
+
+    Args:
+        s: The session, used for the header.
+        msgs: Its parsed transcript.
+        width: Display width in terminal columns (minimum 10).
+        show_results: Include tool results.
+        mine_only: Keep only your own prompts and slash commands (default False).
+
+    Returns:
+        A (lines, body_start) tuple: lines is a list of (text, kind) rows; body_start is the index
+        of the first row after the header.
 
     Example: for a claude session "Fix bug" (id a1, cwd /work/proj, no branch) with messages
     [user "fix the bug", assistant "ok", tool "Read: /x"], width 40, show_results False ->
@@ -1106,6 +1327,14 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
 def hit_lines(lines: List[Line], start: int, terms: List[str]) -> List[int]:
     """Indexes of body lines (from `start`, so never the header) containing any term.
 
+    Args:
+        lines: Rendered (text, kind) rows.
+        start: Index of the first body row; header rows before it never count.
+        terms: Lowercase search terms; a row matches if it contains any of them.
+
+    Returns:
+        The indexes of matching rows, in order; [] when terms is empty.
+
     Example: lines [("Fix bug", "title"), ..., ("  fix the bug", "text")] with start=6 and
     terms ["bug"] -> [8] (the title at index 0 is in the header, so it is not a hit).
     """
@@ -1120,6 +1349,12 @@ def hit_lines(lines: List[Line], start: int, terms: List[str]) -> List[int]:
 
 def copy_clipboard(text: str) -> Optional[str]:
     """Copy text with the first available tool; return its name, or None if none worked.
+
+    Args:
+        text: Text to put on the clipboard.
+
+    Returns:
+        The name of the tool that worked (e.g. "pbcopy"), or None if none did.
 
     Examples: on macOS copy_clipboard("cd /x && claude --resume a1") -> "pbcopy";
     on a Linux box with only xclip -> "xclip"; with no clipboard tool -> None
@@ -1180,6 +1415,12 @@ class App(object):
                  source: str = "all") -> None:
         """Set up UI state (filter, sort, selection, scroll, caches), colors, the filtered view
         and the key map. scr is the curses window; query/source are the initial filter.
+
+        Args:
+            scr: The curses window.
+            sessions: All sessions to browse.
+            query: Initial filter text.
+            source: Initial source filter: "all" (default), "claude" or "codex".
 
         Example: App(scr, sessions, "fix", "claude") -> .view holds the Claude sessions matching
         "fix", newest first; .sel == 0; .sort == "last"; .split is None (layout chosen by width)
@@ -1256,6 +1497,12 @@ class App(object):
     def put(self, y: int, x: int, s: str, attr: int = 0) -> None:
         """Write s at row y, column x with attr, ignoring curses errors (e.g. off-screen writes).
 
+        Args:
+            y: Row.
+            x: Column.
+            s: Text to write.
+            attr: curses attribute (default 0, plain).
+
         Example: put(0, 0, "hi", A_BOLD) draws "hi" at the top-left; put(99, 0, "hi") on a 24-row
         screen draws nothing and does not raise.
         """
@@ -1268,6 +1515,14 @@ class App(object):
              pat: Optional[Pattern[str]] = None) -> None:
         """Draw s at (y, x): sanitized, newlines flattened, clipped to maxw columns, with matches of
         pat drawn in the highlight attribute.
+
+        Args:
+            y: Row.
+            x: Column.
+            s: Text to draw.
+            maxw: Maximum width in columns; nothing is drawn if <= 0.
+            attr: curses attribute for the normal text.
+            pat: Compiled regex whose matches are highlighted, or None for no highlighting.
 
         Example: text(3, 0, "fix the bug", 20, 0, re.compile("bug", re.I)) draws "fix the " plain
         at column 0 and "bug" highlighted at column 8; with maxw=5 it draws only "fix t".
@@ -1290,6 +1545,10 @@ class App(object):
     def fill(self, y: int, attr: int) -> None:
         """Paint row y with attr across the full width (for the header/footer bars).
 
+        Args:
+            y: Row to paint.
+            attr: curses attribute to paint with.
+
         Example: on an 80x24 screen, fill(23, attrs["head"]) paints all 80 cells of the last row
         with spaces in the header attribute.
         """
@@ -1307,6 +1566,10 @@ class App(object):
     def refilter(self, keep: bool = True) -> None:
         """Recompute self.view from the query/source/project filters and the sort mode, reset the
         scroll, and (when keep is true) keep the same session selected if it is still listed.
+
+        Args:
+            keep: If True (default), keep the currently selected session selected when it is still
+                in the new view; otherwise select the first row.
 
         Example: view [A, B, C] with C selected (sel == 2), then query "c" leaves [C] ->
         view == [C], sel == 0; with keep=False after a filter change -> sel == 0.
@@ -1328,6 +1591,9 @@ class App(object):
     def filter_desc(self) -> str:
         """Human-readable summary of the active filters for the header bar.
 
+        Returns:
+            Text such as "source=Codex project=proj /fix", or "none".
+
         Examples:
             no filters -> "none"
             source "claude", project "/work/proj", query "fix" -> "source=Claude Code project=proj /fix"
@@ -1346,6 +1612,10 @@ class App(object):
         """Read one key and return its name: printable keys as themselves; special keys as names
         ("ENTER", "ESC", "BS", "CU", "TAB", "CTRL_C", "UP", "DOWN", "PGUP", "PGDN", "HOME", "END",
         "SUP", "SDOWN", "RESIZE"); unmapped special keys as "UNKNOWN"; None if nothing arrived.
+
+        Returns:
+            A key name (a printable character or a name from the list above), or None if no key
+            arrived.
 
         Examples: pressing j -> "j"; pressing Enter -> "ENTER"; pressing F5 -> "UNKNOWN";
         Ctrl-U -> "CU"; read timeout -> None
@@ -1373,6 +1643,14 @@ class App(object):
     def edit(self, buf: str, k: Optional[str]) -> Tuple[str, Optional[str]]:
         """Apply a line-edit key to buf; return (new, done) where done in (None,'ok','cancel').
 
+        Args:
+            buf: The text being edited.
+            k: A key name from key(), or None.
+
+        Returns:
+            A (new_buf, done) tuple: new_buf is the edited text; done is "ok" after Enter, "cancel"
+            after Esc or Ctrl-C, else None.
+
         Examples:
             edit("ab", "c") -> ("abc", None)
             edit("ab", "BS") -> ("a", None)
@@ -1398,6 +1676,10 @@ class App(object):
         """Compute screen regions for the list and preview. Returns {"mode": "side" | "stack",
         "list": Box, "prev": Box, "sep": column (side) or row (stack) of the separator}.
         Mode is self.split, else "side" when the terminal is at least SIDE_BY_SIDE_MIN_COLS wide.
+
+        Returns:
+            A dict with "mode" ("side" or "stack"), "list" and "prev" (Box regions) and "sep"
+            (separator column or row).
 
         Examples:
             120 cols x 40 rows -> {"mode": "side", "list": (1, 0, 38, 54),
@@ -1460,6 +1742,10 @@ class App(object):
         "date  tag  project  title", with the selected row in reverse video and filter matches
         highlighted.
 
+        Args:
+            box: The (y, x, height, width) region to draw in.
+            pat: Regex for highlighting filter matches, or None.
+
         Example: row for a Claude session -> "2025-03-01 10:00 CC proj   Fix the bug"; with no
         matching sessions the first row reads "(no matching sessions)".
         """
@@ -1498,6 +1784,14 @@ class App(object):
         """Rendered preview for s at width, as (lines, body_start, hit_indexes). Cached until the
         session, its last_ts, width, toggles or terms change.
 
+        Args:
+            s: The session to preview.
+            width: Display width in columns.
+            pat_terms: Lowercase filter terms used to find hits.
+
+        Returns:
+            A (lines, body_start, hit_indexes) tuple, as from render() and hit_lines().
+
         Example: preview_lines(s, 60, ["bug"]) -> ([("Fix bug", "title"), ...], 6, [8]);
         a second identical call returns the very same cached tuple.
         """
@@ -1514,6 +1808,10 @@ class App(object):
     def draw_preview(self, box: Box, pat: Optional[Pattern[str]]) -> None:
         """Draw the preview of the selected session into box. Scroll jumps to just before the first
         filter hit when the selection or filter changes, and is otherwise clamped to the content.
+
+        Args:
+            box: The (y, x, height, width) region to draw in.
+            pat: Regex for highlighting filter matches, or None.
 
         Example: selected session with a match on rendered line 20 for query "bug" -> preview_offset
         becomes 18 (hit - 2) and lines 18.. are drawn; with no session selected nothing is drawn.
@@ -1663,6 +1961,9 @@ class App(object):
     def on_resume(self) -> bool:
         """r: choose the current session for resuming and leave the main loop.
 
+        Returns:
+            True to leave the main loop (a session was chosen), else False.
+
         Example: with a session selected whose cwd exists -> resume == that session, returns True;
         with an empty list or a vanished cwd -> returns False (status explains why).
         """
@@ -1674,6 +1975,9 @@ class App(object):
 
     def on_edit_resume(self) -> bool:
         """e: let the user edit the resume command, then choose the session for resuming.
+
+        Returns:
+            True to leave the main loop (a session was chosen), else False.
 
         Example: current session a1, user edits to "claude --resume a1 --model opus" and presses
         Enter -> resume == the session, resume_override == ["claude", "--resume", "a1",
@@ -1697,6 +2001,9 @@ class App(object):
     def copy_resume_command(self, s: Session) -> None:
         """Copy s's resume command to the clipboard, reporting the outcome in the status.
 
+        Args:
+            s: The session whose resume command to copy.
+
         Example: with pbcopy available -> status == " copied via pbcopy: cd /work/proj && claude
         --resume a1"; with no clipboard tool -> status == " no clipboard tool found
         (pbcopy/wl-copy/xclip/xsel)"
@@ -1708,6 +2015,12 @@ class App(object):
     def can_resume(self, s: Session) -> bool:
         """Resuming runs in the session's cwd; refuse (with a status message) if it is gone.
 
+        Args:
+            s: The session to check.
+
+        Returns:
+            True if s can be resumed (its cwd exists or is unset), else False.
+
         Examples: cwd exists (or is empty) -> True; cwd "/gone" missing -> False and
         status == " cwd no longer exists: /gone"
         """
@@ -1718,6 +2031,14 @@ class App(object):
 
     def edit_resume_command(self, s: Session, redraw_screen: bool = True) -> Optional[List[str]]:
         """Let the user edit the resume command line; return its argv, or None if cancelled.
+
+        Args:
+            s: The session whose resume command is edited.
+            redraw_screen: True (default) repaints the whole list each keystroke; the viewer passes
+                False.
+
+        Returns:
+            The edited command as an argv list, or None if the user cancelled.
 
         Examples: the prompt starts as "claude --resume a1";
             user types " --model opus" and presses Enter -> ["claude", "--resume", "a1", "--model", "opus"]
@@ -1743,6 +2064,9 @@ class App(object):
 
     def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
         """Key name (see App.key) -> handler for the session list.
+
+        Returns:
+            A dict mapping each key name to its handler method.
 
         Example: build_keymap()["j"] is self.on_down; build_keymap()["ENTER"] is self.on_open
         """
@@ -1797,6 +2121,15 @@ class App(object):
         redraw_screen=True repaints the whole list view each keystroke (so live changes
         show); the full-screen viewer passes False to keep its already-drawn frame and
         only repaint the footer.
+
+        Args:
+            label: Text shown before the input, e.g. "/".
+            initial: Starting text of the input.
+            live: Optional callback called with the text after every edit.
+            redraw_screen: True (default) repaints the whole list each keystroke.
+
+        Returns:
+            A (text, accepted) tuple: the final text, and True for Enter or False if cancelled.
 
         Examples: prompt("/", "fi") with keys "x", ENTER -> ("fix", True);
                   prompt("/", "fi") with key ESC -> ("fi", False)
@@ -1855,7 +2188,14 @@ class App(object):
                 return
 
     def viewer(self, s: Session) -> bool:
-        """Open the full-screen viewer; True if a resume was chosen from it."""
+        """Open the full-screen viewer; True if a resume was chosen from it.
+
+        Args:
+            s: The session to show.
+
+        Returns:
+            True if a resume was chosen from the viewer, else False.
+        """
         Viewer(self, s).run()
         return self.resume is not None
 
@@ -1874,6 +2214,10 @@ class Viewer(object):
     def __init__(self, app: App, s: Session) -> None:
         """Load session s's transcript and set up scroll, search and render-cache state; the search
         query starts as the app's list filter.
+
+        Args:
+            app: The App whose window, colors and settings are shared.
+            s: The session to show.
 
         Example: Viewer(app, s) with app.query == "fix" -> .query == "fix", .offset == 0,
         .hit_index == -1, .msgs == get_transcript(s)
@@ -1923,6 +2267,9 @@ class Viewer(object):
     def on_resume(self) -> bool:
         """r: choose this session for resuming and leave the viewer.
 
+        Returns:
+            True to leave the viewer (resume chosen), else False.
+
         Example: cwd exists -> app.resume == self.session and returns True; cwd gone -> returns
         False and the viewer footer shows " cwd no longer exists: /gone".
         """
@@ -1934,6 +2281,9 @@ class Viewer(object):
 
     def on_edit_resume(self) -> bool:
         """e: edit the resume command in the footer, then choose the session for resuming.
+
+        Returns:
+            True to leave the viewer (resume chosen), else False.
 
         Example: user edits to "claude --resume a1 --model opus" and presses Enter ->
         app.resume == self.session, app.resume_override == ["claude", "--resume", "a1",
@@ -1976,6 +2326,9 @@ class Viewer(object):
         """Move to the next (step=1) or previous (step=-1) search hit, wrapping around, and scroll
         so the hit sits about a third of the way down the screen.
 
+        Args:
+            step: +1 for the next hit, -1 for the previous one.
+
         Example: hits [8, 20, 40], hit_index 2, body_height 30: goto_hit(1) -> hit_index == 0,
         offset == 0 (8 - 10 clamped); goto_hit(-1) from 1 -> hit_index == 0. With no hits: no change.
         """
@@ -1998,6 +2351,9 @@ class Viewer(object):
 
     def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
         """Key name (see App.key) -> handler for the viewer.
+
+        Returns:
+            A dict mapping each key name to its handler method.
 
         Example: build_keymap()["n"] is self.on_next_hit; build_keymap()[" "] is self.on_page_down
         """
@@ -2030,6 +2386,10 @@ class Viewer(object):
         """Draw one frame of the h x w viewer: re-render when width/toggles/terms changed, clamp the
         scroll, then paint the title bar (with "hit i/n"), transcript lines and footer (status or
         key hints plus scroll percentage).
+
+        Args:
+            h: Screen height in rows.
+            w: Screen width in columns.
 
         Example: 40-line transcript, h=12 (10 body rows), query "bug" with 3 hits, offset 10 ->
         title bar " CC Fix bug  hit 1/3", body shows lines 10-19, footer ends with "[50%]".
@@ -2102,6 +2462,16 @@ def browse(scr: Window, sessions: List[Session], query: str,
 
     Returns (session chosen for resume or None, edited resume argv or None).
 
+    Args:
+        scr: The curses window.
+        sessions: All sessions to browse.
+        query: Initial filter text.
+        source: Initial source filter: "all", "claude" or "codex".
+
+    Returns:
+        A (session, argv) tuple: the session chosen for resume (None if the user quit) and the
+        edited resume argv (None if the default command should be used).
+
     Example: browse(scr, sessions, "fix", "all") with keys "r" on session a1 -> (a1, None);
     with keys "q" -> (None, None).
     """
@@ -2114,6 +2484,13 @@ def browse(scr: Window, sessions: List[Session], query: str,
 def run_tui(query: str, source: Optional[str] = None) -> int:
     """Run the interactive browser and, if a session was chosen, exec its resume command in the
     session's directory. Returns an exit code (it does not return after a successful exec).
+
+    Args:
+        query: Initial filter text.
+        source: "claude", "codex" or None for both.
+
+    Returns:
+        The exit code: 0 normal, 2 not a terminal, 127 resume command not found, 130 Ctrl-C.
 
     Examples: not a terminal -> prints "interactive mode needs a terminal (try --list)" to
     stderr, returns 2; user quits with q -> 0; Ctrl-C -> 130; resume command not on PATH ->
@@ -2150,6 +2527,14 @@ def cmd_list(sessions: List[Session], query: str, source: Optional[str]) -> int:
     """Print matching sessions newest first, one tab-separated line each: date, source, id,
     project, title. Returns 0.
 
+    Args:
+        sessions: All sessions.
+        query: Search terms; "" lists everything.
+        source: "claude", "codex" or None for both.
+
+    Returns:
+        Exit code 0.
+
     Example: stdout gets "2025-03-01 10:00\\tclaude\\ta1\\tproj\\tFix bug\\n" for a1.
     """
     for s in sort_sessions(filter_sessions(sessions, query, source or "all")):
@@ -2161,6 +2546,15 @@ def cmd_list(sessions: List[Session], query: str, source: Optional[str]) -> int:
 def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool = False) -> int:
     """Print the transcript of the session whose id equals ident or starts with it.
     Returns 0; 1 (with a message on stderr) if nothing matches or the prefix is ambiguous.
+
+    Args:
+        sessions: All sessions.
+        ident: A session id or a unique prefix of one.
+        tools: True to include tool results.
+        mine_only: True to show only your own input (default False).
+
+    Returns:
+        Exit code: 0 on success, 1 if no session or several sessions match.
 
     Examples: cmd_show(sessions, "a1", False) -> prints the 100-column transcript, returns 0;
     cmd_show(sessions, "zz", False) -> "ai-sessions: no session matches 'zz'", returns 1;
@@ -2184,6 +2578,9 @@ def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool =
 def main() -> int:
     """Command-line entry point: parse arguments, then --list, --show or the TUI. Returns the
     process exit code.
+
+    Returns:
+        The process exit code.
 
     Examples: `ai-sessions --list fix` -> tab-separated rows of sessions matching "fix", 0;
     `ai-sessions --show a1b2 --tools` -> that transcript including tool results, 0;
