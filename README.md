@@ -5,6 +5,8 @@ works on macOS and Linux.
 
 ## ai-sessions
 
+NOTE: This code was produced and review by AI.
+
 A curses browser and search for Claude Code and Codex CLI session transcripts.
 Python 3.6+, no dependencies.
 
