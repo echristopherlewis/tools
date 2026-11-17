@@ -1538,7 +1538,7 @@ HELP: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("Tab", "source: all > Claude Code > Codex"),
         ("p", "toggle: only the selected session's project"),
         ("s", "sort: last activity / start time"),
-        ("l", "layout: side by side / stacked"),
+        ("l", "layout: side by side / stacked / list only"),
         ("t", "toggle tool results (calls always shown)"),
         ("u", "toggle showing only your input"),
         ("Enter v", "open full-screen viewer"),
@@ -1608,7 +1608,7 @@ class App(object):
         self.sort = "last"
         self.show_results = False
         self.mine_only = False
-        self.split: Optional[str] = None  # "side" / "stack"; None: by terminal width
+        self.split: Optional[str] = None  # "side" / "stack" / "list"; None: by terminal width
         self.sel = 0
         self.top = 0
         self.preview_offset = 0
@@ -1849,24 +1849,30 @@ class App(object):
 
     # -- layout
     def layout(self) -> Dict[str, Any]:
-        """Compute screen regions for the list and preview. Returns {"mode": "side" | "stack",
-        "list": Box, "prev": Box, "sep": column (side) or row (stack) of the separator}.
+        """Compute screen regions for the list and preview. Returns {"mode": "side" | "stack" |
+        "list", "list": Box, "prev": Box, "sep": column (side) or row (stack) of the separator}.
         Mode is self.split, else "side" when the terminal is at least SIDE_BY_SIDE_MIN_COLS wide.
+        In "list" mode the list fills the body, the preview box is empty and "sep" is None.
 
         Returns:
-            A dict with "mode" ("side" or "stack"), "list" and "prev" (Box regions) and "sep"
-            (separator column or row).
+            A dict with "mode" ("side", "stack" or "list"), "list" and "prev" (Box regions) and
+            "sep" (separator column or row, or None).
 
         Examples:
             120 cols x 40 rows -> {"mode": "side", "list": (1, 0, 38, 54),
                                    "prev": (1, 55, 38, 65), "sep": 54}
             80 cols x 24 rows -> {"mode": "stack", "list": (1, 0, 11, 80),
                                   "prev": (13, 0, 10, 80), "sep": 12}
+            80 cols x 24 rows, split "list" -> {"mode": "list", "list": (1, 0, 22, 80),
+                                                "prev": (1, 0, 0, 0), "sep": None}
         """
         h, w = self.scr.getmaxyx()
         body_top, body_bot = 1, h - 2  # inclusive rows
         bh = body_bot - body_top + 1
         mode = self.split or ("side" if w >= SIDE_BY_SIDE_MIN_COLS else "stack")
+        if mode == "list":
+            return {"mode": "list", "list": (body_top, 0, bh, w),
+                    "prev": (body_top, 0, 0, 0), "sep": None}
         if mode == "side":
             lw = int(w * 0.45)
             return {"mode": "side", "list": (body_top, 0, bh, lw),
@@ -1904,7 +1910,7 @@ class App(object):
         if lay["mode"] == "side":
             for y in range(1, h - 1):
                 self.put(y, lay["sep"], vt, self.attrs["dim"])
-        else:
+        elif lay["mode"] == "stack":
             self.put(lay["sep"], 0, hz * (w - 1), self.attrs["dim"])
         self.draw_preview(lay["prev"], pat)
         self.fill(h - 1, self.attrs["head"])
@@ -2095,14 +2101,18 @@ class App(object):
         self.refilter()
 
     def on_toggle_split(self) -> None:
-        """Flip between side-by-side and stacked layouts (relative to the layout in effect now).
+        """Cycle the layout side by side -> stacked -> list only -> side by side, starting from
+        the layout in effect now (which is chosen by terminal width until the first press).
 
         Example: on a 120-column terminal with split None -> split == "stack" and
-        status == " layout: list above preview"
+        status == " layout: list above preview"; pressing again -> split == "list" and
+        status == " layout: list only"
         """
-        self.split = "stack" if self.layout()["mode"] == "side" else "side"
-        self.status = " layout: %s" % ("list beside preview" if self.split == "side"
-                                       else "list above preview")
+        cycle = {"side": "stack", "stack": "list", "list": "side"}
+        self.split = cycle[self.layout()["mode"]]
+        self.status = " layout: %s" % {"side": "list beside preview",
+                                       "stack": "list above preview",
+                                       "list": "list only"}[self.split]
 
     def on_toggle_results(self) -> None:
         """Toggle display of tool results in transcripts and say so in the status line.
