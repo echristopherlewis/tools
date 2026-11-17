@@ -304,31 +304,32 @@ def wrap(text: str, width: int) -> List[str]:
         if str_width(para) <= width:
             lines.append(para)
             continue
-        indent = len(para) - len(para.lstrip(" "))
-        indent = min(indent, width // 2)
-        cur = " " * indent
+        # Continuation lines keep the paragraph's leading indent (capped at half the width).
+        indent = min(len(para) - len(para.lstrip(" ")), width // 2)
+        current = " " * indent
         for word in para.strip().split(" "):
             if not word:
                 continue
+            # A word wider than a line is split across lines, `width - indent` columns at a time.
             while str_width(word) > width - indent:
-                if cur.strip():
-                    lines.append(cur)
-                    cur = " " * indent
+                if current.strip():
+                    lines.append(current)
+                    current = " " * indent
                 piece = clip(word, width - indent)
-                if not piece:
+                if not piece:  # a single char wider than the line: emit it anyway
                     piece, word = word[:1], word[1:]
                 else:
                     word = word[len(piece):]
                 lines.append(" " * indent + piece)
-            if not cur.strip():
-                cur = " " * indent + word
-            elif str_width(cur) + 1 + str_width(word) <= width:
-                cur += " " + word
+            if not current.strip():
+                current = " " * indent + word
+            elif str_width(current) + 1 + str_width(word) <= width:
+                current += " " + word
             else:
-                lines.append(cur)
-                cur = " " * indent + word
-        if cur.strip():
-            lines.append(cur)
+                lines.append(current)
+                current = " " * indent + word
+        if current.strip():
+            lines.append(current)
     while lines and lines[-1] == "":
         lines.pop()
     return lines
@@ -407,6 +408,56 @@ TOOL_KEYS: Tuple[str, ...] = ("command", "cmd", "file_path", "path", "notebook_p
              "description", "query", "prompt", "text", "message", "target")
 
 
+def decode_json_object(s: str) -> Any:
+    """Decode s if it looks like a JSON object; otherwise (or if invalid) return it unchanged.
+
+    Args:
+        s: A string, possibly holding a JSON object.
+
+    Returns:
+        The decoded value, or s itself.
+
+    Examples:
+        decode_json_object(' {"a": 1}') -> {"a": 1}
+        decode_json_object("{oops") -> "{oops"
+        decode_json_object("plain") -> "plain"
+    """
+    if s.strip().startswith("{"):
+        try:
+            return json.loads(s.strip())
+        except ValueError:
+            pass
+    return s
+
+
+def first_tool_arg(inp: Dict[str, Any]) -> str:
+    """The most telling argument of a tool call, as one line.
+
+    Args:
+        inp: The tool's input dict.
+
+    Returns:
+        The first TOOL_KEYS entry present (a non-blank string, or a list of strings joined by
+        spaces); failing that the first non-blank string value; "" if none.
+
+    Examples:
+        first_tool_arg({"x": "1", "command": "ls"}) -> "ls"
+        first_tool_arg({"command": ["ls", "-l"]}) -> "ls -l"
+        first_tool_arg({"x": "v"}) -> "v"
+        first_tool_arg({"n": 3}) -> ""
+    """
+    for k in TOOL_KEYS:
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            return first_line(v)
+        if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+            return first_line(" ".join(v))
+    for v in inp.values():
+        if isinstance(v, str) and v.strip():
+            return first_line(v)
+    return ""
+
+
 def summarize_tool(name: Any, inp: Any) -> str:
     """One-line "Name: key argument" summary of a tool call.
 
@@ -428,30 +479,14 @@ def summarize_tool(name: Any, inp: Any) -> str:
         summarize_tool("Foo", {}) -> "Foo"
     """
     name = str(name or "tool")
-    val = ""
     if isinstance(inp, str):
-        s = inp.strip()
-        if s.startswith("{"):
-            try:
-                inp = json.loads(s)
-            except ValueError:
-                pass
-        if isinstance(inp, str):
-            val = first_line(inp)
-    if isinstance(inp, dict):
-        for k in TOOL_KEYS:
-            v = inp.get(k)
-            if isinstance(v, str) and v.strip():
-                val = first_line(v)
-                break
-            if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
-                val = first_line(" ".join(v))
-                break
-        else:
-            for v in inp.values():
-                if isinstance(v, str) and v.strip():
-                    val = first_line(v)
-                    break
+        inp = decode_json_object(inp)
+    if isinstance(inp, str):
+        val = first_line(inp)
+    elif isinstance(inp, dict):
+        val = first_tool_arg(inp)
+    else:
+        val = ""
     return "%s: %s" % (name, val) if val else name
 
 
@@ -474,17 +509,14 @@ def content_text(c: Any) -> str:
     """
     if isinstance(c, str):
         return c
-    if isinstance(c, list):
-        parts: List[str] = []
-        for b in c:
-            if isinstance(b, str):
-                parts.append(b)
-            elif isinstance(b, dict):
-                t = b.get("text")
-                if isinstance(t, str):
-                    parts.append(t)
-        return "\n".join(parts)
-    return ""
+    if not isinstance(c, list):
+        return ""
+    parts: List[str] = []
+    for block in c:
+        text = block.get("text") if isinstance(block, dict) else block
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------- parsing
@@ -535,6 +567,86 @@ def content_blocks(content: Any) -> Optional[List[Any]]:
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     return content if isinstance(content, list) else None
+
+
+def claude_user_msgs(blocks: List[Any], ts: Optional[float]) -> List[Msg]:
+    """Turn the content blocks of a Claude "user" record into Msgs.
+
+    Text blocks become "user" messages, or "cmd" messages for slash commands; harness-injected
+    text (CLAUDE_NOISE) is dropped; tool_result blocks become "result" messages.
+
+    Args:
+        blocks: The normalized content blocks (see content_blocks()); non-dict blocks are skipped.
+        ts: The record's timestamp, copied onto every message.
+
+    Returns:
+        The messages in block order.
+
+    Examples:
+        claude_user_msgs([{"type": "text", "text": " hi "}], 1.0) -> [{"role": "user", "text": "hi", "ts": 1.0}]
+        claude_user_msgs([{"type": "text", "text": "<command-name>/clear</command-name>"}], None)
+            -> [{"role": "cmd", "text": "/clear", "ts": None}]
+        claude_user_msgs([{"type": "tool_result", "content": "ok"}], None)
+            -> [{"role": "result", "text": "ok", "ts": None}]
+    """
+    out: List[Msg] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "tool_result":
+            out.append({"role": "result",
+                        "text": content_text(block.get("content"))[:RESULT_CAP], "ts": ts})
+            continue
+        if block_type != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        stripped = text.lstrip()
+        # Peek only at the start: a command tag deep inside a long prompt is
+        # just text the user pasted, not a slash command.
+        head = stripped[:CMD_PEEK]
+        cmd_match = CMD_NAME.search(head) if "<command-name>" in head else None
+        if cmd_match:
+            args_match = CMD_ARGS.search(stripped)
+            cmd = cmd_match.group(1)
+            if args_match and args_match.group(1):
+                cmd += " " + one_line(args_match.group(1))
+            out.append({"role": "cmd", "text": cmd, "ts": ts})
+        elif not stripped.startswith(CLAUDE_NOISE):
+            out.append({"role": "user", "text": text.strip(), "ts": ts})
+    return out
+
+
+def claude_assistant_msgs(blocks: List[Any], ts: Optional[float]) -> List[Msg]:
+    """Turn the content blocks of a Claude "assistant" record into Msgs.
+
+    Args:
+        blocks: The normalized content blocks (see content_blocks()); non-dict blocks are skipped.
+        ts: The record's timestamp, copied onto every message.
+
+    Returns:
+        "assistant" messages for non-blank text blocks and "tool" messages for tool_use blocks,
+        in block order.
+
+    Examples:
+        claude_assistant_msgs([{"type": "text", "text": "done"}], 2.0)
+            -> [{"role": "assistant", "text": "done", "ts": 2.0}]
+        claude_assistant_msgs([{"type": "tool_use", "name": "Read", "input": {"file_path": "/x"}}], None)
+            -> [{"role": "tool", "name": "Read", "text": "Read: /x", "ts": None}]
+    """
+    out: List[Msg] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text" and isinstance(block.get("text"), str) and block["text"].strip():
+            out.append({"role": "assistant", "text": block["text"].strip(), "ts": ts})
+        elif block_type == "tool_use":
+            out.append({"role": "tool", "name": str(block.get("name") or "tool"),
+                        "text": summarize_tool(block.get("name"), block.get("input")), "ts": ts})
+    return out
 
 
 def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
@@ -592,9 +704,8 @@ def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
     cwd: Optional[str] = None
     branch: Optional[str] = None
     custom: Optional[str] = None
-    ai: Optional[str] = None
-    summ: Optional[str] = None
-    first_prompt: Optional[str] = None
+    ai_title: Optional[str] = None
+    summary_title: Optional[str] = None
     first_ts: Optional[float] = None
     last_ts: Optional[float] = None
     msgs: List[Msg] = []
@@ -604,10 +715,10 @@ def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
             custom = record["customTitle"]
             continue
         if rtype == "ai-title" and record.get("aiTitle"):
-            ai = record["aiTitle"]
+            ai_title = record["aiTitle"]
             continue
         if rtype == "summary" and record.get("summary"):
-            summ = record["summary"]
+            summary_title = record["summary"]
             continue
         if rtype not in ("user", "assistant"):
             continue
@@ -630,43 +741,12 @@ def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
         if blocks is None:
             continue
         if rtype == "user":
-            for block in blocks:
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                if block_type == "text":
-                    text = block.get("text")
-                    if not isinstance(text, str) or not text.strip():
-                        continue
-                    stripped = text.lstrip()
-                    # Peek only at the start: a command tag deep inside a long prompt is
-                    # just text the user pasted, not a slash command.
-                    head = stripped[:CMD_PEEK]
-                    cm = CMD_NAME.search(head) if "<command-name>" in head else None
-                    if cm:
-                        am = CMD_ARGS.search(stripped)
-                        cmd = cm.group(1) + ((" " + one_line(am.group(1))) if am and am.group(1) else "")
-                        msgs.append({"role": "cmd", "text": cmd, "ts": ts})
-                    elif stripped.startswith(CLAUDE_NOISE):
-                        continue
-                    else:
-                        msgs.append({"role": "user", "text": text.strip(), "ts": ts})
-                        if first_prompt is None:
-                            first_prompt = text.strip()
-                elif block_type == "tool_result":
-                    msgs.append({"role": "result",
-                                 "text": content_text(block.get("content"))[:RESULT_CAP], "ts": ts})
+            msgs.extend(claude_user_msgs(blocks, ts))
         else:
-            for block in blocks:
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                if block_type == "text" and isinstance(block.get("text"), str) and block["text"].strip():
-                    msgs.append({"role": "assistant", "text": block["text"].strip(), "ts": ts})
-                elif block_type == "tool_use":
-                    msgs.append({"role": "tool", "name": str(block.get("name") or "tool"),
-                                 "text": summarize_tool(block.get("name"), block.get("input")), "ts": ts})
-    title = custom or ai or summ or (one_line(first_prompt)[:TITLE_MAX] if first_prompt else None)
+            msgs.extend(claude_assistant_msgs(blocks, ts))
+    first_prompt = next((m["text"] for m in msgs if m["role"] == "user"), None)
+    title = custom or ai_title or summary_title or (
+        one_line(first_prompt)[:TITLE_MAX] if first_prompt else None)
     return make_summary("claude", sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
 
 
@@ -687,6 +767,30 @@ def codex_user_noise(text: str) -> bool:
     """
     s = text.lstrip()
     return s.startswith(CODEX_NOISE) or bool(CODEX_TAG.match(s) and s.rstrip().endswith(">"))
+
+
+def codex_message_text(payload: Dict[str, Any]) -> str:
+    """Join the non-blank text parts of a Codex "message" payload.
+
+    Args:
+        payload: A response_item payload; its "content" is a string or a list of blocks that
+            carry "text" (input_text / output_text).
+
+    Returns:
+        The text parts joined with newlines and stripped; "" if there are none.
+
+    Examples:
+        codex_message_text({"content": [{"type": "input_text", "text": "a"}, {"text": " "}, {"text": "b"}]})
+            -> "a\\nb"
+        codex_message_text({"content": "hi"}) -> "hi"
+        codex_message_text({}) -> ""
+    """
+    blocks = payload.get("content")
+    if isinstance(blocks, str):
+        blocks = [{"text": blocks}]
+    texts = [block["text"] for block in (blocks or []) if isinstance(block, dict)
+             and isinstance(block.get("text"), str) and block["text"].strip()]
+    return "\n".join(texts).strip()
 
 
 def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
@@ -735,7 +839,6 @@ def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
     sid = stem[-36:] if len(stem) >= 36 else stem
     cwd: Optional[str] = None
     branch: Optional[str] = None
-    first_prompt: Optional[str] = None
     first_ts: Optional[float] = None
     last_ts: Optional[float] = None
     msgs: List[Msg] = []
@@ -765,22 +868,13 @@ def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
             role = payload.get("role")
             if role not in ("user", "assistant"):
                 continue
-            blocks = payload.get("content")
-            if isinstance(blocks, str):
-                blocks = [{"text": blocks}]
-            texts = [block["text"] for block in (blocks or []) if isinstance(block, dict)
-                     and isinstance(block.get("text"), str) and block["text"].strip()]
-            if not texts:
-                continue
-            text = "\n".join(texts).strip()
-            if role == "user" and codex_user_noise(text):
+            text = codex_message_text(payload)
+            if not text or (role == "user" and codex_user_noise(text)):
                 continue
             if ts:
                 first_ts = first_ts or ts
                 last_ts = ts
             msgs.append({"role": role, "text": text, "ts": ts})
-            if role == "user" and first_prompt is None:
-                first_prompt = text
         elif ptype in ("function_call", "custom_tool_call"):
             inp = payload.get("arguments") if ptype == "function_call" else payload.get("input")
             if inp is None:
@@ -792,8 +886,9 @@ def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
         elif ptype in ("function_call_output", "custom_tool_call_output"):
             msgs.append({"role": "result", "text": content_text(payload.get("output"))[:RESULT_CAP],
                          "ts": ts})
-    if not first_prompt:
-        first_prompt = next((msg["text"] for msg in msgs if msg["role"] == "assistant"), None)
+    # Title: the first user prompt, else the first assistant message.
+    first_prompt = (next((m["text"] for m in msgs if m["role"] == "user"), None)
+                    or next((m["text"] for m in msgs if m["role"] == "assistant"), None))
     title = one_line(first_prompt)[:TITLE_MAX] if first_prompt else None
     return make_summary("codex", sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
 
@@ -1029,25 +1124,24 @@ def discover() -> List[Tuple[str, str]]:
     ("codex", "~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl")] (paths expanded)
     """
     found: List[Tuple[str, str]] = []
-    root = claude_dir()
     try:
-        for d in os.scandir(root):
-            # ~/.claude/projects/memory holds memory files, not session transcripts.
-            if not d.is_dir(follow_symlinks=True) or d.name == "memory":
-                continue
-            try:
-                for f in os.scandir(d.path):
-                    if f.name.endswith(".jsonl") and f.is_file():
-                        found.append(("claude", f.path))
-            except OSError:
-                pass
+        project_dirs = list(os.scandir(claude_dir()))
     except OSError:
-        pass
-    sess = os.path.join(codex_dir(), "sessions")
-    for dp, _dn, fn in os.walk(sess):
-        for n in fn:
-            if n.startswith("rollout-") and n.endswith(".jsonl"):
-                found.append(("codex", os.path.join(dp, n)))
+        project_dirs = []
+    for d in project_dirs:
+        # ~/.claude/projects/memory holds memory files, not session transcripts.
+        if not d.is_dir(follow_symlinks=True) or d.name == "memory":
+            continue
+        try:
+            for f in os.scandir(d.path):
+                if f.name.endswith(".jsonl") and f.is_file():
+                    found.append(("claude", f.path))
+        except OSError:
+            pass
+    for dirpath, _dirnames, filenames in os.walk(os.path.join(codex_dir(), "sessions")):
+        for name in filenames:
+            if name.startswith("rollout-") and name.endswith(".jsonl"):
+                found.append(("codex", os.path.join(dirpath, name)))
     return found
 
 
@@ -1067,6 +1161,51 @@ def read_codex_titles() -> Dict[str, str]:
                 and o["thread_name"].strip():
             names[o["id"]] = one_line(o["thread_name"])
     return names
+
+
+def read_index_cache(cp: str) -> Dict[str, Any]:
+    """Read the per-file entries of the summary index.
+
+    Args:
+        cp: Path of index.json (see cache_path()).
+
+    Returns:
+        The "files" mapping (transcript path -> entry); {} if the file is missing, corrupt, or
+        written by another INDEX_VERSION.
+
+    Example: a missing file -> {}
+    """
+    try:
+        with open(cp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == INDEX_VERSION:
+            return data.get("files") or {}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def write_index_cache(cp: str, files: Dict[str, Any]) -> None:
+    """Atomically write the summary index (temp file + rename); failures are ignored.
+
+    Args:
+        cp: Path of index.json; its directory is created if needed.
+        files: The transcript path -> entry mapping to store.
+
+    Returns:
+        None. The cache is only an optimization, so I/O errors are swallowed.
+
+    Example: write_index_cache("/c/ai-sessions/index.json", {}) leaves
+    {"version": INDEX_VERSION, "files": {}} in that file.
+    """
+    try:
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cp), prefix=".index-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"version": INDEX_VERSION, "files": files}, f)
+        os.replace(tmp, cp)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def load_sessions(progress: bool = False) -> List[Session]:
@@ -1096,14 +1235,7 @@ def load_sessions(progress: bool = False) -> List[Session]:
     index.json now holds its summary; a second call re-parses nothing.
     """
     cp = cache_path()
-    cache: Dict[str, Any] = {}
-    try:
-        with open(cp, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and data.get("version") == INDEX_VERSION:
-            cache = data.get("files") or {}
-    except (OSError, ValueError):
-        cache = {}
+    cache = read_index_cache(cp)
     found = discover()
     seen = set()
     result: List[Session] = []
@@ -1139,22 +1271,15 @@ def load_sessions(progress: bool = False) -> List[Session]:
             del merged[p]
             dirty = True
     if dirty:
-        try:
-            os.makedirs(os.path.dirname(cp), exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cp), prefix=".index-", suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"version": INDEX_VERSION, "files": merged}, f)
-            os.replace(tmp, cp)
-        except (OSError, TypeError, ValueError):
-            pass
+        write_index_cache(cp, merged)
     titles = read_codex_titles()
-    for path, e in entries.items():
-        s = dict(e["summary"])
-        if s["source"] == "codex" and s["id"] in titles:
-            s["title"] = titles[s["id"]]
-        if s["n_user"] + s["n_asst"] == 0:
+    for entry in entries.values():
+        summary = dict(entry["summary"])
+        if summary["source"] == "codex" and summary["id"] in titles:
+            summary["title"] = titles[summary["id"]]
+        if summary["n_user"] + summary["n_asst"] == 0:
             continue
-        result.append(Session(s))
+        result.append(Session(summary))
     return result
 
 
@@ -1248,6 +1373,29 @@ def get_transcript(s: Session) -> List[Msg]:
     return msgs
 
 
+def result_preview_lines(text: str, width: int) -> List[Line]:
+    """Render a tool result as at most RESULT_PREVIEW_LINES "result" rows plus a "more" note.
+
+    Args:
+        text: The tool result text.
+        width: Display width in terminal columns.
+
+    Returns:
+        (row, "result") pairs: the first non-blank lines of text (or "(empty)"), each clipped
+        to fit, and a final "... (N more lines)" row when some were cut.
+
+    Examples:
+        result_preview_lines("", 40) -> [("    ← (empty)", "result")]
+        result_preview_lines("a\\n\\nb", 40) -> [("    ← a", "result"), ("    ← b", "result")]
+    """
+    body = [x for x in clean(text).split("\n") if x.strip()] or ["(empty)"]
+    rows: List[Line] = [("    ← " + clip(x.rstrip(), width - 6), "result")
+                        for x in body[:RESULT_PREVIEW_LINES]]
+    if len(body) > RESULT_PREVIEW_LINES:
+        rows.append(("    ← ... (%d more lines)" % (len(body) - RESULT_PREVIEW_LINES), "result"))
+    return rows
+
+
 def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
            mine_only: bool = False) -> Tuple[List[Line], int]:
     """Return (lines, body_start) for a session at the given display width.
@@ -1295,32 +1443,25 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
                   "meta"))
     lines.append((rule_chars()[0] * min(width, 200), "dim"))
     body_start = len(lines)
-    for m in msgs:
-        r = m["role"]
-        if r == "result" and not show_results:
+    for msg in msgs:
+        role = msg["role"]
+        if role == "result" and not show_results:
             continue
-        if mine_only and r not in ("user", "cmd"):
+        if mine_only and role not in ("user", "cmd"):
             continue
-        if r in ("user", "assistant"):
+        if role in ("user", "assistant"):
             if lines and lines[-1][0] != "":
                 lines.append(("", "text"))
-            who = "You:" if r == "user" else ASSISTANT_NAME[s.source] + ":"
-            lines.append((who + ("  " + fmt_ts(m["ts"], False) if m.get("ts") else ""),
-                          "user" if r == "user" else "asst"))
-            add_wrapped(m["text"], "text", "  ")
-        elif r == "cmd":
-            lines.append(("  > " + clip(clean(m["text"]), width - 4), "tool"))
-        elif r == "tool":
-            lines.append(("  → " + clip(clean(m["text"]), width - 4), "tool"))
-        elif r == "result":
-            body = [x for x in clean(m["text"]).split("\n") if x.strip()]
-            if not body:
-                body = ["(empty)"]
-            for x in body[:RESULT_PREVIEW_LINES]:
-                lines.append(("    ← " + clip(x.rstrip(), width - 6), "result"))
-            if len(body) > RESULT_PREVIEW_LINES:
-                lines.append(("    ← ... (%d more lines)" % (len(body) - RESULT_PREVIEW_LINES),
-                              "result"))
+            who = "You:" if role == "user" else ASSISTANT_NAME[s.source] + ":"
+            lines.append((who + ("  " + fmt_ts(msg["ts"], False) if msg.get("ts") else ""),
+                          "user" if role == "user" else "asst"))
+            add_wrapped(msg["text"], "text", "  ")
+        elif role == "cmd":
+            lines.append(("  > " + clip(clean(msg["text"]), width - 4), "tool"))
+        elif role == "tool":
+            lines.append(("  → " + clip(clean(msg["text"]), width - 4), "tool"))
+        elif role == "result":
+            lines.extend(result_preview_lines(msg["text"], width))
     return lines, body_start
 
 
@@ -1359,21 +1500,23 @@ def copy_clipboard(text: str) -> Optional[str]:
     Examples: on macOS copy_clipboard("cd /x && claude --resume a1") -> "pbcopy";
     on a Linux box with only xclip -> "xclip"; with no clipboard tool -> None
     """
-    cands: List[List[str]] = [["pbcopy"]]
+    # Try pbcopy (macOS) first; prefer wl-copy ahead of the X11 tools on a Wayland session.
+    candidates: List[List[str]] = [["pbcopy"]]
     if os.environ.get("WAYLAND_DISPLAY"):
-        cands.append(["wl-copy"])
-    cands += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"],
-              ["wl-copy"]]
-    for cmd in cands:
-        if shutil.which(cmd[0]):
-            try:
-                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
-                p.communicate(text.encode("utf-8"), timeout=5)
-                if p.returncode == 0:
-                    return cmd[0]
-            except (OSError, subprocess.SubprocessError):
-                continue
+        candidates.append(["wl-copy"])
+    candidates += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"],
+                   ["wl-copy"]]
+    for cmd in candidates:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            proc.communicate(text.encode("utf-8"), timeout=5)
+            if proc.returncode == 0:
+                return cmd[0]
+        except (OSError, subprocess.SubprocessError):
+            continue
     return None
 
 
@@ -1470,6 +1613,7 @@ class App(object):
                     bg = -1
                 except curses.error:
                     bg = curses.COLOR_BLACK
+                # (pair number, foreground, background); numbers match the color_pair() uses below.
                 pairs = [(1, curses.COLOR_GREEN, bg), (2, curses.COLOR_MAGENTA, bg),
                          (3, curses.COLOR_GREEN, bg), (4, curses.COLOR_CYAN, bg),
                          (5, curses.COLOR_BLACK, curses.COLOR_YELLOW),
@@ -2575,21 +2719,15 @@ def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool =
     return 0
 
 
-def main() -> int:
-    """Command-line entry point: parse arguments, then --list, --show or the TUI. Returns the
-    process exit code.
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for ai-sessions.
 
     Returns:
-        The process exit code.
+        The ArgumentParser with the query, --list, --search, --source, --show, --tools, --mine,
+        --claude-cmd and --codex-cmd options.
 
-    Examples: `ai-sessions --list fix` -> tab-separated rows of sessions matching "fix", 0;
-    `ai-sessions --show a1b2 --tools` -> that transcript including tool results, 0;
-    `ai-sessions` -> curses browser; `ai-sessions --list | head -1` exits 0 on a closed pipe.
+    Example: build_arg_parser().parse_args(["--list", "fix"]).query -> ["fix"]
     """
-    try:
-        locale.setlocale(locale.LC_ALL, "")
-    except locale.Error:
-        pass
     ap = argparse.ArgumentParser(
         prog="ai-sessions",
         description="Browse and search Claude Code and Codex CLI session transcripts. "
@@ -2609,6 +2747,25 @@ def main() -> int:
     ap.add_argument("--codex-cmd", metavar="CMD",
                     help="command to resume Codex sessions (default: $AI_SESSIONS_CODEX_CMD or "
                          "'codex'); {id} is replaced by the session id, else 'resume ID' is appended")
+    return ap
+
+
+def main() -> int:
+    """Command-line entry point: parse arguments, then --list, --show or the TUI. Returns the
+    process exit code.
+
+    Returns:
+        The process exit code.
+
+    Examples: `ai-sessions --list fix` -> tab-separated rows of sessions matching "fix", 0;
+    `ai-sessions --show a1b2 --tools` -> that transcript including tool results, 0;
+    `ai-sessions` -> curses browser; `ai-sessions --list | head -1` exits 0 on a closed pipe.
+    """
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    ap = build_arg_parser()
     args = ap.parse_args()
     if args.claude_cmd:
         CMD_OVERRIDES["claude"] = args.claude_cmd
