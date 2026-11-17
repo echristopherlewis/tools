@@ -958,6 +958,7 @@ HELP: List[str] = [
     "  Tab              source: all > Claude Code > Codex",
     "  p                toggle project filter (selected session's project)",
     "  s                sort: last activity / start time",
+    "  l                layout: list beside preview / list above preview",
     "  t                show tool results in transcript (calls always shown)",
     "  u                show only your input (prompts and slash commands)",
     "  Enter / v        full-screen viewer",
@@ -989,6 +990,7 @@ class App(object):
         self.sort = "last"
         self.show_results = False
         self.mine_only = False
+        self.split: Optional[str] = None  # "side" / "stack"; None: by terminal width
         self.sel = 0
         self.top = 0
         self.preview_offset = 0
@@ -1145,7 +1147,8 @@ class App(object):
         h, w = self.scr.getmaxyx()
         body_top, body_bot = 1, h - 2  # inclusive rows
         bh = body_bot - body_top + 1
-        if w >= SIDE_BY_SIDE_MIN_COLS:
+        mode = self.split or ("side" if w >= SIDE_BY_SIDE_MIN_COLS else "stack")
+        if mode == "side":
             lw = int(w * 0.45)
             return {"mode": "side", "list": (body_top, 0, bh, lw),
                     "prev": (body_top, lw + 1, bh, w - lw - 1), "sep": lw}
@@ -1313,6 +1316,11 @@ class App(object):
         self.sort = "start" if self.sort == "last" else "last"
         self.refilter()
 
+    def on_toggle_split(self) -> None:
+        self.split = "stack" if self.layout()["mode"] == "side" else "side"
+        self.status = " layout: %s" % ("list beside preview" if self.split == "side"
+                                       else "list above preview")
+
     def on_toggle_results(self) -> None:
         self.show_results = not self.show_results
         self.status = " tool results %s" % ("shown" if self.show_results else "hidden")
@@ -1403,6 +1411,7 @@ class App(object):
             (("TAB",), self.on_cycle_source),
             (("p",), self.on_toggle_project),
             (("s",), self.on_toggle_sort),
+            (("l",), self.on_toggle_split),
             (("t",), self.on_toggle_results),
             (("u",), self.on_toggle_mine),
             (("R",), self.on_rescan),

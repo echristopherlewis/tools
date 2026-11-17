@@ -923,6 +923,19 @@ class Tui(Env):
         self.assertIn(ai.rule_chars()[1], self.scr.frames[0])
         self.run_keys(["j", "\n", "q", "q"], w=60, h=14)
 
+    def test_split_toggle(self) -> None:
+        hz, vt = ai.rule_chars()
+        app = self.run_keys(["l", "q"], w=80)  # auto-stacked at 80 cols -> side
+        self.assertEqual(app.split, "side")
+        self.assertIn(vt, self.scr.frames[-1])
+        self.assertTrue(self.scr.any_frame("layout: list beside preview"))
+        app = self.run_keys(["l", "q"], w=120)  # auto side at 120 cols -> stacked
+        self.assertEqual(app.split, "stack")
+        self.assertIn(hz * 20, self.scr.frames[-1])
+        self.assertNotIn(vt, self.scr.frames[-1])
+        app = self.run_keys(["l", "l", "q"], w=120)
+        self.assertEqual(app.split, "side")
+
     def test_too_small_terminal(self) -> None:
         self.run_keys(["q"], h=5, w=20)
         self.assertTrue(self.scr.any_frame("terminal too small"))
