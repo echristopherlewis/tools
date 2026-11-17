@@ -1522,35 +1522,67 @@ def copy_clipboard(text: str) -> Optional[str]:
 
 # ---------------------------------------------------------------- TUI
 
-HELP: List[str] = [
-    "ai-sessions - browse Claude Code and Codex transcripts",
-    "",
-    "List:",
-    "  Up/Down j/k      move            PgUp/PgDn   page",
-    "  g/G Home/End     first / last    J/K         scroll preview",
-    "  /                filter (terms ANDed; Enter accept, Esc clear, ^U erase)",
-    "  Tab              source: all > Claude Code > Codex",
-    "  p                toggle project filter (selected session's project)",
-    "  s                sort: last activity / start time",
-    "  l                layout: list beside preview / list above preview",
-    "  t                show tool results in transcript (calls always shown)",
-    "  u                show only your input (prompts and slash commands)",
-    "  Enter / v        full-screen viewer",
-    "  r                resume session with the configured command, in its cwd",
-    "  e                edit resume command line, then resume",
-    "  y                copy resume command to clipboard",
-    "  R                rescan      ?  help      q  quit",
-    "",
-    "Viewer:",
-    "  j/k Up/Down PgUp/PgDn space b g/G   scroll",
-    "  /  search     n/N  next/previous hit     t  toggle tool results",
-    "  u  toggle showing only your input",
-    "  r  resume         e  edit resume command line, then resume",
-    "  y  copy resume command          ?  help",
-    "  q / Esc          back",
-    "",
-    "Press any key.",
+HELP_TITLE = "ai-sessions - browse Claude Code and Codex transcripts"
+
+# Help screen contents: (section title, [(keys, what they do), ...]). Keys are drawn in a
+# fixed-width column so the descriptions line up.
+HELP: List[Tuple[str, List[Tuple[str, str]]]] = [
+    ("Session list", [
+        ("j k  Up Down", "move selection"),
+        ("PgUp PgDn", "page up / down"),
+        ("g G  Home End", "first / last session"),
+        ("J K", "scroll the preview"),
+        ("/", "filter (terms ANDed)"),
+        ("", "Enter accept, Esc clear, ^U erase"),
+        ("Esc", "clear the filter"),
+        ("Tab", "source: all > Claude Code > Codex"),
+        ("p", "toggle: only the selected session's project"),
+        ("s", "sort: last activity / start time"),
+        ("l", "layout: side by side / stacked"),
+        ("t", "toggle tool results (calls always shown)"),
+        ("u", "toggle showing only your input"),
+        ("Enter v", "open full-screen viewer"),
+        ("R", "rescan session files"),
+    ]),
+    ("Viewer", [
+        ("j k  Up Down", "scroll one line"),
+        ("PgDn Space f", "page down"),
+        ("PgUp b", "page up"),
+        ("g G  Home End", "top / bottom"),
+        ("/", "search"),
+        ("n N", "next / previous hit"),
+        ("t", "toggle tool results"),
+        ("u", "toggle showing only your input"),
+        ("q Esc", "back to the list"),
+    ]),
+    ("Both", [
+        ("r", "resume session (configured command, in its cwd)"),
+        ("e", "edit the resume command line, then resume"),
+        ("y", "copy the resume command to the clipboard"),
+        ("?", "this help"),
+        ("q", "quit (from the list)"),
+    ]),
 ]
+HELP_KEY_WIDTH = 15  # width of the keys column, including the gap before the description
+HELP_FOOTER = "Press any key to close."
+
+
+def help_lines() -> List[Tuple[str, str, str]]:
+    """Flatten HELP into drawable rows of (kind, keys, text).
+
+    Returns:
+        One tuple per screen row: ("title", "", title), ("section", "", name), ("key", keys,
+        description) or ("blank", "", ""). Sections are separated by a blank row.
+
+    Example: help_lines()[:3] -> [("title", "", HELP_TITLE), ("blank", "", ""),
+    ("section", "", "Session list")]
+    """
+    rows: List[Tuple[str, str, str]] = [("title", "", HELP_TITLE)]
+    for name, keys in HELP:
+        rows.append(("blank", "", ""))
+        rows.append(("section", "", name))
+        rows.extend(("key", k, d) for k, d in keys)
+    return rows
 
 
 class App(object):
@@ -2316,19 +2348,44 @@ class App(object):
         self.refilter()
 
     def help(self) -> None:
-        """Show the HELP text full-screen and wait for any key (resizes are ignored).
+        """Show the key bindings full-screen and wait for a key. j/k, arrows and PgUp/PgDn scroll
+        when the help is taller than the screen; any other key closes it. Redraws on resize.
 
-        Example: help() draws "ai-sessions - browse Claude Code and Codex transcripts" (bold) and
-        the key list, returns when the user presses any key such as "x".
+        Example: help() draws HELP_TITLE (bold), a "Session list" heading, rows such as
+        "  /              filter (terms ANDed)", and returns when the user presses "x".
         """
-        self.scr.erase()
-        h, w = self.scr.getmaxyx()
-        for i, ln in enumerate(HELP[:h - 1]):
-            self.put(i, 1, clip(ln, w - 2), self.attrs["bold"] if i == 0 else 0)
-        self.scr.refresh()
+        rows = help_lines()
+        top = 0
         while True:
+            self.scr.erase()
+            h, w = self.scr.getmaxyx()
+            body = max(1, h - 1)  # last row is the footer
+            top = max(0, min(top, len(rows) - body))
+            for y, (kind, keys, text) in enumerate(rows[top:top + body]):
+                if kind == "title":
+                    self.put(y, 1, clip(text, w - 2), self.attrs["bold"])
+                elif kind == "section":
+                    self.put(y, 1, clip(text, w - 2), self.attrs["head"])
+                elif kind == "key":
+                    self.put(y, 3, clip(keys, w - 4), self.attrs["asst"])
+                    if w > 3 + HELP_KEY_WIDTH:
+                        self.put(y, 3 + HELP_KEY_WIDTH, clip(text, w - 4 - HELP_KEY_WIDTH))
+            more = len(rows) > body
+            footer = HELP_FOOTER + ("  j/k scroll" if more else "")
+            self.put(h - 1, 1, clip(footer, w - 2), self.attrs["dim"])
+            self.scr.refresh()
             k = self.key()
-            if k not in (None, "RESIZE"):
+            if k in (None, "RESIZE"):
+                continue
+            if more and k in ("j", "DOWN", "SDOWN"):
+                top += 1
+            elif more and k in ("k", "UP", "SUP"):
+                top -= 1
+            elif more and k in ("PGDN", " "):
+                top += body
+            elif more and k in ("PGUP", "b"):
+                top -= body
+            else:
                 return
 
     def viewer(self, s: Session) -> bool:

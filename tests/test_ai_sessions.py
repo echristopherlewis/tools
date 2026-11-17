@@ -823,7 +823,18 @@ class Tui(Env):
     def test_help(self) -> None:
         self.run_keys(["?", "x", "q"])
         self.assertTrue(self.scr.any_frame("ai-sessions - browse Claude Code and Codex transcripts"))
-        self.assertTrue(self.scr.any_frame("Press any key."))
+        self.assertTrue(self.scr.any_frame("Press any key to close."))
+        self.assertTrue(self.scr.any_frame("Session list"))
+
+    def test_help_scrolls_when_short(self) -> None:
+        # On a short screen j scrolls the help instead of closing it; x then closes it.
+        app = self.make(["?", "j", "x", "q"], h=12)
+        app.run()
+        self.assertTrue(self.scr.any_frame("j/k scroll"))
+        helps = [f for f in self.scr.frames if "Press any key to close." in f]
+        self.assertEqual(len(helps), 2)                 # before and after one j
+        self.assertIn(ai.HELP_TITLE, helps[0])
+        self.assertNotIn(ai.HELP_TITLE, helps[1])       # scrolled past the title
 
     def test_preview_scroll(self) -> None:
         # With a query the preview starts scrolled to the first hit (here: near the end),
@@ -906,7 +917,7 @@ class Tui(Env):
 
     def test_viewer_help(self) -> None:
         app = self.run_keys(["\n", "?", "x", "q", "q"])
-        self.assertTrue(self.scr.any_frame("Press any key."))
+        self.assertTrue(self.scr.any_frame("Press any key to close."))
         self.assertIsNone(app.resume)
 
     def test_viewer_shows_results_when_toggled(self) -> None:
