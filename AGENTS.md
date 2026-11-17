@@ -6,8 +6,13 @@ Small standalone CLI tools; see [README.md](README.md).
   test: `python3 tests/test_ai_sessions.py ClaudeParsing.test_full_session`.
 - Keep tools single-file, stdlib-only, Python 3.6+ (`typing`, no builtin generics/`|` unions,
   no `from __future__ import annotations`), portable across macOS and Linux (BSD/GNU-compatible flags).
-- Keep README in sync with behavior and environment variables (the `ai-sessions` module
-  docstring lists them too).
+- Always use type hints on Python function parameters and return values (and on
+  variables where the type isn't obvious).
+- Give every non-trivial function a docstring that says what it does, with an example
+  input and the output it produces.
+- Keep all `.md` files (README, AGENTS.md, etc.) consistent with the project whenever
+  behavior, structure, or conventions change. In particular, keep README in sync with
+  behavior and environment variables (the `ai-sessions` module docstring lists them too).
 
 ## ai-sessions architecture
 

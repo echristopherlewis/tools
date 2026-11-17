@@ -104,7 +104,14 @@ TS_RE: Pattern[str] = re.compile(
 # ---------------------------------------------------------------- helpers
 
 def parse_ts(v: Any) -> Optional[float]:
-    """Epoch seconds from an ISO-8601 string or a numeric epoch; None if unusable."""
+    """Epoch seconds from an ISO-8601 string or a numeric epoch; None if unusable.
+
+    Examples:
+        parse_ts("2025-03-01T10:00:00.000Z") -> 1740823200.0
+        parse_ts("2025-03-01T10:00:00+02:00") -> 1740816000
+        parse_ts(1700000000000) -> 1700000000.0   (milliseconds are converted)
+        parse_ts("nope") -> None
+    """
     if v is None:
         return None
     if isinstance(v, (int, float)):
@@ -132,6 +139,14 @@ def parse_ts(v: Any) -> Optional[float]:
 
 
 def fmt_ts(ts: Optional[float], with_date: bool = True) -> str:
+    """Format an epoch timestamp as local time ("YYYY-MM-DD HH:MM", or "HH:MM" without the
+    date); "-" when it is missing, zero or out of range.
+
+    Examples (local timezone UTC):
+        fmt_ts(1740823200.0) -> "2025-03-01 10:00"
+        fmt_ts(1740823200.0, with_date=False) -> "10:00"
+        fmt_ts(None) -> "-"
+    """
     if not ts:
         return "-"
     try:
@@ -142,7 +157,10 @@ def fmt_ts(ts: Optional[float], with_date: bool = True) -> str:
 
 
 def clean(s: Any) -> str:
-    """Make text safe for a terminal cell grid."""
+    """Make text safe for a terminal cell grid.
+
+    Example: clean("a\\tb\\x07c") -> "a    b c"   (tab -> 4 spaces, control char -> space)
+    """
     if not isinstance(s, str):
         s = str(s)
     s = s.replace("\t", "    ").replace("\r", "")
@@ -154,6 +172,11 @@ _wcache: Dict[str, int] = {}
 
 
 def char_width(c: str) -> int:
+    """Terminal columns one character occupies: 0 for combining marks, 2 for wide/fullwidth
+    (CJK), else 1. Results are memoized in _wcache.
+
+    Examples: char_width("a") -> 1; char_width("日") -> 2; char_width("\\u0301") -> 0
+    """
     w = _wcache.get(c)
     if w is None:
         if unicodedata.combining(c):
@@ -171,12 +194,22 @@ def str_width(s: str) -> int:
 
 
 def rule_chars() -> Tuple[str, str]:
-    """(horizontal, vertical) separator characters: box-drawing when UTF-8, else ASCII."""
+    """(horizontal, vertical) separator characters: box-drawing when UTF-8, else ASCII.
+
+    Examples: with a UTF-8 locale -> ("─", "│"); with an ASCII locale -> ("-", "|")
+    """
     enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
     return ("─", "│") if enc == "utf8" else ("-", "|")
 
 
 def clip(s: str, width: int) -> str:
+    """Cut s to at most width display columns (wide chars count as 2).
+
+    Examples:
+        clip("日本語abc", 5) -> "日本"
+        clip("hello", 3) -> "hel"
+        clip("hello", 0) -> ""
+    """
     if width <= 0:
         return ""
     out, w = [], 0
@@ -190,12 +223,24 @@ def clip(s: str, width: int) -> str:
 
 
 def pad(s: str, width: int) -> str:
+    """Clip s to width display columns, then right-pad with spaces to exactly width.
+
+    Examples:
+        pad("ab", 5) -> "ab   "
+        pad("日本語", 5) -> "日本 "   (the third wide char would not fit)
+    """
     s = clip(s, width)
     return s + " " * (width - str_width(s))
 
 
 def wrap(text: str, width: int) -> List[str]:
-    """Word-wrap text to a display width; blank-line runs collapse to one."""
+    """Word-wrap text to a display width; blank-line runs collapse to one.
+
+    Examples:
+        wrap("the quick brown fox jumps", 10) -> ["the quick", "brown fox", "jumps"]
+        wrap("a\\n\\n\\n\\nb", 10) -> ["a", "", "b"]
+        wrap("abcdefghijkl", 6) -> ["abcdef", "ghijkl"]   (over-long words are split)
+    """
     width = max(width, 4)
     lines: List[str] = []
     for para in text.split("\n"):
@@ -238,7 +283,12 @@ def wrap(text: str, width: int) -> List[str]:
 
 
 def first_line(s: Any, n: int = FIRST_LINE_MAX) -> str:
-    """First non-blank line of s, stripped and cut to n chars."""
+    """First non-blank line of s, stripped and cut to n chars.
+
+    Examples:
+        first_line("\\n  hi there \\nmore") -> "hi there"
+        first_line("abcdef", 3) -> "abc"
+    """
     for ln in str(s).split("\n"):
         ln = ln.strip()
         if ln:
@@ -247,17 +297,28 @@ def first_line(s: Any, n: int = FIRST_LINE_MAX) -> str:
 
 
 def one_line(s: Any) -> str:
-    """Collapse all whitespace runs (including newlines) to single spaces."""
+    """Collapse all whitespace runs (including newlines) to single spaces.
+
+    Example: one_line("a \\n b\\t c") -> "a b c"
+    """
     return " ".join(str(s).split())
 
 
 def terms_of(query: Optional[str]) -> List[str]:
-    """Split a filter query into lowercase terms (all must match)."""
+    """Split a filter query into lowercase terms (all must match).
+
+    Examples: terms_of("Foo  BAR") -> ["foo", "bar"]; terms_of(None) -> []
+    """
     return [t for t in (query or "").lower().split() if t]
 
 
 def term_regex(terms: List[str]) -> Optional[Pattern[str]]:
-    """Case-insensitive regex matching any term, longest first (for highlighting)."""
+    """Case-insensitive regex matching any term, longest first (for highlighting).
+
+    Examples:
+        term_regex(["fo", "foobar"]).pattern -> "foobar|fo"
+        term_regex([]) -> None
+    """
     if not terms:
         return None
     return re.compile("|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)),
@@ -274,6 +335,12 @@ def summarize_tool(name: Any, inp: Any) -> str:
 
     inp is a dict (Claude), or a dict / JSON string / plain string (Codex). The
     argument shown is the first TOOL_KEYS entry present, else the first string value.
+
+    Examples:
+        summarize_tool("Read", {"file_path": "/x"}) -> "Read: /x"
+        summarize_tool("shell", '{"command": ["ls", "-l"]}') -> "shell: ls -l"
+        summarize_tool("Foo", {"zzz": "v"}) -> "Foo: v"
+        summarize_tool("Foo", {}) -> "Foo"
     """
     name = str(name or "tool")
     val = ""
@@ -308,6 +375,11 @@ def content_text(c: Any) -> str:
 
     Content is a plain string or a list of strings / {"type":"text","text":...} blocks;
     other block kinds (images etc.) are dropped.
+
+    Examples:
+        content_text([{"type": "text", "text": "a"}, "b", {"type": "image"}]) -> "a\\nb"
+        content_text("x") -> "x"
+        content_text(None) -> ""
     """
     if isinstance(c, str):
         return c
@@ -327,7 +399,11 @@ def content_text(c: Any) -> str:
 # ---------------------------------------------------------------- parsing
 
 def iter_json(path: str) -> Iterator[Dict[str, Any]]:
-    """Yield each JSON-object line of a .jsonl file, skipping blank/garbled lines."""
+    """Yield each JSON-object line of a .jsonl file, skipping blank/garbled lines.
+
+    Example: for a file whose lines are `{"type": "user"}`, `garbage`, `` and `[1]`,
+    iter_json(path) yields only {"type": "user"}; a missing file yields nothing.
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -346,7 +422,13 @@ def iter_json(path: str) -> Iterator[Dict[str, Any]]:
 
 def content_blocks(content: Any) -> Optional[List[Any]]:
     """Normalize Claude message content to a block list: a bare string becomes one text
-    block; anything that is neither string nor list yields None (caller skips it)."""
+    block; anything that is neither string nor list yields None (caller skips it).
+
+    Examples:
+        content_blocks("hi") -> [{"type": "text", "text": "hi"}]
+        content_blocks([{"type": "text", "text": "hi"}]) -> the same list
+        content_blocks(5) -> None
+    """
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     return content if isinstance(content, list) else None
@@ -385,6 +467,15 @@ def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
     The session id is the filename stem. Title priority: custom-title > ai-title >
     summary > the first real prompt (shortened to TITLE_MAX). Later records of the
     same title type replace earlier ones.
+
+    Example: for ~/.claude/projects/-work-proj/abc.jsonl holding one user line
+    {"type": "user", "cwd": "/work/proj", "timestamp": "2025-03-01T10:00:00Z",
+    "message": {"content": "fix the bug"}} and one assistant text reply "done":
+
+        parse_claude(path) -> ({"source": "claude", "id": "abc", "cwd": "/work/proj",
+                                "title": "fix the bug", "n_user": 1, "n_asst": 1, ...},
+                               [{"role": "user", "text": "fix the bug", "ts": 1740823200.0},
+                                {"role": "assistant", "text": "done", "ts": ...}])
     """
     sid = os.path.basename(path)[:-6]
     cwd: Optional[str] = None
@@ -469,7 +560,13 @@ def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
 
 
 def codex_user_noise(text: str) -> bool:
-    """True for Codex user messages that are injected context, not typed prompts."""
+    """True for Codex user messages that are injected context, not typed prompts.
+
+    Examples:
+        codex_user_noise("<environment_context>cwd: /x</environment_context>") -> True
+        codex_user_noise("# AGENTS.md instructions for /x") -> True
+        codex_user_noise("fix the bug") -> False
+    """
     s = text.lstrip()
     return s.startswith(CODEX_NOISE) or bool(CODEX_TAG.match(s) and s.rstrip().endswith(">"))
 
@@ -499,6 +596,15 @@ def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
     of the filename stem: rollout-<timestamp>-<uuid> always ends in a 36-char UUID.
     Codex has no title records, so the title is the first user prompt (or the first
     assistant message); load_sessions() overrides it with session_index.jsonl names.
+
+    Example: for ~/.codex/sessions/2025/03/01/rollout-2025-03-01T10-00-00-<uuid>.jsonl with a
+    session_meta record (id "<uuid>", cwd "/work/proj"), a user message "fix the bug" and a
+    shell function_call:
+
+        parse_codex(path) -> ({"source": "codex", "id": "<uuid>", "cwd": "/work/proj",
+                               "title": "fix the bug", "n_user": 1, "n_asst": 0, ...},
+                              [{"role": "user", "text": "fix the bug", "ts": 1.7e9},
+                               {"role": "tool", "name": "shell", "text": "shell: ls -l", "ts": 1.7e9}])
     """
     stem = os.path.basename(path)[:-6]
     sid = stem[-36:] if len(stem) >= 36 else stem
@@ -570,7 +676,14 @@ def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
 def make_summary(source: str, sid: str, path: str, cwd: Optional[str], branch: Optional[str],
            title: Optional[str], first_ts: Optional[float], last_ts: Optional[float],
            msgs: List[Msg]) -> Summary:
-    """Build the index Summary from parsed fields and messages."""
+    """Build the index Summary from parsed fields and messages.
+
+    Example: make_summary("claude", "abc", "/p/abc.jsonl", "/work/proj", None, "Fix bug",
+    1.0, 2.0, [user "fix the bug", assistant "ok", tool Read]) ->
+    {"source": "claude", "id": "abc", "path": "/p/abc.jsonl", "cwd": "/work/proj",
+    "branch": "", "title": "Fix bug", "first_ts": 1.0, "last_ts": 2.0, "n_user": 1,
+    "n_asst": 1, "blob": "fix the bug\\nok\\nread"}
+    """
     n_user = sum(1 for m in msgs if m["role"] == "user")
     n_asst = sum(1 for m in msgs if m["role"] == "assistant")
     # "blob" is the text the filter searches: prompts, replies and tool names (not tool
@@ -624,6 +737,12 @@ class Session(object):
     search_text: str
 
     def __init__(self, d: Summary) -> None:
+        """Build a Session from an index Summary dict, adding project, title fallback and search_text.
+
+        Example: Session({"source": "claude", "id": "a1", "cwd": "/work/proj", "title": "",
+        "blob": "Fix", ...}) -> .project == "proj", .title == "(untitled)",
+        .search_text == "(untitled)\\nproj\\n/work/proj\\nfix"; with cwd "" -> .project == "-"
+        """
         self.__dict__.update(d)
         self.project = os.path.basename(self.cwd.rstrip("/")) if self.cwd else "-"
         if not self.title:
@@ -638,6 +757,12 @@ class Session(object):
         return build_resume_argv(self.source, self.id)[1]
 
     def resume_cmd(self) -> str:
+        """Shell command line that resumes this session, prefixed with a cd into its cwd.
+
+        Examples:
+            claude session a1 in /work/proj -> "cd /work/proj && claude --resume a1"
+            codex session b1 with cwd "" -> "codex resume b1"
+        """
         cmd = " ".join(shell_quote(w) for w in self.resume_argv())
         return ("cd %s && %s" % (shell_quote(self.cwd), cmd)) if self.cwd else cmd
 
@@ -651,14 +776,29 @@ DEFAULT_RESUME_ARGS: Dict[str, List[str]] = {"claude": ["--resume", "{id}"], "co
 
 
 def resume_template(source: str) -> str:
-    """Command template: CLI flag, then AI_SESSIONS_<SRC>_CMD, then the bare command."""
+    """Command template: CLI flag, then AI_SESSIONS_<SRC>_CMD, then the bare command.
+
+    Examples:
+        with no override and no env var: resume_template("claude") -> "claude"
+        with AI_SESSIONS_CLAUDE_CMD="mycl --x {id}": resume_template("claude") -> "mycl --x {id}"
+    """
     return (CMD_OVERRIDES.get(source)
             or os.environ.get("AI_SESSIONS_%s_CMD" % source.upper())
             or DEFAULT_CMDS[source])
 
 
 def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
-    """Returns (argv, warning). warning is None unless the template was unusable."""
+    """Returns (argv, warning). warning is None unless the template was unusable.
+
+    Examples:
+        build_resume_argv("claude", "abc") -> (["claude", "--resume", "abc"], None)
+        build_resume_argv("codex", "abc") -> (["codex", "resume", "abc"], None)
+        with AI_SESSIONS_CLAUDE_CMD="mycl --x {id} --y":
+            build_resume_argv("claude", "abc") -> (["mycl", "--x", "abc", "--y"], None)
+        with AI_SESSIONS_CLAUDE_CMD="'unterminated":
+            build_resume_argv("claude", "abc") ->
+                (["claude", "--resume", "abc"], "bad claude command: No closing quotation")
+    """
     warn: Optional[str] = None
     try:
         words = shlex.split(resume_template(source))
@@ -673,6 +813,13 @@ def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
 
 
 def shell_quote(s: str) -> str:
+    """Quote s for a POSIX shell, leaving it bare when it only has safe characters.
+
+    Examples:
+        shell_quote("/tmp/x") -> "/tmp/x"
+        shell_quote("a b") -> "'a b'"
+        shell_quote("it's") -> "'it'\\\\''s'"
+    """
     if re.match(r"^[\w@%+=:,./-]+$", s):
         return s
     return "'" + s.replace("'", "'\\''") + "'"
@@ -687,12 +834,22 @@ def codex_dir() -> str:
 
 
 def cache_path() -> str:
+    """Location of the summary index: $XDG_CACHE_HOME (default ~/.cache) / ai-sessions / index.json.
+
+    Example: with XDG_CACHE_HOME=/c -> "/c/ai-sessions/index.json"
+    """
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     return os.path.join(base, "ai-sessions", "index.json")
 
 
 def discover() -> List[Tuple[str, str]]:
-    """List every transcript file as (source, path) without opening any of them."""
+    """List every transcript file as (source, path) without opening any of them.
+
+    Example: with ~/.claude/projects/-work-proj/abc.jsonl and
+    ~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl on disk ->
+    [("claude", "~/.claude/projects/-work-proj/abc.jsonl"),
+    ("codex", "~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl")] (paths expanded)
+    """
     found: List[Tuple[str, str]] = []
     root = claude_dir()
     try:
@@ -717,7 +874,11 @@ def discover() -> List[Tuple[str, str]]:
 
 
 def read_codex_titles() -> Dict[str, str]:
-    """Map Codex session id -> thread name from session_index.jsonl (may be absent)."""
+    """Map Codex session id -> thread name from session_index.jsonl (may be absent).
+
+    Example: a session_index.jsonl line {"id": "u1", "thread_name": "Fix\\nbug"} ->
+    {"u1": "Fix bug"}; a missing file -> {}
+    """
     names: Dict[str, str] = {}
     for o in iter_json(os.path.join(codex_dir(), "session_index.jsonl")):
         if isinstance(o.get("id"), str) and isinstance(o.get("thread_name"), str) \
@@ -741,6 +902,10 @@ def load_sessions(progress: bool = False) -> List[Session]:
     Codex titles from session_index.jsonl are applied here at load time, after the
     cache, rather than stored in it: that file changes independently of the rollouts,
     so caching its names would leave them stale.
+
+    Example: with one Claude transcript (user + assistant message) under
+    AI_SESSIONS_CLAUDE_DIR and an empty cache -> [Session(source="claude", ...)], and
+    index.json now holds its summary; a second call re-parses nothing.
     """
     cp = cache_path()
     cache: Dict[str, Any] = {}
@@ -811,6 +976,11 @@ def filter_sessions(sessions: List[Session], query: str = "", source: str = "all
 
     The query is split on whitespace; every term must appear (case-insensitive
     substring) in the session's title, project, cwd or transcript text.
+
+    Examples (sessions A = claude "Fix bug" in /work/proj, B = codex "Add tests" in /work/other):
+        filter_sessions([A, B], "fix") -> [A]
+        filter_sessions([A, B], "", source="codex") -> [B]
+        filter_sessions([A, B], "", project="/work/proj") -> [A]
     """
     terms = terms_of(query)
     out: List[Session] = []
@@ -826,6 +996,12 @@ def filter_sessions(sessions: List[Session], query: str = "", source: str = "all
 
 
 def sort_sessions(sessions: List[Session], mode: str = "last") -> List[Session]:
+    """Newest first, by last activity (mode "last") or by start time (any other mode, e.g. "start").
+
+    Example: A(first_ts=1, last_ts=2), B(first_ts=5, last_ts=3):
+        sort_sessions([A, B]) -> [B, A]; sort_sessions([A, B], "start") -> [B, A]
+        with B(first_ts=0, last_ts=3): sort_sessions([A, B], "start") -> [A, B]
+    """
     key: Callable[[Session], float] = (
         (lambda s: s.last_ts) if mode == "last" else (lambda s: s.first_ts))
     return sorted(sessions, key=key, reverse=True)
@@ -839,7 +1015,11 @@ _parsed: "collections.OrderedDict[Tuple[str, float], List[Msg]]" = collections.O
 
 
 def get_transcript(s: Session) -> List[Msg]:
-    """Messages of a session, parsed on demand and kept in a small LRU cache."""
+    """Messages of a session, parsed on demand and kept in a small LRU cache.
+
+    Example: get_transcript(s) parses s.path and returns [{"role": "user", "text": "fix the
+    bug", "ts": 1.7e9}, ...]; calling it again with the file unchanged returns the cached list.
+    """
     try:
         mt = os.stat(s.path).st_mtime
     except OSError:
@@ -868,6 +1048,14 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
     labels); text (message body); tool (calls and slash commands); result (tool output).
     show_results includes tool results; mine_only keeps only your own input (prompts
     and slash commands).
+
+    Example: for a claude session "Fix bug" (id a1, cwd /work/proj, no branch) with messages
+    [user "fix the bug", assistant "ok", tool "Read: /x"], width 40, show_results False ->
+    lines (body_start == 6):
+        ("Fix bug", "title"), ("Claude Code   a1", "meta"), ("Dir:     /work/proj", "meta"),
+        ("Started: ...   Updated: ...", "meta"), ("Messages: 1 you, 1 claude", "meta"),
+        ("────...", "dim"), ("", "text"), ("You:  10:00", "user"), ("  fix the bug", "text"),
+        ("", "text"), ("Claude:", "asst"), ("  ok", "text"), ("  → Read: /x", "tool")
     """
     width = max(width, 10)
     lines: List[Line] = []
@@ -916,7 +1104,11 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
 
 
 def hit_lines(lines: List[Line], start: int, terms: List[str]) -> List[int]:
-    """Indexes of body lines (from `start`, so never the header) containing any term."""
+    """Indexes of body lines (from `start`, so never the header) containing any term.
+
+    Example: lines [("Fix bug", "title"), ..., ("  fix the bug", "text")] with start=6 and
+    terms ["bug"] -> [8] (the title at index 0 is in the header, so it is not a hit).
+    """
     if not terms:
         return []
     return [i for i in range(start, len(lines))
@@ -927,7 +1119,11 @@ def hit_lines(lines: List[Line], start: int, terms: List[str]) -> List[int]:
 # ---------------------------------------------------------------- clipboard
 
 def copy_clipboard(text: str) -> Optional[str]:
-    """Copy text with the first available tool; return its name, or None if none worked."""
+    """Copy text with the first available tool; return its name, or None if none worked.
+
+    Examples: on macOS copy_clipboard("cd /x && claude --resume a1") -> "pbcopy";
+    on a Linux box with only xclip -> "xclip"; with no clipboard tool -> None
+    """
     cands: List[List[str]] = [["pbcopy"]]
     if os.environ.get("WAYLAND_DISPLAY"):
         cands.append(["wl-copy"])
@@ -982,6 +1178,12 @@ HELP: List[str] = [
 class App(object):
     def __init__(self, scr: Window, sessions: List[Session], query: str,
                  source: str = "all") -> None:
+        """Set up UI state (filter, sort, selection, scroll, caches), colors, the filtered view
+        and the key map. scr is the curses window; query/source are the initial filter.
+
+        Example: App(scr, sessions, "fix", "claude") -> .view holds the Claude sessions matching
+        "fix", newest first; .sel == 0; .sort == "last"; .split is None (layout chosen by width)
+        """
         self.scr = scr
         self.all = sessions
         self.query = query
@@ -1008,6 +1210,12 @@ class App(object):
 
     # -- setup
     def init_colors(self) -> None:
+        """Fill self.attrs (name -> curses attribute) and hide the cursor. Uses color pairs when the
+        terminal has colors; otherwise (or on curses errors) it keeps the bold/dim/reverse fallbacks.
+
+        Example: on a color terminal -> self.attrs["cc"] == color_pair(1) | A_BOLD;
+        on a monochrome one -> self.attrs["cc"] == A_BOLD and self.attrs["hl"] == A_REVERSE | A_BOLD
+        """
         attrs: Dict[str, int] = {"plain": 0, "dim": curses.A_DIM, "bold": curses.A_BOLD, "rev": curses.A_REVERSE,
              "cc": curses.A_BOLD, "cx": curses.A_UNDERLINE, "user": curses.A_BOLD,
              "asst": curses.A_BOLD, "hl": curses.A_REVERSE | curses.A_BOLD,
@@ -1046,6 +1254,11 @@ class App(object):
 
     # -- drawing primitives
     def put(self, y: int, x: int, s: str, attr: int = 0) -> None:
+        """Write s at row y, column x with attr, ignoring curses errors (e.g. off-screen writes).
+
+        Example: put(0, 0, "hi", A_BOLD) draws "hi" at the top-left; put(99, 0, "hi") on a 24-row
+        screen draws nothing and does not raise.
+        """
         try:
             self.scr.addstr(y, x, s, attr)
         except curses.error:
@@ -1053,6 +1266,12 @@ class App(object):
 
     def text(self, y: int, x: int, s: str, maxw: int, attr: int,
              pat: Optional[Pattern[str]] = None) -> None:
+        """Draw s at (y, x): sanitized, newlines flattened, clipped to maxw columns, with matches of
+        pat drawn in the highlight attribute.
+
+        Example: text(3, 0, "fix the bug", 20, 0, re.compile("bug", re.I)) draws "fix the " plain
+        at column 0 and "bug" highlighted at column 8; with maxw=5 it draws only "fix t".
+        """
         s = clip(clean(s).replace("\n", " "), maxw)
         if not s or maxw <= 0:
             return
@@ -1069,7 +1288,11 @@ class App(object):
             self.put(y, x + str_width(s[:pos]), s[pos:], attr)
 
     def fill(self, y: int, attr: int) -> None:
-        """Paint row y with attr across the full width (for the header/footer bars)."""
+        """Paint row y with attr across the full width (for the header/footer bars).
+
+        Example: on an 80x24 screen, fill(23, attrs["head"]) paints all 80 cells of the last row
+        with spaces in the header attribute.
+        """
         h, w = self.scr.getmaxyx()
         self.put(y, 0, " " * (w - 1), attr)
         # addstr into the bottom-right cell raises (the cursor cannot advance past it),
@@ -1082,6 +1305,12 @@ class App(object):
 
     # -- state
     def refilter(self, keep: bool = True) -> None:
+        """Recompute self.view from the query/source/project filters and the sort mode, reset the
+        scroll, and (when keep is true) keep the same session selected if it is still listed.
+
+        Example: view [A, B, C] with C selected (sel == 2), then query "c" leaves [C] ->
+        view == [C], sel == 0; with keep=False after a filter change -> sel == 0.
+        """
         cur = self.view[self.sel].path if (keep and self.view and self.sel < len(self.view)) else None
         v = filter_sessions(self.all, self.query, self.source, self.project)
         self.view = sort_sessions(v, self.sort)
@@ -1097,6 +1326,12 @@ class App(object):
         return self.view[self.sel] if self.view and 0 <= self.sel < len(self.view) else None
 
     def filter_desc(self) -> str:
+        """Human-readable summary of the active filters for the header bar.
+
+        Examples:
+            no filters -> "none"
+            source "claude", project "/work/proj", query "fix" -> "source=Claude Code project=proj /fix"
+        """
         parts: List[str] = []
         if self.source != "all":
             parts.append("source=" + LABEL[self.source])
@@ -1108,6 +1343,13 @@ class App(object):
 
     # -- key input
     def key(self) -> Optional[str]:
+        """Read one key and return its name: printable keys as themselves; special keys as names
+        ("ENTER", "ESC", "BS", "CU", "TAB", "CTRL_C", "UP", "DOWN", "PGUP", "PGDN", "HOME", "END",
+        "SUP", "SDOWN", "RESIZE"); unmapped special keys as "UNKNOWN"; None if nothing arrived.
+
+        Examples: pressing j -> "j"; pressing Enter -> "ENTER"; pressing F5 -> "UNKNOWN";
+        Ctrl-U -> "CU"; read timeout -> None
+        """
         try:
             k = self.scr.get_wch()
         except KeyboardInterrupt:
@@ -1129,7 +1371,16 @@ class App(object):
         return names.get(k, "UNKNOWN")
 
     def edit(self, buf: str, k: Optional[str]) -> Tuple[str, Optional[str]]:
-        """Apply a line-edit key to buf; return (new, done) where done in (None,'ok','cancel')."""
+        """Apply a line-edit key to buf; return (new, done) where done in (None,'ok','cancel').
+
+        Examples:
+            edit("ab", "c") -> ("abc", None)
+            edit("ab", "BS") -> ("a", None)
+            edit("ab", "CU") -> ("", None)
+            edit("ab", "ENTER") -> ("ab", "ok")
+            edit("ab", "ESC") -> ("ab", "cancel")
+            edit("ab", "UP") -> ("ab", None)   (non-printable keys are ignored)
+        """
         if k == "ENTER":
             return buf, "ok"
         if k == "ESC" or k == "CTRL_C":
@@ -1144,6 +1395,16 @@ class App(object):
 
     # -- layout
     def layout(self) -> Dict[str, Any]:
+        """Compute screen regions for the list and preview. Returns {"mode": "side" | "stack",
+        "list": Box, "prev": Box, "sep": column (side) or row (stack) of the separator}.
+        Mode is self.split, else "side" when the terminal is at least SIDE_BY_SIDE_MIN_COLS wide.
+
+        Examples:
+            120 cols x 40 rows -> {"mode": "side", "list": (1, 0, 38, 54),
+                                   "prev": (1, 55, 38, 65), "sep": 54}
+            80 cols x 24 rows -> {"mode": "stack", "list": (1, 0, 11, 80),
+                                  "prev": (13, 0, 10, 80), "sep": 12}
+        """
         h, w = self.scr.getmaxyx()
         body_top, body_bot = 1, h - 2  # inclusive rows
         bh = body_bot - body_top + 1
@@ -1157,6 +1418,13 @@ class App(object):
                 "prev": (body_top + lh + 1, 0, bh - lh - 1, w), "sep": body_top + lh}
 
     def draw(self) -> None:
+        """Repaint the whole list view: header bar (counts, filter, sort), session list, separator,
+        preview, and footer (status message or key hints).
+
+        Example: 3 of 10 sessions match "fix" on a 100x30 screen -> the top row reads
+        " ai-sessions  3/10 sessions  filter: /fix  sort: last activity", the footer shows the
+        key hints (or self.status if set); a screen under 24x6 shows only "terminal too small".
+        """
         scr = self.scr
         scr.erase()
         h, w = scr.getmaxyx()
@@ -1188,6 +1456,13 @@ class App(object):
         scr.refresh()
 
     def draw_list(self, box: Box, pat: Optional[Pattern[str]]) -> None:
+        """Draw the session rows into box, scrolling so the selection stays visible. Each row is
+        "date  tag  project  title", with the selected row in reverse video and filter matches
+        highlighted.
+
+        Example: row for a Claude session -> "2025-03-01 10:00 CC proj   Fix the bug"; with no
+        matching sessions the first row reads "(no matching sessions)".
+        """
         y0, x0, bh, bw = box
         if bw < 20 or bh < 1:
             return
@@ -1220,6 +1495,12 @@ class App(object):
 
     def preview_lines(self, s: Session, width: int,
                       pat_terms: List[str]) -> Tuple[List[Line], int, List[int]]:
+        """Rendered preview for s at width, as (lines, body_start, hit_indexes). Cached until the
+        session, its last_ts, width, toggles or terms change.
+
+        Example: preview_lines(s, 60, ["bug"]) -> ([("Fix bug", "title"), ...], 6, [8]);
+        a second identical call returns the very same cached tuple.
+        """
         key = (s.path, s.last_ts, width, self.show_results, self.mine_only, tuple(pat_terms))
         if self._preview_cache_key == key:
             return self._preview_cache
@@ -1231,6 +1512,12 @@ class App(object):
         return self._preview_cache
 
     def draw_preview(self, box: Box, pat: Optional[Pattern[str]]) -> None:
+        """Draw the preview of the selected session into box. Scroll jumps to just before the first
+        filter hit when the selection or filter changes, and is otherwise clamped to the content.
+
+        Example: selected session with a match on rendered line 20 for query "bug" -> preview_offset
+        becomes 18 (hit - 2) and lines 18.. are drawn; with no session selected nothing is drawn.
+        """
         y0, x0, bh, bw = box
         s = self.current()
         if s is None or bh < 1 or bw < 12:
@@ -1295,16 +1582,29 @@ class App(object):
         self.filter_mode()
 
     def on_clear_filter(self) -> None:
+        """Esc in the list: drop the text filter and refilter; does nothing if there is none.
+
+        Example: query "fix" -> query == "" and the view shows all sessions again.
+        """
         if self.query:
             self.query = ""
             self.refilter()
 
     def on_cycle_source(self) -> None:
+        """Tab: cycle the source filter all -> claude -> codex -> all, then refilter.
+
+        Example: source "claude" -> source "codex"; source "codex" -> "all"
+        """
         order = ["all", "claude", "codex"]
         self.source = order[(order.index(self.source) + 1) % len(order)]
         self.refilter()
 
     def on_toggle_project(self) -> None:
+        """Restrict the list to the selected session's project (its cwd), or clear that restriction.
+
+        Example: project None with a selected session in /work/proj -> project == "/work/proj";
+        pressed again -> project is None. A selected session with no cwd leaves project None.
+        """
         s = self.current()
         if self.project is not None:
             self.project = None
@@ -1313,23 +1613,45 @@ class App(object):
         self.refilter()
 
     def on_toggle_sort(self) -> None:
+        """Switch the sort mode between last activity and start time, then refilter.
+
+        Example: sort "last" -> sort "start" -> sort "last"
+        """
         self.sort = "start" if self.sort == "last" else "last"
         self.refilter()
 
     def on_toggle_split(self) -> None:
+        """Flip between side-by-side and stacked layouts (relative to the layout in effect now).
+
+        Example: on a 120-column terminal with split None -> split == "stack" and
+        status == " layout: list above preview"
+        """
         self.split = "stack" if self.layout()["mode"] == "side" else "side"
         self.status = " layout: %s" % ("list beside preview" if self.split == "side"
                                        else "list above preview")
 
     def on_toggle_results(self) -> None:
+        """Toggle display of tool results in transcripts and say so in the status line.
+
+        Example: show_results False -> True and status == " tool results shown"
+        """
         self.show_results = not self.show_results
         self.status = " tool results %s" % ("shown" if self.show_results else "hidden")
 
     def on_toggle_mine(self) -> None:
+        """Toggle showing only your own input (prompts and slash commands) and update the status line.
+
+        Example: mine_only False -> True and status == " showing only your input"
+        """
         self.mine_only = not self.mine_only
         self.status = " showing %s" % ("only your input" if self.mine_only else "full transcript")
 
     def on_rescan(self) -> None:
+        """Reload all sessions from disk (picking up new or changed transcripts) and refilter.
+
+        Example: after a new transcript appears, on_rescan() -> len(self.all) grows by 1 and
+        status == " rescanned: 11 sessions"
+        """
         self.all = load_sessions()
         self.refilter()
         self.status = " rescanned: %d sessions" % len(self.all)
@@ -1339,6 +1661,11 @@ class App(object):
         return s is not None and self.viewer(s)
 
     def on_resume(self) -> bool:
+        """r: choose the current session for resuming and leave the main loop.
+
+        Example: with a session selected whose cwd exists -> resume == that session, returns True;
+        with an empty list or a vanished cwd -> returns False (status explains why).
+        """
         s = self.current()
         if s is None or not self.can_resume(s):
             return False
@@ -1346,6 +1673,12 @@ class App(object):
         return True
 
     def on_edit_resume(self) -> bool:
+        """e: let the user edit the resume command, then choose the session for resuming.
+
+        Example: current session a1, user edits to "claude --resume a1 --model opus" and presses
+        Enter -> resume == the session, resume_override == ["claude", "--resume", "a1",
+        "--model", "opus"], returns True; pressing Esc -> returns False.
+        """
         s = self.current()
         if s is None or not self.can_resume(s):
             return False
@@ -1362,20 +1695,35 @@ class App(object):
             self.copy_resume_command(s)
 
     def copy_resume_command(self, s: Session) -> None:
-        """Copy s's resume command to the clipboard, reporting the outcome in the status."""
+        """Copy s's resume command to the clipboard, reporting the outcome in the status.
+
+        Example: with pbcopy available -> status == " copied via pbcopy: cd /work/proj && claude
+        --resume a1"; with no clipboard tool -> status == " no clipboard tool found
+        (pbcopy/wl-copy/xclip/xsel)"
+        """
         how = copy_clipboard(s.resume_cmd())
         self.status = (" copied via %s: %s" % (how, s.resume_cmd())) if how \
             else " no clipboard tool found (pbcopy/wl-copy/xclip/xsel)"
 
     def can_resume(self, s: Session) -> bool:
-        """Resuming runs in the session's cwd; refuse (with a status message) if it is gone."""
+        """Resuming runs in the session's cwd; refuse (with a status message) if it is gone.
+
+        Examples: cwd exists (or is empty) -> True; cwd "/gone" missing -> False and
+        status == " cwd no longer exists: /gone"
+        """
         if s.cwd and not os.path.isdir(s.cwd):
             self.status = " cwd no longer exists: " + s.cwd
             return False
         return True
 
     def edit_resume_command(self, s: Session, redraw_screen: bool = True) -> Optional[List[str]]:
-        """Let the user edit the resume command line; return its argv, or None if cancelled."""
+        """Let the user edit the resume command line; return its argv, or None if cancelled.
+
+        Examples: the prompt starts as "claude --resume a1";
+            user types " --model opus" and presses Enter -> ["claude", "--resume", "a1", "--model", "opus"]
+            user presses Esc, or clears the line -> None and status == " resume cancelled"
+            user enters an unbalanced quote -> status == " bad command: ..." and the prompt reopens
+        """
         initial = " ".join(shell_quote(w) for w in s.resume_argv())
         while True:
             buf, ok = self.prompt("resume: ", initial, redraw_screen=redraw_screen)
@@ -1394,7 +1742,10 @@ class App(object):
             return argv
 
     def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
-        """Key name (see App.key) -> handler for the session list."""
+        """Key name (see App.key) -> handler for the session list.
+
+        Example: build_keymap()["j"] is self.on_down; build_keymap()["ENTER"] is self.on_open
+        """
         bindings: List[Tuple[Tuple[str, ...], Callable[[], Optional[bool]]]] = [
             (("q", "CTRL_C"), self.on_quit),
             (("?",), self.on_help),
@@ -1423,7 +1774,11 @@ class App(object):
         return {name: fn for names, fn in bindings for name in names}
 
     def run(self) -> None:
-        """Main loop: draw, read a key, dispatch. Returns on quit or when a resume is chosen."""
+        """Main loop: draw, read a key, dispatch. Returns on quit or when a resume is chosen.
+
+        Example: keys "j", "j", "q" -> selection moves down twice, then run() returns; keys "r" on
+        a resumable session -> sets self.resume and returns.
+        """
         while True:
             self.draw()
             k = self.key()
@@ -1442,6 +1797,9 @@ class App(object):
         redraw_screen=True repaints the whole list view each keystroke (so live changes
         show); the full-screen viewer passes False to keep its already-drawn frame and
         only repaint the footer.
+
+        Examples: prompt("/", "fi") with keys "x", ENTER -> ("fix", True);
+                  prompt("/", "fi") with key ESC -> ("fi", False)
         """
         buf = initial
         while True:
@@ -1467,6 +1825,12 @@ class App(object):
                 live(buf)
 
     def filter_mode(self) -> None:
+        """Prompt for the list filter ("/"), refiltering live as you type. Enter keeps the text;
+        Esc clears the filter.
+
+        Example: typing "fix" then Enter -> query == "fix" and the view only has matches;
+        typing "fix" then Esc -> query == "" and the full list returns.
+        """
         def live(b: str) -> None:
             self.query = b
             self.refilter()
@@ -1475,6 +1839,11 @@ class App(object):
         self.refilter()
 
     def help(self) -> None:
+        """Show the HELP text full-screen and wait for any key (resizes are ignored).
+
+        Example: help() draws "ai-sessions - browse Claude Code and Codex transcripts" (bold) and
+        the key list, returns when the user presses any key such as "x".
+        """
         self.scr.erase()
         h, w = self.scr.getmaxyx()
         for i, ln in enumerate(HELP[:h - 1]):
@@ -1503,6 +1872,12 @@ class Viewer(object):
     """
 
     def __init__(self, app: App, s: Session) -> None:
+        """Load session s's transcript and set up scroll, search and render-cache state; the search
+        query starts as the app's list filter.
+
+        Example: Viewer(app, s) with app.query == "fix" -> .query == "fix", .offset == 0,
+        .hit_index == -1, .msgs == get_transcript(s)
+        """
         self.app = app
         self.session = s
         self.msgs = get_transcript(s)
@@ -1546,6 +1921,11 @@ class Viewer(object):
         self.app.mine_only = not self.app.mine_only
 
     def on_resume(self) -> bool:
+        """r: choose this session for resuming and leave the viewer.
+
+        Example: cwd exists -> app.resume == self.session and returns True; cwd gone -> returns
+        False and the viewer footer shows " cwd no longer exists: /gone".
+        """
         if not self.app.can_resume(self.session):
             self.take_app_status()
             return False
@@ -1553,6 +1933,12 @@ class Viewer(object):
         return True
 
     def on_edit_resume(self) -> bool:
+        """e: edit the resume command in the footer, then choose the session for resuming.
+
+        Example: user edits to "claude --resume a1 --model opus" and presses Enter ->
+        app.resume == self.session, app.resume_override == ["claude", "--resume", "a1",
+        "--model", "opus"], returns True; Esc -> returns False with the status " resume cancelled".
+        """
         app = self.app
         if not app.can_resume(self.session):
             self.take_app_status()
@@ -1573,7 +1959,11 @@ class Viewer(object):
         self.app.help()
 
     def take_app_status(self) -> None:
-        """Show a status message the App's shared helpers left, in the viewer's footer."""
+        """Show a status message the App's shared helpers left, in the viewer's footer.
+
+        Example: app.status == " resume cancelled" -> self.status == " resume cancelled" and
+        app.status == ""
+        """
         self.status, self.app.status = self.app.status, ""
 
     def on_next_hit(self) -> None:
@@ -1583,11 +1973,23 @@ class Viewer(object):
         self.goto_hit(-1)
 
     def goto_hit(self, step: int) -> None:
+        """Move to the next (step=1) or previous (step=-1) search hit, wrapping around, and scroll
+        so the hit sits about a third of the way down the screen.
+
+        Example: hits [8, 20, 40], hit_index 2, body_height 30: goto_hit(1) -> hit_index == 0,
+        offset == 0 (8 - 10 clamped); goto_hit(-1) from 1 -> hit_index == 0. With no hits: no change.
+        """
         if self.hits:
             self.hit_index = (self.hit_index + step) % len(self.hits)
             self.offset = max(0, self.hits[self.hit_index] - self.body_height // 3)
 
     def on_search(self) -> None:
+        """/: prompt for a search query in the footer; on Enter use it, restart hit navigation and
+        force a re-render with the new terms; on Esc leave everything unchanged.
+
+        Example: query "fix", user types "ing" and presses Enter -> query == "fixing",
+        hit_index == -1.
+        """
         buf, ok = self.app.prompt("/", self.query, redraw_screen=False)
         if ok:
             self.query = buf
@@ -1595,6 +1997,10 @@ class Viewer(object):
             self._render_key = None  # force a re-render with the new terms
 
     def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
+        """Key name (see App.key) -> handler for the viewer.
+
+        Example: build_keymap()["n"] is self.on_next_hit; build_keymap()[" "] is self.on_page_down
+        """
         bindings: List[Tuple[Tuple[str, ...], Callable[[], Optional[bool]]]] = [
             (("q", "ESC", "CTRL_C"), self.on_back),
             (("j", "DOWN", "ENTER"), self.on_line_down),
@@ -1621,6 +2027,13 @@ class Viewer(object):
 
     # -- drawing
     def draw(self, h: int, w: int) -> None:
+        """Draw one frame of the h x w viewer: re-render when width/toggles/terms changed, clamp the
+        scroll, then paint the title bar (with "hit i/n"), transcript lines and footer (status or
+        key hints plus scroll percentage).
+
+        Example: 40-line transcript, h=12 (10 body rows), query "bug" with 3 hits, offset 10 ->
+        title bar " CC Fix bug  hit 1/3", body shows lines 10-19, footer ends with "[50%]".
+        """
         app = self.app
         terms = terms_of(self.query)
         render_key = (w, app.show_results, app.mine_only, tuple(terms))
@@ -1659,6 +2072,12 @@ class Viewer(object):
         self.status = ""
 
     def run(self) -> None:
+        """Viewer main loop: draw, read a key, dispatch until a handler asks to leave. A too-small
+        terminal shows "too small" and waits for q / Esc / Ctrl-C.
+
+        Example: keys "j", "j", "q" -> offset 2 and then run() returns; key "r" on a resumable
+        session -> sets app.resume and returns.
+        """
         app = self.app
         while True:
             h, w = app.scr.getmaxyx()
@@ -1682,6 +2101,9 @@ def browse(scr: Window, sessions: List[Session], query: str,
     """Run the interactive browser (called inside curses.wrapper).
 
     Returns (session chosen for resume or None, edited resume argv or None).
+
+    Example: browse(scr, sessions, "fix", "all") with keys "r" on session a1 -> (a1, None);
+    with keys "q" -> (None, None).
     """
     scr.keypad(True)
     app = App(scr, sessions, query, source)
@@ -1690,6 +2112,13 @@ def browse(scr: Window, sessions: List[Session], query: str,
 
 
 def run_tui(query: str, source: Optional[str] = None) -> int:
+    """Run the interactive browser and, if a session was chosen, exec its resume command in the
+    session's directory. Returns an exit code (it does not return after a successful exec).
+
+    Examples: not a terminal -> prints "interactive mode needs a terminal (try --list)" to
+    stderr, returns 2; user quits with q -> 0; Ctrl-C -> 130; resume command not on PATH ->
+    127; resume chosen -> execvp("claude", ["claude", "--resume", "a1"]) after chdir.
+    """
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         sys.stderr.write("ai-sessions: interactive mode needs a terminal (try --list)\n")
         return 2
@@ -1718,6 +2147,11 @@ def run_tui(query: str, source: Optional[str] = None) -> int:
 # ---------------------------------------------------------------- CLI
 
 def cmd_list(sessions: List[Session], query: str, source: Optional[str]) -> int:
+    """Print matching sessions newest first, one tab-separated line each: date, source, id,
+    project, title. Returns 0.
+
+    Example: stdout gets "2025-03-01 10:00\\tclaude\\ta1\\tproj\\tFix bug\\n" for a1.
+    """
     for s in sort_sessions(filter_sessions(sessions, query, source or "all")):
         row = (fmt_ts(s.last_ts), s.source, s.id, s.project, s.title)
         sys.stdout.write("\t".join(one_line(c) for c in row) + "\n")
@@ -1725,6 +2159,13 @@ def cmd_list(sessions: List[Session], query: str, source: Optional[str]) -> int:
 
 
 def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool = False) -> int:
+    """Print the transcript of the session whose id equals ident or starts with it.
+    Returns 0; 1 (with a message on stderr) if nothing matches or the prefix is ambiguous.
+
+    Examples: cmd_show(sessions, "a1", False) -> prints the 100-column transcript, returns 0;
+    cmd_show(sessions, "zz", False) -> "ai-sessions: no session matches 'zz'", returns 1;
+    cmd_show(sessions, "a", False) with ids a1 and a2 -> lists both as ambiguous, returns 1.
+    """
     ms = [s for s in sessions if s.id == ident] or [s for s in sessions if s.id.startswith(ident)]
     if not ms:
         sys.stderr.write("ai-sessions: no session matches %r\n" % ident)
@@ -1741,6 +2182,13 @@ def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool =
 
 
 def main() -> int:
+    """Command-line entry point: parse arguments, then --list, --show or the TUI. Returns the
+    process exit code.
+
+    Examples: `ai-sessions --list fix` -> tab-separated rows of sessions matching "fix", 0;
+    `ai-sessions --show a1b2 --tools` -> that transcript including tool results, 0;
+    `ai-sessions` -> curses browser; `ai-sessions --list | head -1` exits 0 on a closed pipe.
+    """
     try:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
