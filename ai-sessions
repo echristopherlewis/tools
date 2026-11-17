@@ -170,6 +170,12 @@ def str_width(s: str) -> int:
     return sum(char_width(c) for c in s)
 
 
+def rule_chars() -> Tuple[str, str]:
+    """(horizontal, vertical) separator characters: box-drawing when UTF-8, else ASCII."""
+    enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
+    return ("─", "│") if enc == "utf8" else ("-", "|")
+
+
 def clip(s: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -878,7 +884,7 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
     lines.append(("Started: %s   Updated: %s" % (fmt_ts(s.first_ts), fmt_ts(s.last_ts)), "meta"))
     lines.append(("Messages: %d you, %d %s" % (s.n_user, s.n_asst, ASSISTANT_NAME[s.source].lower()),
                   "meta"))
-    lines.append(("-" * min(width, 200), "dim"))
+    lines.append((rule_chars()[0] * min(width, 200), "dim"))
     body_start = len(lines)
     for m in msgs:
         r = m["role"]
@@ -1165,11 +1171,12 @@ class App(object):
         self.put(0, 0, clip(hdr, w - 1), self.attrs["head"])
         lay = self.layout()
         self.draw_list(lay["list"], pat)
+        hz, vt = rule_chars()
         if lay["mode"] == "side":
             for y in range(1, h - 1):
-                self.put(y, lay["sep"], "|", self.attrs["dim"])
+                self.put(y, lay["sep"], vt, self.attrs["dim"])
         else:
-            self.put(lay["sep"], 0, "-" * (w - 1), self.attrs["dim"])
+            self.put(lay["sep"], 0, hz * (w - 1), self.attrs["dim"])
         self.draw_preview(lay["prev"], pat)
         self.fill(h - 1, self.attrs["head"])
         foot = self.status or (" j/k move  / filter  Tab source  p project  s sort  t results  u mine  "

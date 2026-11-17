@@ -398,7 +398,7 @@ class Cli(Env):
             "Branch:  feature/x",
             "Started: 2025-03-01 10:00   Updated: 2025-03-01 10:05",
             "Messages: 1 you, 2 claude",
-            "-" * 100,
+            ai.rule_chars()[0] * 100,
             "",
             "You:  10:00",
             "  Fix the frobnicator bug",
@@ -525,7 +525,7 @@ class Units(unittest.TestCase):
         lines, start = ai.render(s, msgs, 40, True)
         texts = [t for t, _ in lines]
         self.assertEqual(texts[0], "T")
-        self.assertTrue(start > 0 and texts[start - 1].startswith("---"))
+        self.assertTrue(start > 0 and texts[start - 1].startswith(ai.rule_chars()[0] * 3))
         self.assertIn("    ← r5", texts)
         self.assertIn("    ← ... (3 more lines)", texts)   # 6 result lines shown
         self.assertNotIn("    ← r6", texts)
@@ -669,7 +669,7 @@ class Tui(Env):
         self.assertIn("2025-03-04 08:01", scr)
         self.assertIn("CC", scr)
         self.assertIn("CX", scr)
-        self.assertIn("|", scr)  # side-by-side separator at 120 cols
+        self.assertIn(ai.rule_chars()[1], scr)  # side-by-side separator at 120 cols
         self.assertIn("Claude Code   " + D_ID, scr)  # preview pane
 
     def test_move_keys(self) -> None:
@@ -916,11 +916,11 @@ class Tui(Env):
     def test_narrow_and_wide_layouts(self) -> None:
         app = self.run_keys(["j", "q"], w=80)
         frame = self.scr.frames[0]
-        self.assertIn("-" * 20, frame)   # horizontal separator, stacked layout
+        self.assertIn(ai.rule_chars()[0] * 20, frame)   # horizontal separator, stacked layout
         self.assertIn("ai-sessions", frame)
         self.run_keys(["j", "q"], w=99)
         self.run_keys(["j", "q"], w=100)
-        self.assertIn("|", self.scr.frames[0])
+        self.assertIn(ai.rule_chars()[1], self.scr.frames[0])
         self.run_keys(["j", "\n", "q", "q"], w=60, h=14)
 
     def test_too_small_terminal(self) -> None:
