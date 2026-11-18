@@ -466,6 +466,18 @@ class Units(unittest.TestCase):
         for bad in ("garbage", "", None, [], {}, "2025-13-45T99:99:99Z"):
             self.assertIsNone(p(bad), bad)
 
+    def test_stripe_color(self) -> None:
+        sc = ai.stripe_color
+        self.assertEqual(sc(256, {}), 235)
+        self.assertEqual(sc(256, {"COLORFGBG": "0;15"}), 255)
+        self.assertEqual(sc(256, {"COLORFGBG": "0;default;7"}), 255)
+        self.assertEqual(sc(256, {"COLORFGBG": "15;0"}), 235)
+        self.assertIsNone(sc(8, {}))
+        self.assertEqual(sc(256, {"AI_SESSIONS_STRIPE": "238"}), 238)
+        self.assertEqual(sc(8, {"AI_SESSIONS_STRIPE": "7"}), 7)
+        self.assertIsNone(sc(8, {"AI_SESSIONS_STRIPE": "238"}))
+        self.assertIsNone(sc(256, {"AI_SESSIONS_STRIPE": "off"}))
+
     def test_widths_clip_pad(self) -> None:
         self.assertEqual(char_width("a"), 1)
         self.assertEqual(char_width("漢"), 2)

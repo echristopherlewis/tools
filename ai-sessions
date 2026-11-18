@@ -15,6 +15,9 @@ Environment:
                             claude --dangerously-skip-permissions --model opus
                             codex resume {id} --yolo
                           --claude-cmd / --codex-cmd override these.
+  AI_SESSIONS_STRIPE      background color (0-255) of every other session-list row,
+                          or "off" (default: 235, or 255 if COLORFGBG says the
+                          background is light; 256-color terminals only)
   XDG_CACHE_HOME          cache root (index in $XDG_CACHE_HOME/ai-sessions/index.json)
 """
 
@@ -1073,6 +1076,36 @@ def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
     return [w.replace("{id}", sid) for w in words], warn
 
 
+def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None) -> Optional[int]:
+    """Pick the background color for every other row of the session list, or None for no stripes.
+
+    AI_SESSIONS_STRIPE wins when set: a color number (0..ncolors-1) or "off". Otherwise, on
+    256-color terminals, a shade just off the terminal background: 235 (dark grey) for dark
+    themes, 255 (light grey) when COLORFGBG says the background is light (7 or 15).
+
+    Args:
+        ncolors: Number of colors the terminal supports (curses.COLORS).
+        env: Environment mapping (default os.environ).
+
+    Returns:
+        A curses color number, or None when the list should not be striped.
+
+    Example: stripe_color(256, {}) -> 235; stripe_color(256, {"COLORFGBG": "0;15"}) -> 255;
+    stripe_color(8, {}) -> None; stripe_color(256, {"AI_SESSIONS_STRIPE": "off"}) -> None.
+    """
+    env = os.environ if env is None else env
+    setting = (env.get("AI_SESSIONS_STRIPE") or "").strip().lower()
+    if setting:
+        if setting.isdigit() and int(setting) < ncolors:
+            return int(setting)
+        return None  # "off", or a color the terminal cannot show
+    if ncolors < 256:
+        return None  # 8/16-color palettes have no subtle shades
+    # COLORFGBG is "fg;bg" (sometimes "fg;default;bg"); the last field is the background.
+    bg = (env.get("COLORFGBG") or "").split(";")[-1]
+    return 255 if bg in ("7", "15") else 235
+
+
 def shell_quote(s: str) -> str:
     """Quote s for a POSIX shell, leaving it bare when it only has safe characters.
 
@@ -1637,6 +1670,10 @@ class App(object):
              "asst": curses.A_BOLD, "hl": curses.A_REVERSE | curses.A_BOLD,
              "title": curses.A_BOLD, "tool": curses.A_DIM, "result": curses.A_DIM,
              "meta": 0, "head": curses.A_REVERSE}
+        # Odd session-list rows; without a stripe color they look like the even rows.
+        attrs["stripe"] = 0
+        attrs["stripe_cc"] = attrs["cc"]
+        attrs["stripe_cx"] = attrs["cx"]
         try:
             if curses.has_colors():
                 curses.start_color()
@@ -1661,6 +1698,16 @@ class App(object):
                 attrs["tool"] = curses.color_pair(6)
                 attrs["result"] = curses.A_DIM
                 attrs["head"] = curses.color_pair(7) | curses.A_BOLD
+                # Shaded variants for every other session-list row (pairs 8-10), so long
+                # rows are easy to follow across a wide screen.
+                stripe = stripe_color(curses.COLORS)
+                if stripe is not None:
+                    curses.init_pair(8, -1 if bg == -1 else curses.COLOR_WHITE, stripe)
+                    curses.init_pair(9, curses.COLOR_GREEN, stripe)
+                    curses.init_pair(10, curses.COLOR_MAGENTA, stripe)
+                    attrs["stripe"] = curses.color_pair(8)
+                    attrs["stripe_cc"] = curses.color_pair(9) | curses.A_BOLD
+                    attrs["stripe_cx"] = curses.color_pair(10) | curses.A_BOLD
         except curses.error:
             pass
         self.attrs = attrs
@@ -1921,8 +1968,8 @@ class App(object):
 
     def draw_list(self, box: Box, pat: Optional[Pattern[str]]) -> None:
         """Draw the session rows into box, scrolling so the selection stays visible. Each row is
-        "date  tag  project  title", with the selected row in reverse video and filter matches
-        highlighted.
+        "date  tag  project  title", with the selected row in reverse video, every other row on a
+        slightly different background (stripe_color), and filter matches highlighted.
 
         Args:
             box: The (y, x, height, width) region to draw in.
@@ -1949,13 +1996,17 @@ class App(object):
             s = self.view[idx]
             y = y0 + i
             cur = idx == self.sel
-            extra = curses.A_REVERSE if cur else 0
-            if cur:
+            # Every other row gets a slightly different background (see stripe_color);
+            # the selected row is drawn in reverse video instead.
+            striped = idx % 2 == 1 and not cur
+            extra = curses.A_REVERSE if cur else (self.attrs["stripe"] if striped else 0)
+            if cur or striped:
                 self.put(y, x0, " " * (bw - 1), extra)
+            tag_attr = self.attrs[("stripe_" if striped else "") + ("cc" if s.source == "claude" else "cx")]
             x = x0
             self.put(y, x, fmt_ts(s.last_ts if self.sort == "last" else s.first_ts), extra | self.attrs["dim"])
             x += DATE_COL_WIDTH
-            self.put(y, x, TAG[s.source], extra | self.attrs["cc" if s.source == "claude" else "cx"])
+            self.put(y, x, TAG[s.source], (curses.A_REVERSE if cur else 0) | tag_attr)
             x += TAG_COL_WIDTH
             self.text(y, x, pad(s.project, projw), projw, extra, pat)
             x += projw + 1
