@@ -27,7 +27,11 @@ One executable script (no `.py` suffix), in layers:
 2. **Index**: `load_sessions` caches summaries in `$XDG_CACHE_HOME/ai-sessions/index.json`,
    keyed by path and invalidated by mtime and size. **Bump `INDEX_VERSION` whenever
    `Summary` keys or meaning change.** Codex titles from `session_index.jsonl` are applied
-   after the cache and never stored in it.
+   after the cache and never stored in it. Stars are user data in
+   `$XDG_DATA_HOME/ai-sessions/stars.json` (`read_stars` / `set_star`, which re-reads before
+   writing); they are applied in `load_sessions` as `Session.starred`, not cached. The
+   `skills/star-session` skill (Claude Code and Codex) calls `ai-sessions --star` /
+   `--unstar` / `--star-status`, which find the current session via `CODEX_THREAD_ID` / `CLAUDE_CODE_SESSION_ID`.
 3. **Output**: `cmd_list` / `cmd_show` for plain text; `render` builds the transcript
    lines that `--show` and the TUI both use.
 4. **TUI**: `App` (session list plus preview) and `Viewer` (full-screen transcript) share

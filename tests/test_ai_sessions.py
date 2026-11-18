@@ -3,8 +3,8 @@
 
 Run from the repo root:  python3 tests/test_ai_sessions.py
 
-Every test points AI_SESSIONS_CLAUDE_DIR / AI_SESSIONS_CODEX_DIR / XDG_CACHE_HOME at
-temporary directories, so the real ~/.claude, ~/.codex and ~/.cache are never read or
+Every test points AI_SESSIONS_CLAUDE_DIR / AI_SESSIONS_CODEX_DIR / XDG_CACHE_HOME /
+XDG_DATA_HOME at temporary directories, so the real ~/.claude, ~/.codex and ~/.cache are never read or
 written. The fixture transcripts under fixtures/ai-sessions/ double as format
 documentation for both tools.
 """
@@ -83,14 +83,17 @@ class Env(unittest.TestCase):
         self.claude = os.path.join(self.tmp, "claude")
         self.codex = os.path.join(self.tmp, "codex")
         self.cache = os.path.join(self.tmp, "cache")
+        self.data = os.path.join(self.tmp, "data")
         shutil.copytree(os.path.join(FIXTURES, "claude"), self.claude)
         shutil.copytree(os.path.join(FIXTURES, "codex"), self.codex)
         env = {"AI_SESSIONS_CLAUDE_DIR": self.claude, "AI_SESSIONS_CODEX_DIR": self.codex,
-               "XDG_CACHE_HOME": self.cache, "TZ": "UTC"}
+               "XDG_CACHE_HOME": self.cache, "XDG_DATA_HOME": self.data, "TZ": "UTC"}
         p = mock.patch.dict(os.environ, env)
         p.start()
         self.addCleanup(p.stop)
-        for k in ("AI_SESSIONS_CLAUDE_CMD", "AI_SESSIONS_CODEX_CMD"):
+        # This suite may itself run inside Claude Code or Codex.
+        for k in ("AI_SESSIONS_CLAUDE_CMD", "AI_SESSIONS_CODEX_CMD",
+                  "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             os.environ.pop(k, None)
         if hasattr(ai, "CMD_OVERRIDES"):
             ai.CMD_OVERRIDES.clear()
@@ -101,6 +104,13 @@ class Env(unittest.TestCase):
 
     def sessions(self) -> Dict[str, Any]:
         return {s.id: s for s in ai.load_sessions()}
+
+    def stars_file(self) -> str:
+        return os.path.join(self.data, "ai-sessions", "stars.json")
+
+    def read_stars_file(self) -> Dict[str, Any]:
+        with open(self.stars_file()) as f:
+            return json.load(f)["stars"]
 
 
 A_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -447,6 +457,156 @@ class Cli(Env):
     def test_tui_needs_terminal(self) -> None:
         p = self.run_cli(expect=2)
         self.assertIn("needs a terminal", p.stderr)
+
+
+# ------------------------------------------------------------ stars
+class Stars(Env):
+    def test_roundtrip_and_set_star(self) -> None:
+        self.assertEqual(ai.read_stars(), {})
+        ai.write_stars({"a": 1.5})
+        self.assertEqual(ai.read_stars(), {"a": 1.5})
+        self.assertEqual(ai.stars_path(), self.stars_file())
+        ai.set_star("b", True)
+        self.assertEqual(sorted(ai.read_stars()), ["a", "b"])
+        first = ai.read_stars()["b"]
+        ai.set_star("b", True)  # idempotent, keeps the original timestamp
+        self.assertEqual(ai.read_stars()["b"], first)
+        ai.set_star("a", False)
+        ai.set_star("zzz", False)  # unstarring an unknown id is fine
+        self.assertEqual(sorted(ai.read_stars()), ["b"])
+        with open(self.stars_file()) as f:
+            self.assertEqual(json.load(f)["version"], 1)
+
+    def test_corrupt_or_foreign_file(self) -> None:
+        os.makedirs(os.path.dirname(self.stars_file()))
+        for text in ("not json", "[]", '{"version": 2, "stars": {"a": 1}}',
+                     '{"version": 1, "stars": []}'):
+            with open(self.stars_file(), "w") as f:
+                f.write(text)
+            self.assertEqual(ai.read_stars(), {}, text)
+        with open(self.stars_file(), "w") as f:
+            f.write('{"version": 1, "stars": {"a": 1, "b": "x", "c": null, "d": true}}')
+        self.assertEqual(ai.read_stars(), {"a": 1.0})
+
+    def test_write_failure_raises(self) -> None:
+        os.makedirs(self.data)
+        with open(os.path.join(self.data, "ai-sessions"), "w") as f:  # a file where the dir should be
+            f.write("")
+        with self.assertRaises(OSError):
+            ai.set_star("a", True)
+
+    def test_load_sessions_marks_starred(self) -> None:
+        ai.set_star(B_ID, True)
+        ai.set_star("not-a-session", True)
+        ss = self.sessions()
+        self.assertEqual(sorted(i for i, s in ss.items() if s.starred), [B_ID])
+        self.assertFalse(ai.Session({"source": "claude", "id": "x", "path": "p", "cwd": "",
+                                     "branch": "", "title": "", "first_ts": 0, "last_ts": 0,
+                                     "n_user": 1, "n_asst": 0, "blob": ""}).starred)
+        # stars are not stored in the index cache
+        with open(os.path.join(self.cache, "ai-sessions", "index.json"), "rb") as f:
+            self.assertNotIn(b"starred", f.read())
+
+    def test_filter_starred_only(self) -> None:
+        ai.set_star(B_ID, True)
+        ai.set_star(X_ID, True)
+        ss = list(self.sessions().values())
+        self.assertEqual(sorted(s.id for s in ai.filter_sessions(ss, starred_only=True)), [X_ID, B_ID])
+        self.assertEqual([s.id for s in ai.filter_sessions(ss, source="codex", starred_only=True)], [X_ID])
+        self.assertEqual(len(ai.filter_sessions(ss)), 6)
+
+    def test_current_session_id(self) -> None:
+        both = {"CODEX_THREAD_ID": "cx", "CLAUDE_CODE_SESSION_ID": "cc"}
+        self.assertEqual(ai.current_session_id(None, both), "cx")
+        self.assertEqual(ai.current_session_id("claude", both), "cc")
+        self.assertEqual(ai.current_session_id("codex", both), "cx")
+        self.assertEqual(ai.current_session_id(None, {"CLAUDE_CODE_SESSION_ID": "cc"}), "cc")
+        self.assertIsNone(ai.current_session_id("codex", {"CLAUDE_CODE_SESSION_ID": "cc"}))
+        self.assertIsNone(ai.current_session_id(None, {"CODEX_THREAD_ID": ""}))
+        self.assertIsNone(ai.current_session_id(None, {}))
+        self.assertIsNone(ai.current_session_id(None))  # real environment, cleared in setUp
+
+    def test_find_session(self) -> None:
+        ss = list(self.sessions().values())
+        s, err = ai.find_session(ss, "aaaaaaaa")
+        self.assertEqual((s.id, err), (A_ID, None))
+        s, err = ai.find_session(ss, "zzz")
+        self.assertEqual((s, err), (None, "ai-sessions: no session matches 'zzz'\n"))
+
+
+class StarCli(Env):
+    run_cli = Cli.run_cli
+    rows = Cli.rows
+
+    def test_star_prefix_and_unstar(self) -> None:
+        out = self.run_cli("--star", "aaaaaaaa").stdout
+        self.assertEqual(out, "starred claude %s My custom title\n" % A_ID)
+        self.assertEqual(list(self.read_stars_file()), [A_ID])
+        out = self.run_cli("--unstar", "aaaa").stdout
+        self.assertEqual(out, "unstarred claude %s My custom title\n" % A_ID)
+        self.assertEqual(self.read_stars_file(), {})
+
+    def test_star_status(self) -> None:
+        out = self.run_cli("--star-status", "aaaa").stdout
+        self.assertEqual(out, "not starred claude %s My custom title\n" % A_ID)
+        self.assertFalse(os.path.exists(self.stars_file()))  # reporting never writes
+        self.run_cli("--star", "aaaa")
+        out = self.run_cli("--star-status", "aaaa").stdout
+        self.assertEqual(out, "starred claude %s My custom title\n" % A_ID)
+        os.environ["CLAUDE_CODE_SESSION_ID"] = A_ID
+        out = self.run_cli("--star-status").stdout
+        self.assertEqual(out, "starred claude %s My custom title\n" % A_ID)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID")
+        self.run_cli("--star-status", expect=2)
+        self.run_cli("--star-status", "zzz", expect=1)
+        self.run_cli("--star-status", "--star", expect=2)
+        self.run_cli("--star-status", "--list", expect=2)
+
+    def test_star_errors(self) -> None:
+        p = self.run_cli("--star", "zzz", expect=1)
+        self.assertIn("no session matches 'zzz'", p.stderr)
+        self.run_cli("--star", "a", "--unstar", "b", expect=2)
+        self.run_cli("--star", A_ID, "--list", expect=2)
+        self.run_cli("--starred", expect=2)
+        self.assertFalse(os.path.exists(self.stars_file()))
+
+    def test_star_without_id_uses_environment(self) -> None:
+        os.environ["CLAUDE_CODE_SESSION_ID"] = B_ID
+        out = self.run_cli("--star").stdout
+        self.assertTrue(out.startswith("starred claude %s " % B_ID), out)
+        os.environ["CODEX_THREAD_ID"] = X_ID  # codex wins
+        out = self.run_cli("--star").stdout
+        self.assertEqual(out, "starred codex %s Quokka thread name\n" % X_ID)
+        out = self.run_cli("--unstar", "--source", "claude").stdout  # only the claude variable
+        self.assertTrue(out.startswith("unstarred claude %s " % B_ID), out)
+        self.assertEqual(list(self.read_stars_file()), [X_ID])
+
+    def test_star_unknown_environment_id_is_stored(self) -> None:
+        os.environ["CODEX_THREAD_ID"] = "feedface-0000-4000-8000-000000000000"
+        out = self.run_cli("--star").stdout
+        self.assertEqual(out, "starred feedface-0000-4000-8000-000000000000\n")
+        self.assertIn("feedface-0000-4000-8000-000000000000", self.read_stars_file())
+
+    def test_star_without_id_or_environment(self) -> None:
+        p = self.run_cli("--star", expect=2)
+        self.assertIn("no session id given", p.stderr)
+        self.assertFalse(os.path.exists(self.stars_file()))
+
+    def test_star_write_failure_exits_1(self) -> None:
+        os.makedirs(self.data)
+        with open(os.path.join(self.data, "ai-sessions"), "w") as f:  # a file where the dir should be
+            f.write("")
+        p = self.run_cli("--star", A_ID, expect=1)
+        self.assertIn("cannot save stars", p.stderr)
+
+    def test_list_starred(self) -> None:
+        self.run_cli("--star", A_ID)
+        self.run_cli("--star", X_ID)
+        rows = self.rows(self.run_cli("--list", "--starred").stdout)
+        self.assertEqual([r[2] for r in rows], [X_ID, A_ID])
+        self.assertEqual(len(rows[0]), 5)  # columns unchanged
+        rows = self.rows(self.run_cli("--list", "--starred", "--source", "claude").stdout)
+        self.assertEqual([r[2] for r in rows], [A_ID])
 
 
 # ------------------------------------------------------------ units
@@ -984,6 +1144,56 @@ class Tui(Env):
         self.assertNotIn(vt, self.scr.frames[-1])
         app = self.run_keys(["l", "l", "l", "q"], w=120)  # full cycle back to side
         self.assertEqual(app.split, "side")
+
+    def test_star_key_toggles_and_persists(self) -> None:
+        app = self.run_keys(["*", "j", "*", "*", "q"])
+        self.assertEqual(sorted(ai.read_stars()), [D_ID])
+        self.assertTrue(app.view[0].starred)
+        self.assertFalse(app.view[1].starred)
+        self.assertTrue(self.scr.any_frame(" starred: First prompt becomes the title"))
+        self.assertTrue(self.scr.any_frame(" unstarred: Second codex prompt about walruses"))
+        row = [ln for ln in self.scr.frames[1].splitlines() if "2025-03-04 08:01" in ln][0]
+        self.assertIn("2025-03-04 08:01 * CC", row)
+
+    def test_star_key_write_failure_shows_status(self) -> None:
+        with mock.patch.object(ai, "set_star", side_effect=OSError("disk full")):
+            app = self.run_keys(["*", "q"])
+        self.assertFalse(app.view[0].starred)
+        self.assertTrue(self.scr.any_frame("could not save stars: disk full"))
+
+    def test_starred_only_filter(self) -> None:
+        ai.set_star(B_ID, True)
+        ai.set_star(X_ID, True)
+        app = self.run_keys(["S", "q"])
+        self.assertEqual(sorted(s.id for s in app.view), [X_ID, B_ID])
+        self.assertTrue(self.scr.any_frame("filter: starred"))
+        app = self.run_keys(["S", "S", "q"])
+        self.assertEqual(len(app.view), 6)
+        # unstarring while filtered removes the row
+        app = self.run_keys(["S", "*", "q"])
+        self.assertEqual(len(app.view), 1)
+        self.assertEqual(len(ai.read_stars()), 1)
+
+    def test_rescan_rereads_stars(self) -> None:
+        app = self.make(["R", "q"])
+        ai.set_star(A_ID, True)  # e.g. done by the skill while the TUI is open
+        app.run()
+        self.assertTrue([s for s in app.all if s.id == A_ID][0].starred)
+        # and toggling another session does not clobber it
+        app = self.run_keys(["*", "q"])
+        self.assertEqual(sorted(ai.read_stars()), sorted([A_ID, D_ID]))
+
+    def test_star_in_viewer(self) -> None:
+        app = self.run_keys(["\n", "*", "q", "q"])
+        self.assertEqual(sorted(ai.read_stars()), [D_ID])
+        self.assertTrue(self.scr.any_frame(" starred: First prompt"))
+        self.assertTrue(self.scr.any_frame(" CC * First prompt"))
+        self.assertTrue(app.view[0].starred)
+
+    def test_help_mentions_star_keys(self) -> None:
+        keys = [k for _, ks in ai.HELP for k, _ in ks]
+        self.assertEqual(keys.count("*"), 2)
+        self.assertIn("S", keys)
 
     def test_too_small_terminal(self) -> None:
         self.run_keys(["q"], h=5, w=20)
