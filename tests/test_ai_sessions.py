@@ -628,15 +628,38 @@ class Units(unittest.TestCase):
 
     def test_stripe_color(self) -> None:
         sc = ai.stripe_color
-        self.assertEqual(sc(256, {}), 235)
+        self.assertEqual(sc(256, {}), 233)
         self.assertEqual(sc(256, {"COLORFGBG": "0;15"}), 255)
         self.assertEqual(sc(256, {"COLORFGBG": "0;default;7"}), 255)
-        self.assertEqual(sc(256, {"COLORFGBG": "15;0"}), 235)
+        self.assertEqual(sc(256, {"COLORFGBG": "15;0"}), 233)
         self.assertIsNone(sc(8, {}))
         self.assertEqual(sc(256, {"AI_SESSIONS_STRIPE": "238"}), 238)
         self.assertEqual(sc(8, {"AI_SESSIONS_STRIPE": "7"}), 7)
         self.assertIsNone(sc(8, {"AI_SESSIONS_STRIPE": "238"}))
         self.assertIsNone(sc(256, {"AI_SESSIONS_STRIPE": "off"}))
+        self.assertEqual(sc(256, {}, (255, 255, 255)), 255)
+        self.assertEqual(sc(256, {}, (0, 0, 0)), 233)
+        self.assertEqual(sc(256, {"COLORFGBG": "7;0"}, (255, 255, 255)), 255)
+        self.assertIsNone(sc(256, {"AI_SESSIONS_STRIPE": "off"}, (255, 255, 255)))
+        self.assertIsNone(sc(8, {}, (255, 255, 255)))
+
+    def test_stripe_for_background(self) -> None:
+        f = ai.stripe_for_background
+        self.assertEqual(f((0, 0, 0)), 233)
+        self.assertEqual(f((255, 255, 255)), 255)
+        self.assertEqual(f((30, 30, 30)), 236)
+        self.assertIn(f((253, 246, 227)), range(252, 256))
+
+    def test_parse_osc11_reply(self) -> None:
+        p = ai.parse_osc11_reply
+        self.assertEqual(p("\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), (255, 255, 255))
+        self.assertEqual(p("\x1b]11;rgb:1e/1e/1e\x07"), (30, 30, 30))
+        self.assertEqual(p("\x1b]11;rgb:0000/8080/ffff\x07\x1b[?62;22c"), (0, 128, 255))
+        self.assertEqual(p("\x1b[?62;22c\x1b]11;rgb:1e/1e/1e\x07"), (30, 30, 30))
+        self.assertEqual(p("\x1b]11;rgb:FFFF/AAAA/0000\x07"), (255, 170, 0))
+        self.assertIsNone(p("\x1b[?62;22c"))
+        self.assertIsNone(p("\x1b]11;rgb:zz/00/00\x07"))
+        self.assertIsNone(p(""))
 
     def test_widths_clip_pad(self) -> None:
         self.assertEqual(char_width("a"), 1)

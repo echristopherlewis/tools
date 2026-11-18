@@ -18,8 +18,9 @@ Environment:
                             codex resume {id} --yolo
                           --claude-cmd / --codex-cmd override these.
   AI_SESSIONS_STRIPE      background color (0-255) of every other session-list row,
-                          or "off" (default: 235, or 255 if COLORFGBG says the
-                          background is light; 256-color terminals only)
+                          or "off" (default: a grey just off the terminal background as
+                          reported by the terminal (OSC 11), else 233, or 255 if COLORFGBG
+                          says the background is light; 256-color terminals only)
   XDG_CACHE_HOME          cache root (index in $XDG_CACHE_HOME/ai-sessions/index.json)
   XDG_DATA_HOME           data root (stars in $XDG_DATA_HOME/ai-sessions/stars.json;
                           default ~/.local/share)
@@ -37,11 +38,13 @@ import json
 import locale
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unicodedata
 from typing import Any, Callable, Dict, Iterator, List, Optional, Pattern, Tuple
@@ -1089,22 +1092,126 @@ def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
     return [w.replace("{id}", sid) for w in words], warn
 
 
-def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None) -> Optional[int]:
+def parse_osc11_reply(reply: str) -> Optional[Tuple[int, int, int]]:
+    """Extract the background color from a terminal's reply to the OSC 11 query.
+
+    Args:
+        reply: Raw reply text, e.g. "ESC ] 11 ; rgb:RRRR/GGGG/BBBB" ended by BEL or ST, possibly
+            followed or preceded by other replies (such as a DA1 reply). Each component has 1-4
+            hex digits and is scaled to 0-255.
+
+    Returns:
+        An (r, g, b) tuple with 0-255 components, or None when no valid color is present.
+
+    Example: parse_osc11_reply("\x1b]11;rgb:ffff/ffff/ffff\x1b\\") -> (255, 255, 255);
+    parse_osc11_reply("\x1b]11;rgb:1e/1e/1e\x07") -> (30, 30, 30); parse_osc11_reply("") -> None.
+    """
+    m = re.search(r"\]11;rgb:([0-9a-f]{1,4})/([0-9a-f]{1,4})/([0-9a-f]{1,4})", reply, re.I)
+    if not m:
+        return None
+    r, g, b = (round(int(h, 16) * 255 / (16 ** len(h) - 1)) for h in m.groups())
+    return (r, g, b)
+
+
+def query_terminal_background(timeout: float = 0.2) -> Optional[Tuple[int, int, int]]:
+    """Ask the controlling terminal for its background color (OSC 11). Must run before curses
+    starts, or curses would swallow the reply. Never raises.
+
+    The query is followed by a DA1 query (ESC [ c), which nearly every terminal answers; its
+    reply marks the end of the output, so terminals that ignore OSC 11 do not cost the full timeout.
+
+    Args:
+        timeout: Longest time in seconds to wait for the reply.
+
+    Returns:
+        An (r, g, b) tuple with 0-255 components, or None when there is no terminal or it does
+        not answer.
+
+    Example: an xterm with a white background -> (255, 255, 255); a terminal that ignores
+    OSC 11, or no controlling terminal -> None.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return None
+    buf = b""
+    try:
+        saved = termios.tcgetattr(fd)
+        try:
+            raw = list(saved)
+            raw[3] = raw[3] & ~(termios.ICANON | termios.ECHO)  # lflag: no line buffering or echo
+            raw[6] = list(saved[6])
+            raw[6][termios.VMIN] = 0
+            raw[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, raw)
+            os.write(fd, b"\x1b]11;?\x1b\\" + b"\x1b[c")
+            deadline = time.monotonic() + timeout
+            while not re.search(rb"\x1b\[\?[0-9;]*c", buf):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    break
+                chunk = os.read(fd, 1024)
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+    except (OSError, termios.error, ValueError):
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return parse_osc11_reply(buf.decode("latin-1"))
+
+
+# How far (in 0-255 brightness) the stripe sits from the terminal background. Small, so the
+# stripe is barely visible; it moves toward mid-grey so it works on dark and light themes.
+STRIPE_STEP = 14
+
+
+def stripe_for_background(rgb: Tuple[int, int, int]) -> int:
+    """Pick the 256-color grey closest to a shade STRIPE_STEP away from the given background.
+
+    Args:
+        rgb: Terminal background as (r, g, b), 0-255 each.
+
+    Returns:
+        An xterm-256 grey color number: 16 (level 0), 231 (level 255) or 232-255 (levels 8, 18, ... 238).
+
+    Example: stripe_for_background((0, 0, 0)) -> 233; (255, 255, 255) -> 255; (30, 30, 30) -> 236.
+    """
+    lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+    target = lum + STRIPE_STEP if lum < 128 else lum - STRIPE_STEP
+    greys = [(0, 16), (255, 231)] + [(8 + 10 * k, 232 + k) for k in range(24)]
+    # min() keeps the first of equal distances, so ties are deterministic.
+    return min(greys, key=lambda g: abs(g[0] - target))[1]
+
+
+def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None,
+                 background: Optional[Tuple[int, int, int]] = None) -> Optional[int]:
     """Pick the background color for every other row of the session list, or None for no stripes.
 
     AI_SESSIONS_STRIPE wins when set: a color number (0..ncolors-1) or "off". Otherwise, on
-    256-color terminals, a shade just off the terminal background: 235 (dark grey) for dark
-    themes, 255 (light grey) when COLORFGBG says the background is light (7 or 15).
+    256-color terminals, a grey just off the terminal's real background when it is known
+    (see stripe_for_background); failing that, 255 (light grey) when COLORFGBG says the
+    background is light (7 or 15), else 233 (very dark grey).
 
     Args:
         ncolors: Number of colors the terminal supports (curses.COLORS).
         env: Environment mapping (default os.environ).
+        background: Terminal background (r, g, b) from query_terminal_background, if known.
 
     Returns:
         A curses color number, or None when the list should not be striped.
 
-    Example: stripe_color(256, {}) -> 235; stripe_color(256, {"COLORFGBG": "0;15"}) -> 255;
-    stripe_color(8, {}) -> None; stripe_color(256, {"AI_SESSIONS_STRIPE": "off"}) -> None.
+    Example: stripe_color(256, {}) -> 233; stripe_color(256, {"COLORFGBG": "0;15"}) -> 255;
+    stripe_color(256, {}, (255, 255, 255)) -> 255; stripe_color(8, {}) -> None;
+    stripe_color(256, {"AI_SESSIONS_STRIPE": "off"}) -> None.
     """
     env = os.environ if env is None else env
     setting = (env.get("AI_SESSIONS_STRIPE") or "").strip().lower()
@@ -1114,9 +1221,11 @@ def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None) -> Optional
         return None  # "off", or a color the terminal cannot show
     if ncolors < 256:
         return None  # 8/16-color palettes have no subtle shades
+    if background is not None:
+        return stripe_for_background(background)  # the real color beats a stale COLORFGBG
     # COLORFGBG is "fg;bg" (sometimes "fg;default;bg"); the last field is the background.
     bg = (env.get("COLORFGBG") or "").split(";")[-1]
-    return 255 if bg in ("7", "15") else 235
+    return 255 if bg in ("7", "15") else 233
 
 
 def shell_quote(s: str) -> str:
@@ -1743,7 +1852,8 @@ def help_lines() -> List[Tuple[str, str, str]]:
 
 class App(object):
     def __init__(self, scr: Window, sessions: List[Session], query: str,
-                 source: str = "all") -> None:
+                 source: str = "all",
+                 background: Optional[Tuple[int, int, int]] = None) -> None:
         """Set up UI state (filter, sort, selection, scroll, caches), colors, the filtered view
         and the key map. scr is the curses window; query/source are the initial filter.
 
@@ -1752,6 +1862,7 @@ class App(object):
             sessions: All sessions to browse.
             query: Initial filter text.
             source: Initial source filter: "all" (default), "claude" or "codex".
+            background: Terminal background (r, g, b) used to pick the row stripe color, or None.
 
         Example: App(scr, sessions, "fix", "claude") -> .view holds the Claude sessions matching
         "fix", newest first; .sel == 0; .sort == "last"; .split is None (layout chosen by width)
@@ -1760,6 +1871,7 @@ class App(object):
         self.all = sessions
         self.query = query
         self.source = source
+        self.background = background
         self.project: Optional[str] = None
         self.sort = "last"
         self.show_results = False
@@ -1829,7 +1941,7 @@ class App(object):
                 attrs["star"] = curses.color_pair(11) | curses.A_BOLD
                 # Shaded variants for every other session-list row (pairs 8-10 and 12), so long
                 # rows are easy to follow across a wide screen.
-                stripe = stripe_color(curses.COLORS)
+                stripe = stripe_color(curses.COLORS, background=self.background)
                 if stripe is not None:
                     curses.init_pair(8, -1 if bg == -1 else curses.COLOR_WHITE, stripe)
                     curses.init_pair(9, curses.COLOR_GREEN, stripe)
@@ -2943,7 +3055,8 @@ class Viewer(object):
 
 
 def browse(scr: Window, sessions: List[Session], query: str,
-           source: str) -> Tuple[Optional[Session], Optional[List[str]]]:
+           source: str,
+           background: Optional[Tuple[int, int, int]] = None) -> Tuple[Optional[Session], Optional[List[str]]]:
     """Run the interactive browser (called inside curses.wrapper).
 
     Returns (session chosen for resume or None, edited resume argv or None).
@@ -2953,6 +3066,7 @@ def browse(scr: Window, sessions: List[Session], query: str,
         sessions: All sessions to browse.
         query: Initial filter text.
         source: Initial source filter: "all", "claude" or "codex".
+        background: Terminal background (r, g, b) for the row stripe color, or None.
 
     Returns:
         A (session, argv) tuple: the session chosen for resume (None if the user quit) and the
@@ -2969,7 +3083,7 @@ def browse(scr: Window, sessions: List[Session], query: str,
         curses.mouseinterval(0)
     except curses.error:
         pass  # no mouse support in this terminal; keys still work
-    app = App(scr, sessions, query, source)
+    app = App(scr, sessions, query, source, background)
     app.run()
     return app.resume, app.resume_override
 
@@ -2993,8 +3107,12 @@ def run_tui(query: str, source: Optional[str] = None) -> int:
         sys.stderr.write("ai-sessions: interactive mode needs a terminal (try --list)\n")
         return 2
     sessions = load_sessions(progress=True)
+    # Ask the terminal for its background before curses starts (it would swallow the reply).
+    background = None
+    if not (os.environ.get("AI_SESSIONS_STRIPE") or "").strip():
+        background = query_terminal_background()
     try:
-        chosen, argv_override = curses.wrapper(browse, sessions, query, source or "all")
+        chosen, argv_override = curses.wrapper(browse, sessions, query, source or "all", background)
     except KeyboardInterrupt:
         return 130
     if chosen is not None:
