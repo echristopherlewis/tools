@@ -709,6 +709,27 @@ class Tui(Env):
         self.assertEqual([app.key() for _ in range(8)],
                          ["UP", "BS", "ENTER", "ESC", "TAB", "CU", "x", "UNKNOWN"])
 
+    def test_click_moves_selection_without_opening(self) -> None:
+        # Side-by-side at 120x30: list rows start at screen row 1, columns 0-53.
+        app = self.make([curses.KEY_MOUSE, curses.KEY_MOUSE, curses.KEY_MOUSE, "q"])
+        events = [(5, 3, curses.BUTTON1_PRESSED),    # third row -> C_ID
+                  (80, 1, curses.BUTTON1_PRESSED),   # preview pane: ignored
+                  (5, 20, curses.BUTTON1_PRESSED)]   # below the last session: ignored
+        app.mouse_event = lambda: events.pop(0)
+        app.run()
+        self.assertEqual(self.scr.keys, [])
+        self.assertEqual(app.current().id, C_ID)
+        self.assertFalse(self.scr.any_frame("Press any key."))
+        self.assertIsNone(app.resume)
+
+    def test_click_respects_scroll_offset(self) -> None:
+        # 80x8 stacked: the list shows 3 rows; after G it is scrolled to the last three.
+        app = self.make(["G", curses.KEY_MOUSE, "q"], h=8, w=80)
+        app.mouse_event = lambda: (2, 1, curses.BUTTON1_PRESSED)
+        app.run()
+        self.assertEqual(app.top, 3)
+        self.assertEqual(app.current().id, app.view[3].id)
+
     def test_unknown_special_key_is_ignored(self) -> None:
         # Regression: unmapped keys (e.g. F1) used to be named "?" and opened help.
         app = self.run_keys([curses.KEY_F1, "j", "q"])

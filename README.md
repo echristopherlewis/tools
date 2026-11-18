@@ -11,7 +11,7 @@ A curses browser and search for Claude Code and Codex CLI session transcripts.
 Python 3.6+, no dependencies.
 
 ```sh
-ai-sessions                      # interactive browser (press ? for keys)
+ai-sessions                      # interactive browser (press ? for keys; click a row to select it)
 ai-sessions --list [terms...]    # tab-separated: date, source, id, project, title
 ai-sessions --list --search QUERY --source claude
 ai-sessions --show ID [--tools] [--mine]   # print a transcript (id or unique prefix)

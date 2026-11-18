@@ -1576,6 +1576,7 @@ HELP: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("u", "toggle showing only your input"),
         ("Enter v", "open full-screen viewer"),
         ("R", "rescan session files"),
+        ("click", "move selection to the clicked session"),
     ]),
     ("Viewer", [
         ("j k  Up Down", "scroll one line"),
@@ -1834,7 +1835,7 @@ class App(object):
     def key(self) -> Optional[str]:
         """Read one key and return its name: printable keys as themselves; special keys as names
         ("ENTER", "ESC", "BS", "CU", "TAB", "CTRL_C", "UP", "DOWN", "PGUP", "PGDN", "HOME", "END",
-        "SUP", "SDOWN", "RESIZE"); unmapped special keys as "UNKNOWN"; None if nothing arrived.
+        "SUP", "SDOWN", "RESIZE", "MOUSE"); unmapped special keys as "UNKNOWN"; None if nothing arrived.
 
         Returns:
             A key name (a printable character or a name from the list above), or None if no key
@@ -1855,7 +1856,7 @@ class App(object):
         names: Dict[int, str] = {curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_PPAGE: "PGUP",
                  curses.KEY_NPAGE: "PGDN", curses.KEY_HOME: "HOME", curses.KEY_END: "END",
                  curses.KEY_RESIZE: "RESIZE", curses.KEY_BACKSPACE: "BS", curses.KEY_ENTER: "ENTER",
-                 }
+                 curses.KEY_MOUSE: "MOUSE"}
         for nm, val in (("KEY_SR", "SUP"), ("KEY_SF", "SDOWN"), ("KEY_BTAB", "TAB")):
             if hasattr(curses, nm):
                 names[getattr(curses, nm)] = val
@@ -2071,6 +2072,41 @@ class App(object):
     def move(self, d: int) -> None:
         if self.view:
             self.sel = max(0, min(len(self.view) - 1, self.sel + d))
+
+    def mouse_event(self) -> Optional[Tuple[int, int, int]]:
+        """Fetch the pending mouse event (call after key() returned "MOUSE").
+
+        Returns:
+            (x, y, button state) in screen coordinates, or None if no event could be read.
+
+        Example: a left click at column 5, row 3 -> (5, 3, curses.BUTTON1_PRESSED)
+        """
+        try:
+            _, x, y, _, bstate = curses.getmouse()
+        except curses.error:
+            return None
+        return x, y, bstate
+
+    def on_mouse(self) -> None:
+        """Move the selection to the session row that was clicked, like navigating there with
+        j/k. It never opens the session. Clicks outside the list rows are ignored.
+
+        Example: clicking the third visible row (with the list scrolled to the top) selects
+        self.view[2]; clicking in the preview pane changes nothing.
+        """
+        ev = self.mouse_event()
+        if ev is None:
+            return
+        x, y, bstate = ev
+        if not bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+            return
+        y0, x0, bh, bw = self.layout()["list"]
+        if not (y0 <= y < y0 + bh and x0 <= x < x0 + bw):
+            return
+        # self.top is the scroll offset from the last draw, i.e. what is on screen now.
+        idx = self.top + (y - y0)
+        if idx < len(self.view):
+            self.sel = idx
 
     def list_height(self) -> int:
         return max(1, self.layout()["list"][2])
@@ -2331,6 +2367,7 @@ class App(object):
             (("r",), self.on_resume),
             (("e",), self.on_edit_resume),
             (("y",), self.on_copy),
+            (("MOUSE",), self.on_mouse),
         ]
         return {name: fn for names, fn in bindings for name in names}
 
@@ -2436,7 +2473,7 @@ class App(object):
             self.put(h - 1, 1, clip(footer, w - 2), self.attrs["dim"])
             self.scr.refresh()
             k = self.key()
-            if k in (None, "RESIZE"):
+            if k in (None, "RESIZE", "MOUSE"):
                 continue
             if more and k in ("j", "DOWN", "SDOWN"):
                 top += 1
@@ -2738,6 +2775,13 @@ def browse(scr: Window, sessions: List[Session], query: str,
     with keys "q" -> (None, None).
     """
     scr.keypad(True)
+    try:
+        # Report left-button presses (not full clicks, which ncurses delays by mouseinterval)
+        # so clicking a list row selects it immediately.
+        curses.mousemask(curses.BUTTON1_PRESSED)
+        curses.mouseinterval(0)
+    except curses.error:
+        pass  # no mouse support in this terminal; keys still work
     app = App(scr, sessions, query, source)
     app.run()
     return app.resume, app.resume_override
