@@ -34,6 +34,7 @@ Environment:
 | `AI_SESSIONS_CLAUDE_DIR` / `AI_SESSIONS_CODEX_DIR` | Transcript roots (defaults: `~/.claude/projects`, `~/.codex`) |
 | `AI_SESSIONS_CLAUDE_CMD` / `AI_SESSIONS_CODEX_CMD` | Resume command; `{id}` is replaced by the session id |
 | `AI_SESSIONS_STRIPE` | Background color (0-255) of every other session-list row, or `off` (default: a grey just off the terminal's background as reported by the terminal (OSC 11), else 236, or 255 when `COLORFGBG` reports a light background; 256-color terminals only) |
+| `AI_SESSIONS_THEME` | `claude` (default): Claude Code's 256-color palette, light or dark to match the terminal background; `basic`: the original 8-color look. Terminals with fewer than 256 colors always use `basic` |
 | `XDG_CACHE_HOME` | Location of the index cache (`ai-sessions/index.json`) |
 | `XDG_DATA_HOME` | Location of the stars (`ai-sessions/stars.json`; default `~/.local/share`) |
 | `CODEX_THREAD_ID` | Set by Codex; the session `--star` / `--unstar` / `--star-status` act on without an ID (checked first) |

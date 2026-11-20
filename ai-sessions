@@ -21,6 +21,10 @@ Environment:
                           or "off" (default: a grey just off the terminal background as
                           reported by the terminal (OSC 11), else 236, or 255 if COLORFGBG
                           says the background is light; 256-color terminals only)
+  AI_SESSIONS_THEME       "claude" (default): Claude Code's 256-color palette, light or dark to
+                          match the terminal background (OSC 11, else COLORFGBG); "basic": the
+                          original 8-color look. Terminals with fewer than 256 colors always
+                          use basic.
   XDG_CACHE_HOME          cache root (index in $XDG_CACHE_HOME/ai-sessions/index.json)
   XDG_DATA_HOME           data root (stars in $XDG_DATA_HOME/ai-sessions/stars.json;
                           default ~/.local/share)
@@ -67,7 +71,8 @@ Msg = Dict[str, Any]
 # stale caches are discarded instead of being misread.
 Summary = Dict[str, Any]
 # One rendered transcript row: (text, kind). kind picks the color/attribute:
-# title, meta, dim, text, user, asst, tool, result (see App.init_colors).
+# title, meta, dim, text, prompt, user, asst, tool, result (see App.init_colors).
+# "prompt" is the body of your own messages (drawn on a grey band); "text" is everything else.
 Line = Tuple[str, str]
 # curses window (curses._CursesWindow is not importable at runtime).
 Window = Any
@@ -246,6 +251,18 @@ def rule_chars() -> Tuple[str, str]:
     """
     enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
     return ("─", "│") if enc == "utf8" else ("-", "|")
+
+
+def transcript_glyphs() -> Tuple[str, str]:
+    """(tool call marker, result elbow) as Claude Code draws them: UTF-8 glyphs, else ASCII.
+
+    Returns:
+        A (marker, elbow) pair of one-character strings.
+
+    Examples: with a UTF-8 locale -> ("⏺", "⎿"); with an ASCII locale -> ("*", "|")
+    """
+    enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
+    return ("⏺", "⎿") if enc == "utf8" else ("*", "|")
 
 
 def clip(s: str, width: int) -> str:
@@ -1176,6 +1193,32 @@ STRIPE_STEP_DARK = 48
 STRIPE_STEP_LIGHT = 14
 
 
+def background_is_light(env: Optional[Dict[str, str]] = None,
+                        background: Optional[Tuple[int, int, int]] = None) -> bool:
+    """Whether the terminal has a light background.
+
+    The real background color (from query_terminal_background) wins: light when its luminance
+    is at least 128. Otherwise COLORFGBG ("fg;bg" or "fg;default;bg") decides: light when its
+    last field is 7 or 15. With no information at all the terminal is assumed dark.
+
+    Args:
+        env: Environment mapping (default os.environ).
+        background: Terminal background (r, g, b), 0-255 each, if known.
+
+    Returns:
+        True for a light background, False for a dark or unknown one.
+
+    Examples: background_is_light({}, (255, 255, 255)) -> True; background_is_light({}) -> False;
+    background_is_light({"COLORFGBG": "0;15"}) -> True;
+    background_is_light({"COLORFGBG": "0;15"}, (0, 0, 0)) -> False.
+    """
+    env = os.environ if env is None else env
+    if background is not None:
+        lum = 0.299 * background[0] + 0.587 * background[1] + 0.114 * background[2]
+        return lum >= 128
+    return (env.get("COLORFGBG") or "").split(";")[-1] in ("7", "15")
+
+
 def stripe_for_background(rgb: Tuple[int, int, int]) -> int:
     """Pick the 256-color grey closest to a shade STRIPE_STEP_DARK/LIGHT away from the background.
 
@@ -1188,7 +1231,7 @@ def stripe_for_background(rgb: Tuple[int, int, int]) -> int:
     Example: stripe_for_background((0, 0, 0)) -> 236; (255, 255, 255) -> 255; (30, 30, 30) -> 239.
     """
     lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-    target = lum + STRIPE_STEP_DARK if lum < 128 else lum - STRIPE_STEP_LIGHT
+    target = lum - STRIPE_STEP_LIGHT if background_is_light({}, rgb) else lum + STRIPE_STEP_DARK
     greys = [(0, 16), (255, 231)] + [(8 + 10 * k, 232 + k) for k in range(24)]
     # min() keeps the first of equal distances, so ties are deterministic.
     return min(greys, key=lambda g: abs(g[0] - target))[1]
@@ -1225,9 +1268,51 @@ def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None,
         return None  # 8/16-color palettes have no subtle shades
     if background is not None:
         return stripe_for_background(background)  # the real color beats a stale COLORFGBG
-    # COLORFGBG is "fg;bg" (sometimes "fg;default;bg"); the last field is the background.
-    bg = (env.get("COLORFGBG") or "").split(";")[-1]
-    return 255 if bg in ("7", "15") else 236
+    return 255 if background_is_light(env) else 236
+
+
+# Claude Code's theme as xterm-256 color numbers (the nearest cube/grey entry to each RGB).
+# Keys: brand (Claude orange, assistant name / Claude Code tag), codex (Codex tag),
+# secondary (muted text: dates, metadata, tool results), tool (tool-call marker),
+# star (starred rows), select_fg / select_bg (selected row), prompt_bg (band behind your
+# messages), head_bg (header and footer bars), hl_fg / hl_bg (search-match highlight).
+CLAUDE_PALETTES: Dict[str, Dict[str, int]] = {
+    # Source RGBs: brand 215,119,87; secondary 153,153,153; tool/success 78,186,101;
+    # star/warning 255,193,7; select_fg 177,185,249; prompt_bg 55,55,55.
+    "dark": {"brand": 173, "codex": 74, "secondary": 246, "tool": 71, "star": 214,
+             "select_fg": 147, "select_bg": 239, "prompt_bg": 237, "head_bg": 237,
+             "hl_fg": 16, "hl_bg": 214},
+    # Source RGBs: brand 215,119,87; secondary 102,102,102; tool/success 44,122,57;
+    # star/warning 150,108,30; select_fg 87,105,247; prompt_bg 240,240,240.
+    "light": {"brand": 173, "codex": 31, "secondary": 242, "tool": 28, "star": 172,
+              "select_fg": 63, "select_bg": 252, "prompt_bg": 254, "head_bg": 254,
+              "hl_fg": 16, "hl_bg": 214},
+}
+
+
+def pick_palette(ncolors: int, env: Optional[Dict[str, str]] = None,
+                 background: Optional[Tuple[int, int, int]] = None) -> Optional[Dict[str, int]]:
+    """Choose the TUI color palette, or None for the original 8-color ("basic") look.
+
+    AI_SESSIONS_THEME is "claude" (default; unknown values count as "claude") or "basic".
+    Basic is also used on terminals with fewer than 256 colors.
+
+    Args:
+        ncolors: Number of colors the terminal supports (curses.COLORS).
+        env: Environment mapping (default os.environ).
+        background: Terminal background (r, g, b) from query_terminal_background, if known.
+
+    Returns:
+        A CLAUDE_PALETTES entry (dark or light, see background_is_light), or None for basic.
+
+    Examples: pick_palette(256, {}) -> CLAUDE_PALETTES["dark"];
+    pick_palette(256, {"COLORFGBG": "0;15"}) -> CLAUDE_PALETTES["light"];
+    pick_palette(256, {"AI_SESSIONS_THEME": "basic"}) -> None; pick_palette(8, {}) -> None.
+    """
+    env = os.environ if env is None else env
+    if (env.get("AI_SESSIONS_THEME") or "").strip().lower() == "basic" or ncolors < 256:
+        return None
+    return CLAUDE_PALETTES["light" if background_is_light(env, background) else "dark"]
 
 
 def shell_quote(s: str) -> str:
@@ -1637,7 +1722,8 @@ def get_transcript(s: Session) -> List[Msg]:
 
 
 def result_preview_lines(text: str, width: int) -> List[Line]:
-    """Render a tool result as at most RESULT_PREVIEW_LINES "result" rows plus a "more" note.
+    """Render a tool result as at most RESULT_PREVIEW_LINES "result" rows plus a "more" note,
+    Claude Code style: an elbow before the first row, the rest indented to the same column.
 
     Args:
         text: The tool result text.
@@ -1645,18 +1731,20 @@ def result_preview_lines(text: str, width: int) -> List[Line]:
 
     Returns:
         (row, "result") pairs: the first non-blank lines of text (or "(empty)"), each clipped
-        to fit, and a final "... (N more lines)" row when some were cut.
+        to fit, and a final "... (N more lines)" row when some were cut. The first row starts
+        with "    ⎿  " (see transcript_glyphs); later rows are indented with spaces.
 
     Examples:
-        result_preview_lines("", 40) -> [("    ← (empty)", "result")]
-        result_preview_lines("a\\n\\nb", 40) -> [("    ← a", "result"), ("    ← b", "result")]
+        result_preview_lines("", 40) -> [("    ⎿  (empty)", "result")]
+        result_preview_lines("a\\n\\nb", 40) -> [("    ⎿  a", "result"), ("       b", "result")]
     """
+    first = "    %s  " % transcript_glyphs()[1]
+    rest = " " * len(first)
     body = [x for x in clean(text).split("\n") if x.strip()] or ["(empty)"]
-    rows: List[Line] = [("    ← " + clip(x.rstrip(), width - 6), "result")
-                        for x in body[:RESULT_PREVIEW_LINES]]
+    shown = [clip(x.rstrip(), width - len(first)) for x in body[:RESULT_PREVIEW_LINES]]
     if len(body) > RESULT_PREVIEW_LINES:
-        rows.append(("    ← ... (%d more lines)" % (len(body) - RESULT_PREVIEW_LINES), "result"))
-    return rows
+        shown.append("... (%d more lines)" % (len(body) - RESULT_PREVIEW_LINES))
+    return [((first if i == 0 else rest) + x, "result") for i, x in enumerate(shown)]
 
 
 def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
@@ -1666,7 +1754,8 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
     lines are (text, kind) pairs, already wrapped/clipped to width. The first
     body_start lines are the header (title, id, dir, branch, dates, counts, rule);
     the transcript body follows. Kinds: title, meta, dim (header); user / asst (speaker
-    labels); text (message body); tool (calls and slash commands); result (tool output).
+    labels); prompt (body of your own messages); text (other message bodies and blank
+    separators); tool (calls and slash commands); result (tool output).
     show_results includes tool results; mine_only keeps only your own input (prompts
     and slash commands).
 
@@ -1686,8 +1775,8 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
     lines (body_start == 6):
         ("Fix bug", "title"), ("Claude Code   a1", "meta"), ("Dir:     /work/proj", "meta"),
         ("Started: ...   Updated: ...", "meta"), ("Messages: 1 you, 1 claude", "meta"),
-        ("────...", "dim"), ("", "text"), ("You:  10:00", "user"), ("  fix the bug", "text"),
-        ("", "text"), ("Claude:", "asst"), ("  ok", "text"), ("  → Read: /x", "tool")
+        ("────...", "dim"), ("", "text"), ("You:  10:00", "user"), ("  fix the bug", "prompt"),
+        ("", "text"), ("Claude:", "asst"), ("  ok", "text"), ("  ⏺ Read: /x", "tool")
     """
     width = max(width, 10)
     lines: List[Line] = []
@@ -1718,11 +1807,11 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
             who = "You:" if role == "user" else ASSISTANT_NAME[s.source] + ":"
             lines.append((who + ("  " + fmt_ts(msg["ts"], False) if msg.get("ts") else ""),
                           "user" if role == "user" else "asst"))
-            add_wrapped(msg["text"], "text", "  ")
+            add_wrapped(msg["text"], "prompt" if role == "user" else "text", "  ")
         elif role == "cmd":
             lines.append(("  > " + clip(clean(msg["text"]), width - 4), "tool"))
         elif role == "tool":
-            lines.append(("  → " + clip(clean(msg["text"]), width - 4), "tool"))
+            lines.append(("  %s " % transcript_glyphs()[0] + clip(clean(msg["text"]), width - 4), "tool"))
         elif role == "result":
             lines.extend(result_preview_lines(msg["text"], width))
     return lines, body_start
@@ -1739,13 +1828,13 @@ def hit_lines(lines: List[Line], start: int, terms: List[str]) -> List[int]:
     Returns:
         The indexes of matching rows, in order; [] when terms is empty.
 
-    Example: lines [("Fix bug", "title"), ..., ("  fix the bug", "text")] with start=6 and
+    Example: lines [("Fix bug", "title"), ..., ("  fix the bug", "prompt")] with start=6 and
     terms ["bug"] -> [8] (the title at index 0 is in the header, so it is not a hit).
     """
     if not terms:
         return []
     return [i for i in range(start, len(lines))
-            if lines[i][1] in ("text", "tool", "result", "user", "asst")
+            if lines[i][1] in ("text", "prompt", "tool", "result", "user", "asst")
             and any(t in lines[i][0].lower() for t in terms)]
 
 
@@ -1900,61 +1989,99 @@ class App(object):
         """Fill self.attrs (name -> curses attribute) and hide the cursor. Uses color pairs when the
         terminal has colors; otherwise (or on curses errors) it keeps the bold/dim/reverse fallbacks.
 
-        Example: on a color terminal -> self.attrs["cc"] == color_pair(1) | A_BOLD;
-        on a monochrome one -> self.attrs["cc"] == A_BOLD and self.attrs["hl"] == A_REVERSE | A_BOLD;
-        self.attrs["star"] is bold yellow (color_pair(11)) or just A_BOLD
+        With the "claude" theme on a 256-color terminal (see pick_palette) the colors come from
+        Claude Code's palette; otherwise the original 8-color look is used. Besides the kind
+        names (title, meta, dim, user, asst, tool, result, hl, head, and "prompt" in the claude
+        theme only) it holds the session-list row variants: cc, cx, star, dim for plain rows and
+        the same with a "stripe_" or "sel_" prefix (plus bare "stripe" / "sel" for the row's
+        own background) for every other row and the selected row.
+
+        Example: on a basic color terminal -> self.attrs["cc"] == color_pair(1) | A_BOLD and
+        self.attrs["sel"] == A_REVERSE; on a 256-color one, self.attrs["sel"] is the select_fg
+        color on the select_bg color and "prompt" is the grey band behind your messages;
+        on a monochrome one -> self.attrs["cc"] == A_BOLD and self.attrs["hl"] == A_REVERSE | A_BOLD
         """
         attrs: Dict[str, int] = {"plain": 0, "dim": curses.A_DIM, "bold": curses.A_BOLD, "rev": curses.A_REVERSE,
              "cc": curses.A_BOLD, "cx": curses.A_UNDERLINE, "user": curses.A_BOLD,
              "asst": curses.A_BOLD, "hl": curses.A_REVERSE | curses.A_BOLD,
              "title": curses.A_BOLD, "tool": curses.A_DIM, "result": curses.A_DIM,
-             "meta": 0, "head": curses.A_REVERSE}
-        # Odd session-list rows; without a stripe color they look like the even rows.
-        attrs["stripe"] = 0
-        attrs["stripe_cc"] = attrs["cc"]
-        attrs["stripe_cx"] = attrs["cx"]
-        attrs["star"] = curses.A_BOLD
-        attrs["stripe_star"] = attrs["star"]
+             "meta": 0, "head": curses.A_REVERSE, "star": curses.A_BOLD}
         try:
             if curses.has_colors():
                 curses.start_color()
                 try:
                     curses.use_default_colors()
-                    bg = -1
+                    bg = fg = -1
                 except curses.error:
-                    bg = curses.COLOR_BLACK
-                # (pair number, foreground, background); numbers match the color_pair() uses below.
-                pairs = [(1, curses.COLOR_GREEN, bg), (2, curses.COLOR_MAGENTA, bg),
-                         (3, curses.COLOR_GREEN, bg), (4, curses.COLOR_CYAN, bg),
-                         (5, curses.COLOR_BLACK, curses.COLOR_YELLOW),
-                         (6, curses.COLOR_YELLOW, bg), (7, curses.COLOR_WHITE, curses.COLOR_BLUE)]
-                for n, f, b in pairs:
-                    curses.init_pair(n, f, b)
-                attrs["cc"] = curses.color_pair(1) | curses.A_BOLD
-                attrs["cx"] = curses.color_pair(2) | curses.A_BOLD
-                attrs["user"] = curses.color_pair(3) | curses.A_BOLD
-                attrs["asst"] = curses.color_pair(4) | curses.A_BOLD
-                attrs["hl"] = curses.color_pair(5)
-                attrs["title"] = curses.A_BOLD
-                attrs["tool"] = curses.color_pair(6)
-                attrs["result"] = curses.A_DIM
-                attrs["head"] = curses.color_pair(7) | curses.A_BOLD
-                curses.init_pair(11, curses.COLOR_YELLOW, bg)
-                attrs["star"] = curses.color_pair(11) | curses.A_BOLD
-                # Shaded variants for every other session-list row (pairs 8-10 and 12), so long
-                # rows are easy to follow across a wide screen.
+                    bg, fg = curses.COLOR_BLACK, curses.COLOR_WHITE
+                palette = pick_palette(curses.COLORS, background=self.background)
+                next_pair = [1]  # pair numbers are handed out in order; 0 is the terminal default
+
+                def pair(f: int, b: int) -> int:
+                    """Allocate the next color pair (f on b) and return its attribute; 0 when
+                    the terminal has no pairs left. Example: pair(2, -1) -> color_pair(1)."""
+                    if next_pair[0] >= curses.COLOR_PAIRS:
+                        return 0
+                    curses.init_pair(next_pair[0], f, b)
+                    next_pair[0] += 1
+                    return curses.color_pair(next_pair[0] - 1)
+
+                def row_set(prefix: str, row_bg: int, base: int, cc: int, cx: int,
+                            star: int, dim: int) -> None:
+                    """Store the list-row attributes for one row background: attrs[prefix] (the
+                    row itself) and prefix_cc / _cx / _star / _dim, each fg on row_bg.
+                    Example: row_set("sel", 239, base_fg, 173, 74, 214, 246)."""
+                    attrs[prefix] = pair(base, row_bg)
+                    attrs[prefix + "_cc"] = pair(cc, row_bg) | curses.A_BOLD
+                    attrs[prefix + "_cx"] = pair(cx, row_bg) | curses.A_BOLD
+                    attrs[prefix + "_star"] = pair(star, row_bg) | curses.A_BOLD
+                    attrs[prefix + "_dim"] = pair(dim, row_bg)
+
                 stripe = stripe_color(curses.COLORS, background=self.background)
-                if stripe is not None:
-                    curses.init_pair(8, -1 if bg == -1 else curses.COLOR_WHITE, stripe)
-                    curses.init_pair(9, curses.COLOR_GREEN, stripe)
-                    curses.init_pair(10, curses.COLOR_MAGENTA, stripe)
-                    curses.init_pair(12, curses.COLOR_YELLOW, stripe)
-                    attrs["stripe"] = curses.color_pair(8)
-                    attrs["stripe_cc"] = curses.color_pair(9) | curses.A_BOLD
-                    attrs["stripe_cx"] = curses.color_pair(10) | curses.A_BOLD
-                    attrs["stripe_star"] = curses.color_pair(12) | curses.A_BOLD
+                if palette is None:
+                    attrs["cc"] = pair(curses.COLOR_GREEN, bg) | curses.A_BOLD
+                    attrs["cx"] = pair(curses.COLOR_MAGENTA, bg) | curses.A_BOLD
+                    attrs["user"] = pair(curses.COLOR_GREEN, bg) | curses.A_BOLD
+                    attrs["asst"] = pair(curses.COLOR_CYAN, bg) | curses.A_BOLD
+                    attrs["hl"] = pair(curses.COLOR_BLACK, curses.COLOR_YELLOW)
+                    attrs["tool"] = pair(curses.COLOR_YELLOW, bg)
+                    attrs["head"] = pair(curses.COLOR_WHITE, curses.COLOR_BLUE) | curses.A_BOLD
+                    attrs["star"] = pair(curses.COLOR_YELLOW, bg) | curses.A_BOLD
+                    # Shaded variants for every other session-list row, so long rows are easy
+                    # to follow across a wide screen.
+                    if stripe is not None:
+                        row_set("stripe", stripe, fg, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
+                                curses.COLOR_YELLOW, fg)
+                        attrs["stripe_dim"] |= curses.A_DIM
+                else:
+                    p = palette
+                    secondary = pair(p["secondary"], bg)
+                    attrs["cc"] = pair(p["brand"], bg) | curses.A_BOLD
+                    attrs["cx"] = pair(p["codex"], bg) | curses.A_BOLD
+                    attrs["user"] = curses.A_BOLD
+                    attrs["asst"] = attrs["cc"]
+                    attrs["title"] = curses.A_BOLD
+                    attrs["meta"] = attrs["dim"] = attrs["result"] = secondary
+                    attrs["tool"] = pair(p["tool"], bg)
+                    attrs["star"] = pair(p["star"], bg) | curses.A_BOLD
+                    attrs["hl"] = pair(p["hl_fg"], p["hl_bg"])
+                    attrs["head"] = pair(fg, p["head_bg"]) | curses.A_BOLD
+                    attrs["prompt"] = pair(fg, p["prompt_bg"])
+                    if stripe is not None:
+                        row_set("stripe", stripe, fg, p["brand"], p["codex"], p["star"], p["secondary"])
+                    row_set("sel", p["select_bg"], p["select_fg"], p["brand"], p["codex"],
+                            p["star"], p["secondary"])
+                    attrs["sel"] |= curses.A_BOLD
         except curses.error:
             pass
+        # Without a stripe color, odd rows look like the even ones.
+        attrs.setdefault("stripe", 0)
+        for name in ("cc", "cx", "star", "dim"):
+            attrs.setdefault("stripe_" + name, attrs[name])
+        # The basic theme (and any failure above) marks the selected row with reverse video.
+        attrs.setdefault("sel", curses.A_REVERSE)
+        for name in ("cc", "cx", "star", "dim"):
+            attrs.setdefault("sel_" + name, attrs[name] | curses.A_REVERSE)
         self.attrs = attrs
         try:
             curses.curs_set(0)
@@ -2009,6 +2136,26 @@ class App(object):
             pos = m.end()
         if pos < len(s):
             self.put(y, x + str_width(s[:pos]), s[pos:], attr)
+
+    def draw_line(self, y: int, x: int, s: str, maxw: int, kind: str,
+                  pat: Optional[Pattern[str]] = None) -> None:
+        """Draw one rendered transcript row in the attribute for its kind. "prompt" rows first
+        get the whole width painted with the prompt attribute so the band spans the row.
+
+        Args:
+            y: Row.
+            x: Column.
+            s: Row text.
+            maxw: Width in columns available to the row.
+            kind: The row's kind (see Line); unknown kinds draw plain.
+            pat: Regex whose matches are highlighted, or None.
+
+        Example: draw_line(3, 0, "  fix it", 40, "prompt") paints 40 grey cells on row 3, then
+        writes "  fix it" over them; in the basic theme (no "prompt" attribute) it is just text().
+        """
+        if kind == "prompt" and "prompt" in self.attrs and maxw > 0:
+            self.put(y, x, " " * maxw, self.attrs["prompt"])
+        self.text(y, x, s, maxw, self.attrs.get(kind, 0), pat)
 
     def fill(self, y: int, attr: int) -> None:
         """Paint row y with attr across the full width (for the header/footer bars).
@@ -2216,7 +2363,7 @@ class App(object):
 
     def draw_list(self, box: Box, pat: Optional[Pattern[str]]) -> None:
         """Draw the session rows into box, scrolling so the selection stays visible. Each row is
-        "date  star  tag  project  title", with the selected row in reverse video, every other row on a
+        "date  star  tag  project  title", with the selected row highlighted (reverse video in the basic theme), every other row on a
         slightly different background (stripe_color), and filter matches highlighted.
 
         Args:
@@ -2246,20 +2393,21 @@ class App(object):
             y = y0 + i
             cur = idx == self.sel
             # Every other row gets a slightly different background (see stripe_color);
-            # the selected row is drawn in reverse video instead.
+            # the selected row uses the "sel" attributes (see init_colors).
             striped = idx % 2 == 1 and not cur
-            extra = curses.A_REVERSE if cur else (self.attrs["stripe"] if striped else 0)
+            row = "sel" if cur else ("stripe" if striped else "plain")
+            pre = "" if row == "plain" else row + "_"  # attrs key prefix: "cc" vs "sel_cc"
+            extra = self.attrs[row]
             if cur or striped:
                 self.put(y, x0, " " * (bw - 1), extra)
-            tag_attr = self.attrs[("stripe_" if striped else "") + ("cc" if s.source == "claude" else "cx")]
+            tag_attr = self.attrs[pre + ("cc" if s.source == "claude" else "cx")]
             x = x0
-            self.put(y, x, fmt_ts(s.last_ts if self.sort == "last" else s.first_ts), extra | self.attrs["dim"])
+            self.put(y, x, fmt_ts(s.last_ts if self.sort == "last" else s.first_ts), self.attrs[pre + "dim"])
             x += DATE_COL_WIDTH
             if s.starred:
-                self.put(y, x, "*", (curses.A_REVERSE if cur else 0) |
-                         self.attrs[("stripe_" if striped else "") + "star"])
+                self.put(y, x, "*", self.attrs[pre + "star"])
             x += STAR_COL_WIDTH
-            self.put(y, x, TAG[s.source], (curses.A_REVERSE if cur else 0) | tag_attr)
+            self.put(y, x, TAG[s.source], tag_attr)
             x += TAG_COL_WIDTH
             self.text(y, x, pad(s.project, projw), projw, extra, pat)
             x += projw + 1
@@ -2318,7 +2466,7 @@ class App(object):
             if j >= len(lines):
                 break
             t, kind = lines[j]
-            self.text(y0 + i, x0, t, bw - 1, self.attrs.get(kind, 0), pat)
+            self.draw_line(y0 + i, x0, t, bw - 1, kind, pat)
 
     # -- actions
     def move(self, d: int) -> None:
@@ -3022,7 +3170,7 @@ class Viewer(object):
             if j >= len(self.lines):
                 break
             t, kind = self.lines[j]
-            app.text(1 + i, 0, t, w - 1, app.attrs.get(kind, 0), pat)
+            app.draw_line(1 + i, 0, t, w - 1, kind, pat)
         app.fill(h - 1, app.attrs["head"])
         pct = 100 if len(self.lines) <= bh else int(100 * (self.offset + bh) / len(self.lines))
         foot = self.status or (" j/k scroll  spc/b page  g/G ends  / search  n/N hit  "

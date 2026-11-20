@@ -416,9 +416,9 @@ class Cli(Env):
             "",
             "Claude:  10:00",
             "  I will look at the file.",
-            "  → Read: /work/alpha/foo.py",
-            "    ← line one",
-            "    ← line two",
+            "  %s Read: /work/alpha/foo.py" % ai.transcript_glyphs()[0],
+            "    %s  line one" % ai.transcript_glyphs()[1],
+            "       line two",
             "",
             "Claude:  10:05",
             "  Found it: the zebra widget.",
@@ -427,9 +427,10 @@ class Cli(Env):
 
     def test_show_prefix_and_tools_flag(self) -> None:
         plain = self.run_cli("--show", "aaaaaaaa").stdout
-        self.assertIn("→ Read: /work/alpha/foo.py", plain)  # calls always shown
-        self.assertNotIn("←", plain)                         # results hidden
-        self.assertIn("← line one", self.run_cli("--show", "aaaaaaaa", "--tools").stdout)
+        mark, elbow = ai.transcript_glyphs()
+        self.assertIn(mark + " Read: /work/alpha/foo.py", plain)  # calls always shown
+        self.assertNotIn(elbow, plain)                             # results hidden
+        self.assertIn(elbow + "  line one", self.run_cli("--show", "aaaaaaaa", "--tools").stdout)
 
     def test_show_mine(self) -> None:
         out = self.run_cli("--show", A_ID, "--mine").stdout
@@ -441,8 +442,9 @@ class Cli(Env):
     def test_show_codex(self) -> None:
         out = self.run_cli("--show", "1111", "--tools").stdout
         self.assertIn("Codex   " + X_ID, out)
-        self.assertIn("→ apply_patch: *** Begin Patch", out)
-        self.assertIn("← Patch applied", out)
+        mark, elbow = ai.transcript_glyphs()
+        self.assertIn(mark + " apply_patch: *** Begin Patch", out)
+        self.assertIn(elbow + "  Patch applied", out)
 
     def test_show_missing_and_ambiguous(self) -> None:
         p = self.run_cli("--show", "zzz", expect=1)
@@ -643,6 +645,38 @@ class Units(unittest.TestCase):
         self.assertIsNone(sc(256, {"AI_SESSIONS_STRIPE": "off"}, (255, 255, 255)))
         self.assertIsNone(sc(8, {}, (255, 255, 255)))
 
+    def test_background_is_light(self) -> None:
+        f = ai.background_is_light
+        self.assertFalse(f({}))
+        self.assertTrue(f({}, (255, 255, 255)))
+        self.assertFalse(f({}, (30, 30, 30)))
+        self.assertTrue(f({"COLORFGBG": "0;15"}))
+        self.assertTrue(f({"COLORFGBG": "0;default;7"}))
+        self.assertFalse(f({"COLORFGBG": "15;0"}))
+        self.assertFalse(f({"COLORFGBG": "0;15"}, (0, 0, 0)))  # real color beats COLORFGBG
+        self.assertTrue(f({"COLORFGBG": "15;0"}, (250, 250, 250)))
+
+    def test_pick_palette(self) -> None:
+        pp = ai.pick_palette
+        dark, light = ai.CLAUDE_PALETTES["dark"], ai.CLAUDE_PALETTES["light"]
+        self.assertEqual(set(dark), set(light))
+        self.assertIs(pp(256, {}), dark)
+        self.assertIs(pp(256, {"COLORFGBG": "0;15"}), light)
+        self.assertIs(pp(256, {}, (255, 255, 255)), light)
+        self.assertIs(pp(256, {"COLORFGBG": "0;15"}, (0, 0, 0)), dark)
+        self.assertIsNone(pp(256, {"AI_SESSIONS_THEME": "basic"}))
+        self.assertIsNone(pp(256, {"AI_SESSIONS_THEME": " Basic "}))
+        self.assertIsNone(pp(8, {}))
+        self.assertIsNone(pp(88, {"AI_SESSIONS_THEME": "claude"}))
+        self.assertIs(pp(256, {"AI_SESSIONS_THEME": "claude"}), dark)
+        self.assertIs(pp(256, {"AI_SESSIONS_THEME": "bogus"}), dark)
+
+    def test_transcript_glyphs(self) -> None:
+        with mock.patch.object(ai.locale, "getpreferredencoding", return_value="UTF-8"):
+            self.assertEqual(ai.transcript_glyphs(), ("\u23fa", "\u23bf"))
+        with mock.patch.object(ai.locale, "getpreferredencoding", return_value="ANSI_X3.4-1968"):
+            self.assertEqual(ai.transcript_glyphs(), ("*", "|"))
+
     def test_stripe_for_background(self) -> None:
         f = ai.stripe_for_background
         self.assertEqual(f((0, 0, 0)), 236)
@@ -721,11 +755,21 @@ class Units(unittest.TestCase):
         texts = [t for t, _ in lines]
         self.assertEqual(texts[0], "T")
         self.assertTrue(start > 0 and texts[start - 1].startswith(ai.rule_chars()[0] * 3))
-        self.assertIn("    ← r5", texts)
-        self.assertIn("    ← ... (3 more lines)", texts)   # 6 result lines shown
-        self.assertNotIn("    ← r6", texts)
+        elbow = ai.transcript_glyphs()[1]
+        self.assertIn("    %s  r0" % elbow, texts)          # elbow on the first row only
+        self.assertIn("       r5", texts)                    # later rows indented to match
+        self.assertIn("       ... (3 more lines)", texts)    # 6 result lines shown
+        self.assertNotIn("       r6", texts)
+        self.assertEqual(texts.count("    %s  r0" % elbow), 1)
+        self.assertFalse(any(elbow in t for t in texts if t.startswith("       ")))
         hidden = [t for t, _ in ai.render(s, msgs, 40, False)[0]]
-        self.assertFalse(any("←" in t for t in hidden))
+        self.assertFalse(any(elbow in t for t in hidden))
+        kinds = dict((t, k) for t, k in lines)
+        self.assertEqual(kinds["  hello world"], "prompt")  # your message body
+        self.assertEqual(kinds["  bye"], "text")             # assistant body
+        self.assertEqual(kinds["  %s Read: /x" % ai.transcript_glyphs()[0]], "tool")
+        self.assertEqual(ai.hit_lines(lines, start, ["hello"]),
+                         [texts.index("  hello world")])
         self.assertEqual(ai.hit_lines(lines, start, ["world"]),
                          [i for i in range(start, len(lines)) if "world" in lines[i][0]])
         self.assertEqual(ai.hit_lines(lines, start, []), [])
@@ -853,6 +897,44 @@ class Tui(Env):
     def test_init_colors_without_terminal(self) -> None:
         app = self.make([])
         self.assertIn("hl", getattr(app, "attrs", None) or app.A)  # swallowed curses.error
+
+    def colored_attrs(self, ncolors: int, env: Dict[str, str]) -> Dict[str, int]:
+        """init_colors on a fake color terminal; returns app.attrs (color_pair(n) is n << 8)."""
+        app = self.make([])
+        pairs: Dict[int, Any] = {}
+        with mock.patch.object(curses, "has_colors", return_value=True), \
+                mock.patch.object(curses, "start_color"), \
+                mock.patch.object(curses, "use_default_colors"), \
+                mock.patch.object(curses, "curs_set"), \
+                mock.patch.object(curses, "COLORS", ncolors, create=True), \
+                mock.patch.object(curses, "COLOR_PAIRS", 256, create=True), \
+                mock.patch.object(curses, "init_pair", side_effect=lambda n, f, b: pairs.update({n: (f, b)})), \
+                mock.patch.object(curses, "color_pair", side_effect=lambda n: n << 8), \
+                mock.patch.dict(os.environ, env):
+            app.background = None
+            app.init_colors()
+        self.pairs = pairs
+        return app.attrs
+
+    def test_init_colors_claude_theme(self) -> None:
+        a = self.colored_attrs(256, {"AI_SESSIONS_THEME": "claude", "COLORFGBG": "15;0"})
+        pal = ai.CLAUDE_PALETTES["dark"]
+        self.assertEqual(self.pairs[a["prompt"] >> 8], (-1, pal["prompt_bg"]))
+        self.assertEqual(self.pairs[a["sel"] >> 8 & 0xff], (pal["select_fg"], pal["select_bg"]))
+        self.assertEqual(self.pairs[a["sel_cc"] >> 8 & 0xff], (pal["brand"], pal["select_bg"]))
+        self.assertEqual(self.pairs[a["tool"] >> 8], (pal["tool"], -1))
+        self.assertFalse(a["dim"] & curses.A_DIM)
+        self.assertFalse(a["sel"] & curses.A_REVERSE)
+        self.assertLessEqual(max(self.pairs), 256)
+
+    def test_init_colors_basic_theme(self) -> None:
+        for env, ncolors in (({"AI_SESSIONS_THEME": "basic"}, 256), ({}, 8)):
+            a = self.colored_attrs(ncolors, env)
+            self.assertNotIn("prompt", a)
+            self.assertEqual(a["sel"], curses.A_REVERSE)
+            self.assertEqual(a["sel_cc"], a["cc"] | curses.A_REVERSE)
+            self.assertEqual(self.pairs[a["cc"] >> 8 & 0xff], (curses.COLOR_GREEN, -1))
+            self.assertTrue(a["sel_dim"] & curses.A_REVERSE and a["dim"] == curses.A_DIM)
 
     def test_initial_view_and_draw(self) -> None:
         app = self.make(["q"])
@@ -1138,7 +1220,7 @@ class Tui(Env):
 
     def test_viewer_shows_results_when_toggled(self) -> None:
         self.run_keys(["\n", "t", "q", "q"], query="zebra")
-        self.assertTrue(self.scr.any_frame("← line one"))
+        self.assertTrue(self.scr.any_frame(ai.transcript_glyphs()[1] + "  line one"))
 
     def test_narrow_and_wide_layouts(self) -> None:
         app = self.run_keys(["j", "q"], w=80)
