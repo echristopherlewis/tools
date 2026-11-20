@@ -19,7 +19,7 @@ Environment:
                           --claude-cmd / --codex-cmd override these.
   AI_SESSIONS_STRIPE      background color (0-255) of every other session-list row,
                           or "off" (default: a grey just off the terminal background as
-                          reported by the terminal (OSC 11), else 233, or 255 if COLORFGBG
+                          reported by the terminal (OSC 11), else 236, or 255 if COLORFGBG
                           says the background is light; 256-color terminals only)
   XDG_CACHE_HOME          cache root (index in $XDG_CACHE_HOME/ai-sessions/index.json)
   XDG_DATA_HOME           data root (stars in $XDG_DATA_HOME/ai-sessions/stars.json;
@@ -1169,13 +1169,15 @@ def query_terminal_background(timeout: float = 0.2) -> Optional[Tuple[int, int, 
     return parse_osc11_reply(buf.decode("latin-1"))
 
 
-# How far (in 0-255 brightness) the stripe sits from the terminal background. Small, so the
-# stripe is barely visible; it moves toward mid-grey so it works on dark and light themes.
-STRIPE_STEP = 14
+# How far (in 0-255 brightness) the stripe sits from the terminal background; it moves toward
+# mid-grey so it works on dark and light themes. Dark backgrounds take a bigger step so a black
+# background gets grey 236; light backgrounds keep a small step so the stripe stays faint.
+STRIPE_STEP_DARK = 48
+STRIPE_STEP_LIGHT = 14
 
 
 def stripe_for_background(rgb: Tuple[int, int, int]) -> int:
-    """Pick the 256-color grey closest to a shade STRIPE_STEP away from the given background.
+    """Pick the 256-color grey closest to a shade STRIPE_STEP_DARK/LIGHT away from the background.
 
     Args:
         rgb: Terminal background as (r, g, b), 0-255 each.
@@ -1183,10 +1185,10 @@ def stripe_for_background(rgb: Tuple[int, int, int]) -> int:
     Returns:
         An xterm-256 grey color number: 16 (level 0), 231 (level 255) or 232-255 (levels 8, 18, ... 238).
 
-    Example: stripe_for_background((0, 0, 0)) -> 233; (255, 255, 255) -> 255; (30, 30, 30) -> 236.
+    Example: stripe_for_background((0, 0, 0)) -> 236; (255, 255, 255) -> 255; (30, 30, 30) -> 239.
     """
     lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-    target = lum + STRIPE_STEP if lum < 128 else lum - STRIPE_STEP
+    target = lum + STRIPE_STEP_DARK if lum < 128 else lum - STRIPE_STEP_LIGHT
     greys = [(0, 16), (255, 231)] + [(8 + 10 * k, 232 + k) for k in range(24)]
     # min() keeps the first of equal distances, so ties are deterministic.
     return min(greys, key=lambda g: abs(g[0] - target))[1]
@@ -1199,7 +1201,7 @@ def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None,
     AI_SESSIONS_STRIPE wins when set: a color number (0..ncolors-1) or "off". Otherwise, on
     256-color terminals, a grey just off the terminal's real background when it is known
     (see stripe_for_background); failing that, 255 (light grey) when COLORFGBG says the
-    background is light (7 or 15), else 233 (very dark grey).
+    background is light (7 or 15), else 236 (very dark grey).
 
     Args:
         ncolors: Number of colors the terminal supports (curses.COLORS).
@@ -1209,7 +1211,7 @@ def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None,
     Returns:
         A curses color number, or None when the list should not be striped.
 
-    Example: stripe_color(256, {}) -> 233; stripe_color(256, {"COLORFGBG": "0;15"}) -> 255;
+    Example: stripe_color(256, {}) -> 236; stripe_color(256, {"COLORFGBG": "0;15"}) -> 255;
     stripe_color(256, {}, (255, 255, 255)) -> 255; stripe_color(8, {}) -> None;
     stripe_color(256, {"AI_SESSIONS_STRIPE": "off"}) -> None.
     """
@@ -1225,7 +1227,7 @@ def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None,
         return stripe_for_background(background)  # the real color beats a stale COLORFGBG
     # COLORFGBG is "fg;bg" (sometimes "fg;default;bg"); the last field is the background.
     bg = (env.get("COLORFGBG") or "").split(";")[-1]
-    return 255 if bg in ("7", "15") else 233
+    return 255 if bg in ("7", "15") else 236
 
 
 def shell_quote(s: str) -> str:
