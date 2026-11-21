@@ -2490,7 +2490,7 @@ HELP_TITLE = "ai-sessions - browse Claude Code and Codex transcripts"
 # Help screen contents: (section title, [(keys, what they do), ...]). Keys are drawn in a
 # fixed-width column so the descriptions line up.
 HELP: List[Tuple[str, List[Tuple[str, str]]]] = [
-    ("Session list", [
+    ("Session list                                                  ", [
         ("j k  Up Down", "move selection"),
         ("PgUp PgDn", "page up / down"),
         ("g G  Home End", "first / last session"),
@@ -2510,7 +2510,7 @@ HELP: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("R", "rescan session files"),
         ("click", "move selection to the clicked session"),
     ]),
-    ("Viewer", [
+    ("Viewer                                                          ", [
         ("j k  Up Down", "scroll one line"),
         ("PgDn Space f", "page down"),
         ("PgUp b", "page up"),
@@ -2522,7 +2522,7 @@ HELP: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("* 8", "star / unstar this session"),
         ("q Esc", "back to the list"),
     ]),
-    ("Both", [
+    ("Both                                                            ", [
         ("r", "resume session (configured command, in its cwd)"),
         ("e", "edit the resume command line, then resume"),
         ("y", "copy the resume command to the clipboard"),
