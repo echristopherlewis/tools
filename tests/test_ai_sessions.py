@@ -103,7 +103,7 @@ class Env(unittest.TestCase):
         return os.path.join(self.tmp, *parts)
 
     def sessions(self) -> Dict[str, Any]:
-        return {s.id: s for s in ai.load_sessions()}
+        return {s.id: s for s in ai.INDEX.load()}
 
     def stars_file(self) -> str:
         return os.path.join(self.data, "ai-sessions", "stars.json")
@@ -286,19 +286,19 @@ class LoadSessions(Env):
 
     def test_first_load_parses_every_file_once(self) -> None:
         with mock.patch.object(ai, "parse_any", wraps=ai.parse_any) as pa:
-            ai.load_sessions()
+            ai.INDEX.load()
             # 5 claude files (memory/ is skipped) + 3 codex rollouts, empty ones included
             self.assertEqual(pa.call_count, 8)
         self.assertEqual(len(self.cache_files()), 8)
 
     def test_cache_second_load_does_not_parse(self) -> None:
-        ai.load_sessions()
+        ai.INDEX.load()
         with mock.patch.object(ai, "parse_any", wraps=ai.parse_any) as pa:
-            self.assertEqual(len(ai.load_sessions()), 6)
+            self.assertEqual(len(ai.INDEX.load()), 6)
             self.assertEqual(pa.call_count, 0)
 
     def test_modified_file_is_reparsed(self) -> None:
-        ai.load_sessions()
+        ai.INDEX.load()
         path = self.fx("claude", "-work-beta", D_ID + ".jsonl")
         with open(path, "a") as f:
             f.write(json.dumps({"type": "user", "message": {"content": "another"}}) + "\n")
@@ -310,7 +310,7 @@ class LoadSessions(Env):
         self.assertEqual(ss[D_ID].n_user, 2)
 
     def test_deleted_file_is_pruned(self) -> None:
-        ai.load_sessions()
+        ai.INDEX.load()
         path = self.fx("claude", "-work-beta", D_ID + ".jsonl")
         os.remove(path)
         ss = self.sessions()
@@ -318,7 +318,7 @@ class LoadSessions(Env):
         self.assertNotIn(path, self.cache_files())
 
     def test_prune_only_under_scanned_roots(self) -> None:
-        ai.load_sessions()
+        ai.INDEX.load()
         cp = os.path.join(self.cache, "ai-sessions", "index.json")
         with open(cp) as f:
             data = json.load(f)
@@ -326,11 +326,11 @@ class LoadSessions(Env):
         with open(cp, "w") as f:
             json.dump(data, f)
         os.remove(self.fx("claude", "-work-beta", D_ID + ".jsonl"))  # forces a cache rewrite
-        ai.load_sessions()
+        ai.INDEX.load()
         self.assertIn("/elsewhere/x.jsonl", self.cache_files())
 
     def test_codex_index_change_applies_without_reparse(self) -> None:
-        ai.load_sessions()
+        ai.INDEX.load()
         write_jsonl(self.fx("codex", "session_index.jsonl"),
                     [{"id": X_ID, "thread_name": "Renamed thread"}])
         with mock.patch.object(ai, "parse_any", wraps=ai.parse_any) as pa:
@@ -339,7 +339,7 @@ class LoadSessions(Env):
         self.assertEqual(ss[X_ID].title, "Renamed thread")
 
     def test_index_version_mismatch_reparses(self) -> None:
-        ai.load_sessions()
+        ai.INDEX.load()
         cp = os.path.join(self.cache, "ai-sessions", "index.json")
         with open(cp) as f:
             data = json.load(f)
@@ -347,14 +347,14 @@ class LoadSessions(Env):
         with open(cp, "w") as f:
             json.dump(data, f)
         with mock.patch.object(ai, "parse_any", wraps=ai.parse_any) as pa:
-            ai.load_sessions()
+            ai.INDEX.load()
             self.assertGreater(pa.call_count, 0)
 
     def test_corrupt_cache_is_ignored(self) -> None:
         os.makedirs(os.path.join(self.cache, "ai-sessions"))
         with open(os.path.join(self.cache, "ai-sessions", "index.json"), "w") as f:
             f.write("{not json")
-        self.assertEqual(len(ai.load_sessions()), 6)
+        self.assertEqual(len(ai.INDEX.load()), 6)
 
     def test_filter_and_sort(self) -> None:
         ss = list(self.sessions().values())
@@ -464,18 +464,18 @@ class Cli(Env):
 # ------------------------------------------------------------ stars
 class Stars(Env):
     def test_roundtrip_and_set_star(self) -> None:
-        self.assertEqual(ai.read_stars(), {})
-        ai.write_stars({"a": 1.5})
-        self.assertEqual(ai.read_stars(), {"a": 1.5})
-        self.assertEqual(ai.stars_path(), self.stars_file())
-        ai.set_star("b", True)
-        self.assertEqual(sorted(ai.read_stars()), ["a", "b"])
-        first = ai.read_stars()["b"]
-        ai.set_star("b", True)  # idempotent, keeps the original timestamp
-        self.assertEqual(ai.read_stars()["b"], first)
-        ai.set_star("a", False)
-        ai.set_star("zzz", False)  # unstarring an unknown id is fine
-        self.assertEqual(sorted(ai.read_stars()), ["b"])
+        self.assertEqual(ai.STARS.read(), {})
+        ai.STARS.write({"a": 1.5})
+        self.assertEqual(ai.STARS.read(), {"a": 1.5})
+        self.assertEqual(ai.STARS.path(), self.stars_file())
+        ai.STARS.set("b", True)
+        self.assertEqual(sorted(ai.STARS.read()), ["a", "b"])
+        first = ai.STARS.read()["b"]
+        ai.STARS.set("b", True)  # idempotent, keeps the original timestamp
+        self.assertEqual(ai.STARS.read()["b"], first)
+        ai.STARS.set("a", False)
+        ai.STARS.set("zzz", False)  # unstarring an unknown id is fine
+        self.assertEqual(sorted(ai.STARS.read()), ["b"])
         with open(self.stars_file()) as f:
             self.assertEqual(json.load(f)["version"], 1)
 
@@ -485,21 +485,21 @@ class Stars(Env):
                      '{"version": 1, "stars": []}'):
             with open(self.stars_file(), "w") as f:
                 f.write(text)
-            self.assertEqual(ai.read_stars(), {}, text)
+            self.assertEqual(ai.STARS.read(), {}, text)
         with open(self.stars_file(), "w") as f:
             f.write('{"version": 1, "stars": {"a": 1, "b": "x", "c": null, "d": true}}')
-        self.assertEqual(ai.read_stars(), {"a": 1.0})
+        self.assertEqual(ai.STARS.read(), {"a": 1.0})
 
     def test_write_failure_raises(self) -> None:
         os.makedirs(self.data)
         with open(os.path.join(self.data, "ai-sessions"), "w") as f:  # a file where the dir should be
             f.write("")
         with self.assertRaises(OSError):
-            ai.set_star("a", True)
+            ai.STARS.set("a", True)
 
     def test_load_sessions_marks_starred(self) -> None:
-        ai.set_star(B_ID, True)
-        ai.set_star("not-a-session", True)
+        ai.STARS.set(B_ID, True)
+        ai.STARS.set("not-a-session", True)
         ss = self.sessions()
         self.assertEqual(sorted(i for i, s in ss.items() if s.starred), [B_ID])
         self.assertFalse(ai.Session({"source": "claude", "id": "x", "path": "p", "cwd": "",
@@ -510,8 +510,8 @@ class Stars(Env):
             self.assertNotIn(b"starred", f.read())
 
     def test_filter_starred_only(self) -> None:
-        ai.set_star(B_ID, True)
-        ai.set_star(X_ID, True)
+        ai.STARS.set(B_ID, True)
+        ai.STARS.set(X_ID, True)
         ss = list(self.sessions().values())
         self.assertEqual(sorted(s.id for s in ai.filter_sessions(ss, starred_only=True)), [X_ID, B_ID])
         self.assertEqual([s.id for s in ai.filter_sessions(ss, source="codex", starred_only=True)], [X_ID])
@@ -982,7 +982,7 @@ class ResumeArgv(Env):
         self.assertEqual(s2.resume_cmd(), "cd /work/codex-proj && codex resume " + X_ID)
 
     def sessions(self) -> Dict[str, Any]:
-        return {s.id: s for s in ai.load_sessions()}
+        return {s.id: s for s in ai.INDEX.load()}
 
 
 # ------------------------------------------------------------ TUI
@@ -1054,7 +1054,7 @@ class Tui(Env):
     def make(self, keys: List[Key], query: str = "", source: str = "all",
              h: int = 30, w: int = 120) -> Any:
         self.scr = FakeScr(keys, h, w)
-        return ai.App(self.scr, list(ai.load_sessions()), query, source)
+        return ai.App(self.scr, list(ai.INDEX.load()), query, source)
 
     def run_keys(self, keys: List[Key], **kw: Any) -> Any:
         app = self.make(keys, **kw)
@@ -1441,7 +1441,7 @@ class Tui(Env):
 
     def test_star_key_toggles_and_persists(self) -> None:
         app = self.run_keys(["*", "j", "*", "*", "q"])
-        self.assertEqual(sorted(ai.read_stars()), [D_ID])
+        self.assertEqual(sorted(ai.STARS.read()), [D_ID])
         self.assertTrue(app.view[0].starred)
         self.assertFalse(app.view[1].starred)
         self.assertTrue(self.scr.any_frame(" starred: First prompt becomes the title"))
@@ -1450,14 +1450,14 @@ class Tui(Env):
         self.assertIn("2025-03-04 08:01 * CC", row)
 
     def test_star_key_write_failure_shows_status(self) -> None:
-        with mock.patch.object(ai, "set_star", side_effect=OSError("disk full")):
+        with mock.patch.object(ai.STARS, "set", side_effect=OSError("disk full")):
             app = self.run_keys(["*", "q"])
         self.assertFalse(app.view[0].starred)
         self.assertTrue(self.scr.any_frame("could not save stars: disk full"))
 
     def test_starred_only_filter(self) -> None:
-        ai.set_star(B_ID, True)
-        ai.set_star(X_ID, True)
+        ai.STARS.set(B_ID, True)
+        ai.STARS.set(X_ID, True)
         app = self.run_keys(["S", "q"])
         self.assertEqual(sorted(s.id for s in app.view), [X_ID, B_ID])
         self.assertTrue(self.scr.any_frame("filter: starred"))
@@ -1466,27 +1466,27 @@ class Tui(Env):
         # unstarring while filtered removes the row
         app = self.run_keys(["S", "*", "q"])
         self.assertEqual(len(app.view), 1)
-        self.assertEqual(len(ai.read_stars()), 1)
+        self.assertEqual(len(ai.STARS.read()), 1)
 
     def test_rescan_rereads_stars(self) -> None:
         app = self.make(["R", "q"])
-        ai.set_star(A_ID, True)  # e.g. done by the skill while the TUI is open
+        ai.STARS.set(A_ID, True)  # e.g. done by the skill while the TUI is open
         app.run()
         self.assertTrue([s for s in app.all if s.id == A_ID][0].starred)
         # and toggling another session does not clobber it
         app = self.run_keys(["*", "q"])
-        self.assertEqual(sorted(ai.read_stars()), sorted([A_ID, D_ID]))
+        self.assertEqual(sorted(ai.STARS.read()), sorted([A_ID, D_ID]))
 
     def test_eight_stars_like_asterisk(self) -> None:
         app = self.run_keys(["8", "j", "8", "8", "q"])
-        self.assertEqual(sorted(ai.read_stars()), [D_ID])
+        self.assertEqual(sorted(ai.STARS.read()), [D_ID])
         app = self.run_keys(["\n", "8", "q", "q"])
-        self.assertEqual(sorted(ai.read_stars()), [])
+        self.assertEqual(sorted(ai.STARS.read()), [])
         self.assertFalse(app.view[0].starred)
 
     def test_star_in_viewer(self) -> None:
         app = self.run_keys(["\n", "*", "q", "q"])
-        self.assertEqual(sorted(ai.read_stars()), [D_ID])
+        self.assertEqual(sorted(ai.STARS.read()), [D_ID])
         self.assertTrue(self.scr.any_frame(" starred: First prompt"))
         self.assertTrue(self.scr.any_frame(" CC * First prompt"))
         self.assertTrue(app.view[0].starred)

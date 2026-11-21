@@ -101,7 +101,6 @@ TRANSCRIPT_CACHE_SIZE = 6  # parsed transcripts kept in memory (LRU)
 DATE_COL_WIDTH = 17        # "YYYY-MM-DD HH:MM" plus a space, in the session list
 STAR_COL_WIDTH = 2         # "* " (starred) or "  " in the session list, before the tag
 TAG_COL_WIDTH = 3          # "CC " / "CX " in the session list
-STARS_VERSION = 1          # format version of stars.json
 SIDE_BY_SIDE_MIN_COLS = 100  # at least this wide: list | preview, else list over preview
 # ISO-8601-ish timestamps with optional fraction and Z / +hh:mm / +hhmm offset.
 TS_RE: Pattern[str] = re.compile(
@@ -650,7 +649,7 @@ class Source(object):
         raise NotImplementedError
 
     def scan_root(self) -> str:
-        """The directory whose vanished transcript files load_sessions() prunes from the index.
+        """The directory whose vanished transcript files SessionIndex.load() prunes from the index.
 
         Returns:
             A directory path, equal to or below root().
@@ -1135,7 +1134,7 @@ class CodexSource(Source):
         The id comes from session_meta when present. Otherwise it is the last 36 characters
         of the filename stem: rollout-<timestamp>-<uuid> always ends in a 36-char UUID.
         Codex has no title records, so the title is the first user prompt (or the first
-        assistant message); load_sessions() overrides it with session_index.jsonl names.
+        assistant message); SessionIndex.load() overrides it with session_index.jsonl names.
 
         Args:
             path: Path of the Codex rollout .jsonl file.
@@ -1274,7 +1273,7 @@ class Session(object):
         Example: Session({"source": "claude", "id": "a1", "cwd": "/work/proj", "title": "",
         "blob": "Fix", ...}) -> .project == "proj", .title == "(untitled)",
         .search_text == "(untitled)\\nproj\\n/work/proj\\nfix"; with cwd "" -> .project == "-";
-        .starred is False unless d has "starred" (load_sessions sets it from stars.json)
+        .starred is False unless d has "starred" (SessionIndex.load sets it from stars.json)
         """
         self.starred = False
         self.__dict__.update(d)
@@ -1536,239 +1535,290 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def cache_path() -> str:
-    """Location of the summary index: $XDG_CACHE_HOME (default ~/.cache) / ai-sessions / index.json.
+class StarStore:
+    """The starred sessions, kept in stars.json in the data directory.
 
-    Returns:
-        The absolute path of the index file.
-
-    Example: with XDG_CACHE_HOME=/c -> "/c/ai-sessions/index.json"
+    Stars are user data (not cache), so write errors are raised. Paths are computed from
+    the environment on every call, never stored, so a changed XDG_DATA_HOME is honored.
     """
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(base, "ai-sessions", "index.json")
 
+    VERSION = 1  # format version of stars.json
 
-def read_index_cache(cp: str) -> Dict[str, Any]:
-    """Read the per-file entries of the summary index.
+    def path(self) -> str:
+        """Location of the starred-sessions file: $XDG_DATA_HOME (default ~/.local/share) /
+        ai-sessions / stars.json. Stars are user data, so they live in the data dir, not the cache.
 
-    Args:
-        cp: Path of index.json (see cache_path()).
+        Returns:
+            The absolute path of the stars file.
 
-    Returns:
-        The "files" mapping (transcript path -> entry); {} if the file is missing, corrupt, or
-        written by another INDEX_VERSION.
+        Example: with XDG_DATA_HOME=/d -> "/d/ai-sessions/stars.json"
+        """
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        return os.path.join(base, "ai-sessions", "stars.json")
 
-    Example: a missing file -> {}
-    """
-    try:
-        with open(cp, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and data.get("version") == INDEX_VERSION:
-            return data.get("files") or {}
-    except (OSError, ValueError):
-        pass
-    return {}
+    def read(self) -> Dict[str, float]:
+        """Read the starred sessions from self.path().
 
+        Returns:
+            A dict mapping session id -> epoch seconds when it was starred. It is empty if the file
+            is missing, unreadable, corrupt or of another version; entries whose value is not a
+            number are skipped.
 
-def write_index_cache(cp: str, files: Dict[str, Any]) -> None:
-    """Atomically write the summary index (temp file + rename); failures are ignored.
-
-    Args:
-        cp: Path of index.json; its directory is created if needed.
-        files: The transcript path -> entry mapping to store.
-
-    Returns:
-        None. The cache is only an optimization, so I/O errors are swallowed.
-
-    Example: write_index_cache("/c/ai-sessions/index.json", {}) leaves
-    {"version": INDEX_VERSION, "files": {}} in that file.
-    """
-    try:
-        os.makedirs(os.path.dirname(cp), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cp), prefix=".index-", suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"version": INDEX_VERSION, "files": files}, f)
-        os.replace(tmp, cp)
-    except (OSError, TypeError, ValueError):
-        pass
-
-
-def stars_path() -> str:
-    """Location of the starred-sessions file: $XDG_DATA_HOME (default ~/.local/share) /
-    ai-sessions / stars.json. Stars are user data, so they live in the data dir, not the cache.
-
-    Returns:
-        The absolute path of the stars file.
-
-    Example: with XDG_DATA_HOME=/d -> "/d/ai-sessions/stars.json"
-    """
-    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "ai-sessions", "stars.json")
-
-
-def read_stars() -> Dict[str, float]:
-    """Read the starred sessions from stars_path().
-
-    Returns:
-        A dict mapping session id -> epoch seconds when it was starred. It is empty if the file
-        is missing, unreadable, corrupt or of another version; entries whose value is not a
-        number are skipped.
-
-    Example: file {"version": 1, "stars": {"a1": 1700000000, "b2": "x"}} -> {"a1": 1700000000.0};
-    no file -> {}
-    """
-    try:
-        with open(stars_path(), encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict) or data.get("version") != STARS_VERSION \
-            or not isinstance(data.get("stars"), dict):
-        return {}
-    stars: Dict[str, float] = {}
-    for sid, when in data["stars"].items():
-        if isinstance(when, (int, float)) and not isinstance(when, bool):
-            stars[str(sid)] = float(when)
-    return stars
-
-
-def write_stars(stars: Dict[str, float]) -> None:
-    """Atomically write the starred sessions (temp file + rename) to stars_path().
-
-    Unlike the index cache, stars are user data, so failures are not swallowed.
-
-    Args:
-        stars: Session id -> epoch seconds when it was starred.
-
-    Returns:
-        None.
-
-    Raises:
-        OSError: If the directory or file cannot be written (a failed temp file is removed).
-
-    Example: write_stars({"a1": 1700000000.0}) leaves
-    {"version": 1, "stars": {"a1": 1700000000.0}} in $XDG_DATA_HOME/ai-sessions/stars.json.
-    """
-    sp = stars_path()
-    os.makedirs(os.path.dirname(sp), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(sp), prefix=".stars-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"version": STARS_VERSION, "stars": stars}, f, indent=1, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp, sp)
-    except (OSError, TypeError, ValueError) as e:
+        Example: file {"version": 1, "stars": {"a1": 1700000000, "b2": "x"}} -> {"a1": 1700000000.0};
+        no file -> {}
+        """
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise OSError(str(e))
+            with open(self.path(), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict) or data.get("version") != self.VERSION \
+                or not isinstance(data.get("stars"), dict):
+            return {}
+        stars: Dict[str, float] = {}
+        for sid, when in data["stars"].items():
+            if isinstance(when, (int, float)) and not isinstance(when, bool):
+                stars[str(sid)] = float(when)
+        return stars
 
+    def write(self, stars: Dict[str, float]) -> None:
+        """Atomically write the starred sessions (temp file + rename) to self.path().
 
-def set_star(sid: str, on: bool) -> None:
-    """Star (on=True) or unstar (on=False) session sid.
+        Unlike the index cache, stars are user data, so failures are not swallowed.
 
-    The file is re-read right before writing, so stars changed meanwhile by another process
-    (the CLI or a skill, while the TUI is open) are not overwritten. Starring an already
-    starred session keeps its original timestamp.
+        Args:
+            stars: Session id -> epoch seconds when it was starred.
 
-    Args:
-        sid: The full session id.
-        on: True to star, False to unstar.
+        Returns:
+            None.
 
-    Returns:
-        None.
+        Raises:
+            OSError: If the directory or file cannot be written (a failed temp file is removed).
 
-    Raises:
-        OSError: If stars.json cannot be written.
-
-    Example: set_star("a1", True) -> read_stars() has "a1"; set_star("a1", False) -> it does not.
-    """
-    stars = read_stars()
-    if on:
-        stars.setdefault(sid, time.time())
-    else:
-        stars.pop(sid, None)
-    write_stars(stars)
-
-
-def load_sessions(progress: bool = False) -> List[Session]:
-    """Return all sessions that have at least one user/assistant message.
-
-    Parsing every transcript on each start would be slow, so summaries are cached in
-    $XDG_CACHE_HOME/ai-sessions/index.json, keyed by file path. An entry is reused only
-    if the file's mtime and size and the source (claude/codex) are unchanged; otherwise
-    the file is re-parsed. Entries for files that vanished are pruned, but only under
-    the roots scanned this run, so pointing AI_SESSIONS_*_DIR elsewhere temporarily does
-    not discard the cache for the real dirs. The cache is rewritten atomically
-    (temp file + rename) and only when something changed. A cache from another
-    INDEX_VERSION, or a corrupt one, is ignored.
-
-    Codex titles from session_index.jsonl are applied here at load time, after the
-    cache, rather than stored in it: that file changes independently of the rollouts,
-    so caching its names would leave them stale. Stars (stars.json, see read_stars()) are
-    applied the same way: read once per call and set as Session.starred.
-
-    Args:
-        progress: If True, print an "indexing N file(s)" notice to stderr when files need parsing.
-
-    Returns:
-        A list of Session objects (unsorted), omitting sessions with no user or assistant messages.
-
-    Example: with one Claude transcript (user + assistant message) under
-    AI_SESSIONS_CLAUDE_DIR and an empty cache -> [Session(source="claude", ...)], and
-    index.json now holds its summary; a second call re-parses nothing.
-    """
-    cp = cache_path()
-    cache = read_index_cache(cp)
-    found = discover()
-    seen = set()
-    result: List[Session] = []
-    dirty = False
-    todo: List[Tuple[str, str, os.stat_result]] = []
-    entries: Dict[str, Dict[str, Any]] = {}
-    for source, path in found:
+        Example: StarStore().write({"a1": 1700000000.0}) leaves
+        {"version": 1, "stars": {"a1": 1700000000.0}} in $XDG_DATA_HOME/ai-sessions/stars.json.
+        """
+        sp = self.path()
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(sp), prefix=".stars-", suffix=".tmp")
         try:
-            st = os.stat(path)
-        except OSError:
-            continue
-        seen.add(path)
-        e = cache.get(path)
-        if isinstance(e, dict) and e.get("mtime") == st.st_mtime and e.get("size") == st.st_size \
-                and isinstance(e.get("summary"), dict) and e["summary"].get("source") == source:
-            entries[path] = e
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"version": self.VERSION, "stars": stars}, f, indent=1, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, sp)
+        except (OSError, TypeError, ValueError) as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise OSError(str(e))
+
+    def set(self, sid: str, on: bool) -> None:
+        """Star (on=True) or unstar (on=False) session sid.
+
+        The file is re-read right before writing, so stars changed meanwhile by another process
+        (the CLI or a skill, while the TUI is open) are not overwritten. Starring an already
+        starred session keeps its original timestamp.
+
+        Args:
+            sid: The full session id.
+            on: True to star, False to unstar.
+
+        Returns:
+            None.
+
+        Raises:
+            OSError: If stars.json cannot be written.
+
+        Example: set("a1", True) -> read() has "a1"; set("a1", False) -> it does not.
+        """
+        stars = self.read()
+        if on:
+            stars.setdefault(sid, time.time())
         else:
-            todo.append((source, path, st))
-    if todo and progress:
-        sys.stderr.write("ai-sessions: indexing %d file(s)...\n" % len(todo))
-    for source, path, st in todo:
+            stars.pop(sid, None)
+        self.write(stars)
+
+
+STARS = StarStore()
+
+
+class SessionIndex:
+    """The summary index of all sessions, plus an in-memory cache of parsed transcripts.
+
+    Paths come from the environment on every call, never from __init__, so a changed
+    XDG_CACHE_HOME or AI_SESSIONS_*_DIR is honored.
+    """
+
+    def __init__(self) -> None:
+        # LRU cache of fully parsed transcripts (they are not stored in the index), keyed by
+        # (path, mtime) so a transcript that is still being written is re-read.
+        self.parsed: "collections.OrderedDict[Tuple[str, float], List[Msg]]" = \
+            collections.OrderedDict()
+
+    def path(self) -> str:
+        """Location of the summary index: $XDG_CACHE_HOME (default ~/.cache) / ai-sessions / index.json.
+
+        Returns:
+            The absolute path of the index file.
+
+        Example: with XDG_CACHE_HOME=/c -> "/c/ai-sessions/index.json"
+        """
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        return os.path.join(base, "ai-sessions", "index.json")
+
+    def read_cache(self, cp: str) -> Dict[str, Any]:
+        """Read the per-file entries of the summary index.
+
+        Args:
+            cp: Path of index.json (see path()).
+
+        Returns:
+            The "files" mapping (transcript path -> entry); {} if the file is missing, corrupt, or
+            written by another INDEX_VERSION.
+
+        Example: a missing file -> {}
+        """
         try:
-            summary, _ = parse_any(source, path)
-        except Exception:  # never let one bad file break the browser
-            continue
-        entries[path] = {"mtime": st.st_mtime, "size": st.st_size, "summary": summary}
-        dirty = True
-    roots = tuple(s.scan_root() for s in SOURCE_LIST)
-    merged = dict(cache)
-    merged.update(entries)
-    for p in list(merged):
-        if p not in seen and p.startswith(roots):
-            del merged[p]
+            with open(cp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("version") == INDEX_VERSION:
+                return data.get("files") or {}
+        except (OSError, ValueError):
+            pass
+        return {}
+
+    def write_cache(self, cp: str, files: Dict[str, Any]) -> None:
+        """Atomically write the summary index (temp file + rename); failures are ignored.
+
+        Args:
+            cp: Path of index.json; its directory is created if needed.
+            files: The transcript path -> entry mapping to store.
+
+        Returns:
+            None. The cache is only an optimization, so I/O errors are swallowed.
+
+        Example: write_cache("/c/ai-sessions/index.json", {}) leaves
+        {"version": INDEX_VERSION, "files": {}} in that file.
+        """
+        try:
+            os.makedirs(os.path.dirname(cp), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cp), prefix=".index-", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"version": INDEX_VERSION, "files": files}, f)
+            os.replace(tmp, cp)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def load(self, progress: bool = False) -> List[Session]:
+        """Return all sessions that have at least one user/assistant message.
+
+        Parsing every transcript on each start would be slow, so summaries are cached in
+        $XDG_CACHE_HOME/ai-sessions/index.json, keyed by file path. An entry is reused only
+        if the file's mtime and size and the source (claude/codex) are unchanged; otherwise
+        the file is re-parsed. Entries for files that vanished are pruned, but only under
+        the roots scanned this run, so pointing AI_SESSIONS_*_DIR elsewhere temporarily does
+        not discard the cache for the real dirs. The cache is rewritten atomically
+        (temp file + rename) and only when something changed. A cache from another
+        INDEX_VERSION, or a corrupt one, is ignored.
+
+        Codex titles from session_index.jsonl are applied here at load time, after the
+        cache, rather than stored in it: that file changes independently of the rollouts,
+        so caching its names would leave them stale. Stars (stars.json, see StarStore.read()) are
+        applied the same way: read once per call and set as Session.starred.
+
+        Args:
+            progress: If True, print an "indexing N file(s)" notice to stderr when files need parsing.
+
+        Returns:
+            A list of Session objects (unsorted), omitting sessions with no user or assistant messages.
+
+        Example: with one Claude transcript (user + assistant message) under
+        AI_SESSIONS_CLAUDE_DIR and an empty cache -> [Session(source="claude", ...)], and
+        index.json now holds its summary; a second call re-parses nothing.
+        """
+        cp = self.path()
+        cache = self.read_cache(cp)
+        found = discover()
+        seen = set()
+        result: List[Session] = []
+        dirty = False
+        todo: List[Tuple[str, str, os.stat_result]] = []
+        entries: Dict[str, Dict[str, Any]] = {}
+        for source, path in found:
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            seen.add(path)
+            e = cache.get(path)
+            if isinstance(e, dict) and e.get("mtime") == st.st_mtime and e.get("size") == st.st_size \
+                    and isinstance(e.get("summary"), dict) and e["summary"].get("source") == source:
+                entries[path] = e
+            else:
+                todo.append((source, path, st))
+        if todo and progress:
+            sys.stderr.write("ai-sessions: indexing %d file(s)...\n" % len(todo))
+        for source, path, st in todo:
+            try:
+                summary, _ = parse_any(source, path)
+            except Exception:  # never let one bad file break the browser
+                continue
+            entries[path] = {"mtime": st.st_mtime, "size": st.st_size, "summary": summary}
             dirty = True
-    if dirty:
-        write_index_cache(cp, merged)
-    titles: Dict[str, Dict[str, str]] = {s.key: s.title_overrides() for s in SOURCE_LIST}
-    stars = read_stars()
-    for entry in entries.values():
-        summary = dict(entry["summary"])
-        override = titles.get(summary["source"], {}).get(summary["id"])
-        if override is not None:
-            summary["title"] = override
-        if summary["n_user"] + summary["n_asst"] == 0:
-            continue
-        summary["starred"] = summary["id"] in stars
-        result.append(Session(summary))
-    return result
+        roots = tuple(s.scan_root() for s in SOURCE_LIST)
+        merged = dict(cache)
+        merged.update(entries)
+        for p in list(merged):
+            if p not in seen and p.startswith(roots):
+                del merged[p]
+                dirty = True
+        if dirty:
+            self.write_cache(cp, merged)
+        titles: Dict[str, Dict[str, str]] = {s.key: s.title_overrides() for s in SOURCE_LIST}
+        stars = STARS.read()
+        for entry in entries.values():
+            summary = dict(entry["summary"])
+            override = titles.get(summary["source"], {}).get(summary["id"])
+            if override is not None:
+                summary["title"] = override
+            if summary["n_user"] + summary["n_asst"] == 0:
+                continue
+            summary["starred"] = summary["id"] in stars
+            result.append(Session(summary))
+        return result
+
+    def transcript(self, s: Session) -> List[Msg]:
+        """Messages of a session, parsed on demand and kept in a small LRU cache.
+
+        Args:
+            s: The session whose transcript file to parse.
+
+        Returns:
+            The list of Msg dicts; [] if the file cannot be parsed.
+
+        Example: transcript(s) parses s.path and returns [{"role": "user", "text": "fix the
+        bug", "ts": 1.7e9}, ...]; calling it again with the file unchanged returns the cached list.
+        """
+        try:
+            mt = os.stat(s.path).st_mtime
+        except OSError:
+            mt = 0
+        k = (s.path, mt)
+        if k in self.parsed:
+            self.parsed.move_to_end(k)
+            return self.parsed[k]
+        try:
+            _, msgs = parse_any(s.source, s.path)
+        except Exception:
+            msgs = []
+        self.parsed[k] = msgs
+        while len(self.parsed) > TRANSCRIPT_CACHE_SIZE:
+            self.parsed.popitem(last=False)
+        return msgs
+
+
+INDEX = SessionIndex()
 
 
 def filter_sessions(sessions: List[Session], query: str = "", source: str = "all",
@@ -1829,41 +1879,6 @@ def sort_sessions(sessions: List[Session], mode: str = "last") -> List[Session]:
 
 
 # ---------------------------------------------------------------- rendering
-
-# LRU cache of fully parsed transcripts (they are not stored in the index), keyed by
-# (path, mtime) so a transcript that is still being written is re-read.
-_parsed: "collections.OrderedDict[Tuple[str, float], List[Msg]]" = collections.OrderedDict()
-
-
-def get_transcript(s: Session) -> List[Msg]:
-    """Messages of a session, parsed on demand and kept in a small LRU cache.
-
-    Args:
-        s: The session whose transcript file to parse.
-
-    Returns:
-        The list of Msg dicts; [] if the file cannot be parsed.
-
-    Example: get_transcript(s) parses s.path and returns [{"role": "user", "text": "fix the
-    bug", "ts": 1.7e9}, ...]; calling it again with the file unchanged returns the cached list.
-    """
-    try:
-        mt = os.stat(s.path).st_mtime
-    except OSError:
-        mt = 0
-    k = (s.path, mt)
-    if k in _parsed:
-        _parsed.move_to_end(k)
-        return _parsed[k]
-    try:
-        _, msgs = parse_any(s.source, s.path)
-    except Exception:
-        msgs = []
-    _parsed[k] = msgs
-    while len(_parsed) > TRANSCRIPT_CACHE_SIZE:
-        _parsed.popitem(last=False)
-    return msgs
-
 
 # ---------------------------------------------------------------- markdown
 
@@ -3215,7 +3230,7 @@ class App(object):
         key = (s.path, s.last_ts, width, self.show_results, self.mine_only, tuple(pat_terms))
         if self._preview_cache_key == key:
             return self._preview_cache
-        msgs = get_transcript(s)
+        msgs = INDEX.transcript(s)
         lines, start = render(s, msgs, width, self.show_results, self.mine_only)
         hits = hit_lines(lines, start, pat_terms)
         self._preview_cache_key = key
@@ -3422,7 +3437,7 @@ class App(object):
         """
         on = not s.starred
         try:
-            set_star(s.id, on)
+            STARS.set(s.id, on)
         except OSError as e:
             self.status = " could not save stars: %s" % e
             return
@@ -3443,7 +3458,7 @@ class App(object):
         Example: after a new transcript appears, on_rescan() -> len(self.all) grows by 1 and
         status == " rescanned: 11 sessions"
         """
-        self.all = load_sessions()
+        self.all = INDEX.load()
         self.refilter()
         self.status = " rescanned: %d sessions" % len(self.all)
 
@@ -3741,11 +3756,11 @@ class Viewer(object):
             s: The session to show.
 
         Example: Viewer(app, s) with app.query == "fix" -> .query == "fix", .offset == 0,
-        .hit_index == -1, .msgs == get_transcript(s)
+        .hit_index == -1, .msgs == INDEX.transcript(s)
         """
         self.app = app
         self.session = s
-        self.msgs = get_transcript(s)
+        self.msgs = INDEX.transcript(s)
         self.query = app.query
         self.offset = 0          # first visible line
         self.hit_index = -1      # current search hit (-1: none chosen yet)
@@ -4039,7 +4054,7 @@ def run_tui(query: str, source: Optional[str] = None) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         sys.stderr.write("ai-sessions: interactive mode needs a terminal (try --list)\n")
         return 2
-    sessions = load_sessions(progress=True)
+    sessions = INDEX.load(progress=True)
     # Ask the terminal for its background before curses starts (it would swallow the reply).
     background = None
     if not (os.environ.get("AI_SESSIONS_STRIPE") or "").strip():
@@ -4180,12 +4195,12 @@ def cmd_star(sessions: List[Session], ident: Optional[str], on: Optional[bool],
             return 1
         sid = found.id
     if on is None:
-        word = "starred" if sid in read_stars() else "not starred"
+        word = "starred" if sid in STARS.read() else "not starred"
     else:
         try:
-            set_star(sid, on)
+            STARS.set(sid, on)
         except OSError as e:
-            sys.stderr.write("ai-sessions: cannot save stars to %s: %s\n" % (stars_path(), e))
+            sys.stderr.write("ai-sessions: cannot save stars to %s: %s\n" % (STARS.path(), e))
             return 1
         word = "starred" if on else "unstarred"
     if found is None:
@@ -4217,7 +4232,7 @@ def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool =
     if s is None:
         sys.stderr.write(err or "")
         return 1
-    lines, _ = render(s, get_transcript(s), 100, tools, mine_only)
+    lines, _ = render(s, INDEX.transcript(s), 100, tools, mine_only)
     sys.stdout.write("\n".join(t for t, _, _ in lines) + "\n")
     return 0
 
@@ -4301,13 +4316,13 @@ def main() -> int:
     if args.starred and not args.list:
         ap.error("--starred requires --list")
     if star_ops:
-        sessions = load_sessions()
+        sessions = INDEX.load()
         if args.source:
             sessions = [s for s in sessions if s.source == args.source]
         ident, on = star_ops[0]
         return cmd_star(sessions, ident or None, on, args.source)
     if args.list or args.show:
-        sessions = load_sessions()
+        sessions = INDEX.load()
         if args.source:
             sessions = [s for s in sessions if s.source == args.source]
         try:
