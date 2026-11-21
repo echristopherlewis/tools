@@ -47,9 +47,9 @@ One executable script (no `.py` suffix), in layers:
 3. **Output**: `cmd_list` / `cmd_show` for plain text; `render` builds the transcript
    lines that `--show` and the TUI both use. A `Line` is `(text, kind, spans)`, where `spans`
    are `(start, end, style)` character offsets for inline styles (`Screen.text` draws them).
-   Assistant replies go through the markdown layer (`markdown_lines`, `parse_inline`,
-   `wrap_segments`, `_table_lines`), which strips the markup and emits the `heading`, `code`,
-   `quote` and `table` kinds; user prompts, tool rows and results are not parsed.
+   Assistant replies go through `MarkdownRenderer` (`lines`, `blocks`, `table_lines`, plus the
+   static `parse_inline` and `wrap_segments`), which strips the markup and emits the `heading`,
+   `code`, `quote` and `table` kinds; user prompts, tool rows and results are not parsed.
 4. **TUI**: `Screen` wraps the curses window and its attribute table (drawing, key input,
    the footer prompt, the help screen); `App` (session list plus preview) and `Viewer`
    (full-screen transcript) share one. Resuming goes through `App.choose_resume` and

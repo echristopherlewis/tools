@@ -778,10 +778,10 @@ class Units(unittest.TestCase):
 
 
 class MarkdownRendering(unittest.TestCase):
-    """markdown_lines / parse_inline / render for assistant replies."""
+    """MarkdownRenderer.lines / parse_inline / render for assistant replies."""
 
     def rows(self, text: str, width: int = 60) -> List[Any]:
-        return ai.markdown_lines(text, width, "  ")
+        return ai.MarkdownRenderer.lines(text, width, "  ")
 
     def texts(self, text: str, width: int = 60) -> List[str]:
         return [t for t, _, _ in self.rows(text, width)]
@@ -941,7 +941,7 @@ class MarkdownRendering(unittest.TestCase):
         self.assertEqual(by_text["  some bold"], ("text", ((7, 11, "bold"),)))
         hits = ai.hit_lines(lines, start, ["head"])
         self.assertEqual([lines[i][0] for i in hits], ["  Head"])
-        shown = ai.hit_lines(ai.markdown_lines("```\ncode here\n```", 40, "  "), 0, ["code"])
+        shown = ai.hit_lines(ai.MarkdownRenderer.lines("```\ncode here\n```", 40, "  "), 0, ["code"])
         self.assertEqual(shown, [0])
 
 
@@ -1077,7 +1077,7 @@ class Tui(Env):
     def test_viewer_shows_markdown(self) -> None:
         app = self.make(["\n", "q", "q"], query="")
         # drive the real renderer for an assistant reply through draw_line
-        lines = ai.markdown_lines("# Head\n**b** `c`", 40, "  ")
+        lines = ai.MarkdownRenderer.lines("# Head\n**b** `c`", 40, "  ")
         for i, (t, kind, spans) in enumerate(lines):
             app.screen.draw_line(i, 0, t, 40, kind, None, spans)
         self.assertIn("  Head", self.scr.screen())

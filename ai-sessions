@@ -81,6 +81,9 @@ Seg = Tuple[str, Tuple[str, ...]]
 # heading, code, quote, table (see Theme.curses_attrs). "prompt" is the body of your own messages
 # (drawn on a grey band); "text" is everything else. spans is () for unstyled rows.
 Line = Tuple[str, str, Tuple[Span, ...]]
+
+# (character, styles) pairs: styled text split into single characters (see wrap_segments).
+Pairs = List[Tuple[str, Tuple[str, ...]]]
 # curses window (curses._CursesWindow is not importable at runtime).
 Window = Any
 # (y, x, height, width) screen region.
@@ -249,6 +252,26 @@ def transcript_glyphs() -> Tuple[str, str]:
     """
     enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
     return ("⏺", "⎿") if enc == "utf8" else ("*", "|")
+
+
+def utf8_locale() -> bool:
+    """True when the locale encodes UTF-8 (so box-drawing and bullet glyphs can be printed).
+
+    Example: with a UTF-8 locale -> True; with an ASCII ("C") locale -> False
+    """
+    enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
+    return enc == "utf8"
+
+
+def markdown_glyphs() -> Tuple[str, str]:
+    """(bullet, quote bar) used when rendering Markdown: UTF-8 glyphs, else ASCII.
+
+    Returns:
+        A (bullet, quote_bar) pair of one-character strings.
+
+    Examples: with a UTF-8 locale -> ("•", "▎"); with an ASCII locale -> ("-", "|")
+    """
+    return ("•", "▎") if utf8_locale() else ("-", "|")
 
 
 def clip(s: str, width: int) -> str:
@@ -2079,599 +2102,607 @@ class SessionFilter(object):
 
 # ---------------------------------------------------------------- markdown
 
-# Characters a backslash can escape in inline text.
-MD_ESCAPABLE = "\\`*_[]()#|<>"
-MD_AUTOLINK = re.compile(r"<(https?://[^\s<>]+)>")
-MD_FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
-MD_HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$")
-MD_HRULE = re.compile(r"^ {0,3}([-*_])(\s*\1){2,}\s*$")
-MD_BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
-MD_ORDERED = re.compile(r"^(\s*)(\d{1,9}[.)])\s+(.*)$")
-MD_QUOTE = re.compile(r"^ {0,3}> ?")
-MD_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+class MarkdownRenderer(object):
+    """Turns assistant Markdown into transcript Lines of a given width: block structure
+    (headings, lists, quotes, fences, tables, rules) plus inline styles as spans.
 
+    The block level (`blocks`, `table_lines`) lays rows out at `self.width`; the inline level
+    (`parse_inline`, `wrap_segments` and their helpers) does not depend on it and is static.
 
-def utf8_locale() -> bool:
-    """True when the locale encodes UTF-8 (so box-drawing and bullet glyphs can be printed).
+    Attributes:
+        width: Body width in display columns (at least 4).
 
-    Example: with a UTF-8 locale -> True; with an ASCII ("C") locale -> False
+    Example: MarkdownRenderer.lines("hi **there**", 40, "  ") ->
+        [("  hi there", "text", ((5, 10, "bold"),))]
     """
-    enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
-    return enc == "utf8"
 
+    # Characters a backslash can escape in inline text.
+    ESCAPABLE = "\\`*_[]()#|<>"
+    AUTOLINK = re.compile(r"<(https?://[^\s<>]+)>")
+    FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
+    HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$")
+    HRULE = re.compile(r"^ {0,3}([-*_])(\s*\1){2,}\s*$")
+    BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+    ORDERED = re.compile(r"^(\s*)(\d{1,9}[.)])\s+(.*)$")
+    QUOTE = re.compile(r"^ {0,3}> ?")
+    TABLE_SEP = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
 
-def markdown_glyphs() -> Tuple[str, str]:
-    """(bullet, quote bar) used when rendering Markdown: UTF-8 glyphs, else ASCII.
+    def __init__(self, width: int) -> None:
+        """Create a renderer for rows `width` columns wide.
 
-    Returns:
-        A (bullet, quote_bar) pair of one-character strings.
+        Args:
+            width: Display width for the rows; values under 4 are raised to 4.
 
-    Examples: with a UTF-8 locale -> ("•", "▎"); with an ASCII locale -> ("-", "|")
-    """
-    return ("•", "▎") if utf8_locale() else ("-", "|")
+        Example: MarkdownRenderer(2).width -> 4
+        """
+        self.width = max(width, 4)
 
+    @classmethod
+    def lines(cls, text: str, width: int, prefix: str = "") -> List[Line]:
+        """Render Markdown text (an assistant reply) into transcript rows with inline spans.
 
-def _code_run_end(text: str, start: int, n: int) -> int:
-    """Index of the first run of exactly n backticks at or after start, or -1.
+        Markers are removed and the layout kept: headings ("heading"), fenced code ("code", verbatim,
+        hard-wrapped, indented 2 more), bullet / ordered lists with hanging indents, block quotes
+        ("quote", marked with a bar), horizontal rules ("dim"), box-drawn tables ("table") and
+        paragraphs ("text") whose **bold**, *italic*, `code` and [link](url) markup becomes spans.
+        Single newlines stay line breaks and blank-line runs collapse to one.
 
-    Example: _code_run_end("a `b` c", 3, 1) -> 4
-    """
-    j = start
-    while True:
-        j = text.find("`" * n, j)
-        if j < 0:
-            return -1
-        k = j
-        while k < len(text) and text[k] == "`":
-            k += 1
-        if k - j == n:
-            return j
-        j = k
+        Args:
+            text: The Markdown source.
+            width: Total display width in columns, including prefix (at least len(prefix) + 4).
+            prefix: Plain text put before every non-blank row (the body indent), e.g. "  ".
 
+        Returns:
+            Line tuples (row text, kind, spans); spans are character offsets into the row text.
 
-def _run_end(text: str, start: int) -> int:
-    """Index just past the run of identical characters beginning at start.
+        Examples:
+            MarkdownRenderer.lines("hi **there**", 40, "  ") ->
+                [("  hi there", "text", ((5, 10, "bold"),))]
+            MarkdownRenderer.lines("# T\\n- a", 40, "  ") ->
+                [("  T", "heading", ()), ("  • a", "text", ())]
+        """
+        rows = cls(max(width - len(prefix), 4)).blocks(clean(text).split("\n"))
+        return [((prefix + t, k, tuple((a + len(prefix), b + len(prefix), s) for a, b, s in sp))
+                 if t else ("", k, ())) for t, k, sp in rows]
 
-    Example: _run_end("a**b", 1) -> 3
-    """
-    k = start
-    while k < len(text) and text[k] == text[start]:
-        k += 1
-    return k
+    def blocks(self, lines: List[str]) -> List[Line]:
+        """Render Markdown source lines into rows (no outer prefix), `self.width` columns wide.
 
+        Blocks: fenced code, ATX headings, tables, horizontal rules, block quotes, bullet and
+        ordered lists, and paragraphs (each source line stays its own line). Blank-line runs
+        collapse to one and leading/trailing blanks are dropped. See `lines`.
 
-def _find_closer(text: str, start: int, ch: str, n: int) -> int:
-    """Find the closing emphasis delimiter (a run of exactly n `ch`) at or after start.
+        Args:
+            lines: Source lines (already sanitized with clean()).
 
-    Skips code spans and backslash escapes. A closer must follow non-space text and, for "_",
-    must not be followed by a letter or digit (so snake_case_names stay literal).
+        Returns:
+            The rows as Line tuples.
 
-    Args:
-        text: The inline text.
-        start: Index just after the opening delimiter.
-        ch: "*" or "_".
-        n: Length of the opening delimiter run (1, 2 or 3).
+        Example: MarkdownRenderer(20).blocks(["# Hi", "- a"]) ->
+            [("Hi", "heading", ()), ("• a", "text", ())]
+        """
+        bullet, bar = markdown_glyphs()
+        out: List[Line] = []
+        levels: List[int] = []   # source indents of the open list nesting levels
+        i, n = 0, len(lines)
 
-    Returns:
-        The index of the closing run, or -1 if there is none.
+        def add_wrapped(segs: List[Seg], kind: str, first: str, rest: str) -> None:
+            for k, (t, sp) in enumerate(self.wrap_segments(segs, self.width - len(rest))):
+                lead = first if k == 0 else rest
+                out.append((lead + t, kind, tuple((a + len(lead), b + len(lead), s) for a, b, s in sp)))
 
-    Example: _find_closer("a b* c", 0, "*", 1) -> 3; _find_closer("a * b", 0, "*", 1) -> -1
-    """
-    j, size = start, len(text)
-    while j < size:
-        c = text[j]
-        if c == "\\":
-            j += 2
-        elif c == "`":
-            k = _run_end(text, j)
-            e = _code_run_end(text, k, k - j)
-            j = k if e < 0 else e + (k - j)
-        elif c == ch:
-            k = _run_end(text, j)
-            if (k - j == n and j > start and not text[j - 1].isspace()
-                    and (ch == "*" or k >= size or not text[k].isalnum())):
-                return j
-            j = k
-        else:
-            j += 1
-    return -1
-
-
-def _match_link(text: str, i: int) -> Optional[Tuple[str, str, int]]:
-    """Match an inline link "[label](url)" starting at text[i] == "[".
-
-    Returns:
-        (label, url, end_index) or None when text[i:] is not a link. A title after the url
-        ("[a](u "t")") is dropped.
-
-    Example: _match_link("[a](http://x) y", 0) -> ("a", "http://x", 13)
-    """
-    size, depth, j = len(text), 0, i
-    while j < size:
-        c = text[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c == "[":
-            depth += 1
-        elif c == "]":
-            depth -= 1
-            if depth == 0:
-                break
-        j += 1
-    if j >= size or j + 1 >= size or text[j + 1] != "(":
-        return None
-    depth, k = 1, j + 2
-    while k < size:
-        if text[k] == "(":
-            depth += 1
-        elif text[k] == ")":
-            depth -= 1
-            if depth == 0:
-                break
-        k += 1
-    if k >= size:
-        return None
-    inner = text[j + 2:k].strip()
-    return text[i + 1:j], (inner.split(" ")[0] if inner else ""), k + 1
-
-
-def _merge_segs(segs: List[Seg]) -> List[Seg]:
-    """Drop empty segments and join neighbours that have the same styles.
-
-    Example: [("a", ()), ("b", ()), ("", ("bold",))] -> [("ab", ())]
-    """
-    out: List[Seg] = []
-    for t, st in segs:
-        if not t:
-            continue
-        if out and out[-1][1] == st:
-            out[-1] = (out[-1][0] + t, st)
-        else:
-            out.append((t, st))
-    return out
-
-
-def parse_inline(text: str, styles: Tuple[str, ...] = ()) -> List[Seg]:
-    """Parse inline Markdown into styled segments with the markers removed.
-
-    Handles `code` (any backtick run length, literal content), **bold** / __bold__,
-    *italic* / _italic_ (underscores only at word boundaries), ***both***, [text](url)
-    (text styled "link" then " (url)" styled "dim" unless url == text), <https://autolinks>
-    and backslash escapes. Unmatched markers stay literal. Styles may nest.
-
-    Args:
-        text: One line of text (no newlines needed).
-        styles: Styles applied to everything in text (used for recursion).
-
-    Returns:
-        A list of (text, styles) segments with no empty or mergeable neighbours.
-
-    Examples:
-        parse_inline("a **b** c") -> [("a ", ()), ("b", ("bold",)), (" c", ())]
-        parse_inline("snake_case_name and 2 * 3") -> [("snake_case_name and 2 * 3", ())]
-        parse_inline("[x](http://u)") -> [("x", ("link",)), (" (http://u)", ("dim",))]
-    """
-    segs: List[Seg] = []
-    buf: List[str] = []
-
-    def flush() -> None:
-        if buf:
-            segs.append(("".join(buf), styles))
-            del buf[:]
-
-    i, size = 0, len(text)
-    while i < size:
-        c = text[i]
-        if c == "\\" and i + 1 < size and text[i + 1] in MD_ESCAPABLE:
-            buf.append(text[i + 1])
-            i += 2
-        elif c == "`":
-            k = _run_end(text, i)
-            e = _code_run_end(text, k, k - i)
-            if e < 0:
-                buf.append(text[i:k])
-                i = k
-                continue
-            inner = text[k:e]
-            if len(inner) > 2 and inner[0] == " " and inner[-1] == " " and inner.strip():
-                inner = inner[1:-1]
-            flush()
-            segs.append((inner, styles + ("code",)))
-            i = e + (k - i)
-        elif c == "[":
-            link = _match_link(text, i)
-            if link is None:
-                buf.append(c)
+        while i < n:
+            raw = lines[i].rstrip()
+            if not raw.strip():
+                if out and out[-1][0] != "":
+                    out.append(("", "text", ()))
                 i += 1
                 continue
-            label, url, end = link
-            flush()
-            segs.extend(parse_inline(label, styles + ("link",)))
-            if url and url != label:
-                segs.append((" (%s)" % url, styles + ("dim",)))
-            i = end
-        elif c == "<" and MD_AUTOLINK.match(text, i):
-            m = MD_AUTOLINK.match(text, i)
-            assert m is not None
-            flush()
-            segs.append((m.group(1), styles + ("link",)))
-            i = m.end()
-        elif c in "*_":
-            k = _run_end(text, i)
-            n = k - i
-            if (n <= 3 and k < size and not text[k].isspace()
-                    and (c == "*" or i == 0 or not text[i - 1].isalnum())):
-                e = _find_closer(text, k, c, n)
-                if e >= 0:
-                    flush()
-                    added = {1: ("italic",), 2: ("bold",), 3: ("bold", "italic")}[n]
-                    segs.extend(parse_inline(text[k:e], styles + added))
-                    i = e + n
-                    continue
-            buf.append(text[i:k])
-            i = k
-        else:
-            buf.append(c)
-            i += 1
-    flush()
-    return _merge_segs(segs)
-
-
-def segs_text(segs: List[Seg]) -> str:
-    """The plain text of styled segments.
-
-    Example: segs_text([("a ", ()), ("b", ("bold",))]) -> "a b"
-    """
-    return "".join(t for t, _ in segs)
-
-
-Pairs = List[Tuple[str, Tuple[str, ...]]]
-
-
-def _pairs_to_row(pairs: Pairs) -> Tuple[str, Tuple[Span, ...]]:
-    """Turn (char, styles) pairs into row text plus spans (one span per style run).
-
-    Example: [("a", ()), ("b", ("bold",)), ("c", ("bold",))] -> ("abc", ((1, 3, "bold"),))
-    """
-    spans: List[Span] = []
-    opened: Dict[str, int] = {}
-    for i, (_, st) in enumerate(pairs):
-        for name in list(opened):
-            if name not in st:
-                spans.append((opened.pop(name), i, name))
-        for name in st:
-            if name not in opened:
-                opened[name] = i
-    for name, start in opened.items():
-        spans.append((start, len(pairs), name))
-    spans.sort()
-    return "".join(c for c, _ in pairs), tuple(spans)
-
-
-def wrap_segments(segs: List[Seg], width: int) -> List[Tuple[str, Tuple[Span, ...]]]:
-    """Word-wrap styled text to a display width, keeping each character's styles.
-
-    Like wrap() for a single line: a line that fits is kept as is (minus trailing spaces);
-    otherwise runs of spaces collapse to one, continuation lines keep the leading indent (up to
-    half the width) and over-long words are split by display width (wide chars count 2).
-
-    Args:
-        segs: The styled text, as from parse_inline (no newlines).
-        width: Display width in columns (at least 1).
-
-    Returns:
-        A list of (row text, spans) pairs; never empty ([("", ())] for empty input).
-
-    Example: wrap_segments([("aa ", ()), ("bb", ("bold",))], 2) -> [("aa", ()), ("bb", ((0, 2, "bold"),))]
-    """
-    width = max(width, 1)
-    pairs: Pairs = [(ch, st) for t, st in segs for ch in t]
-    while pairs and pairs[-1][0] == " ":
-        pairs.pop()
-    if not pairs:
-        return [("", ())]
-    if sum(char_width(c) for c, _ in pairs) <= width:
-        return [_pairs_to_row(pairs)]
-    lead = 0
-    while lead < len(pairs) and pairs[lead][0] == " ":
-        lead += 1
-    indent = min(lead, width // 2)
-    # Split into (gap space, word) items.
-    items: List[Tuple[Optional[Tuple[str, Tuple[str, ...]]], Pairs]] = []
-    gap: Optional[Tuple[str, Tuple[str, ...]]] = None
-    word: Pairs = []
-    for p in pairs[lead:] + [(" ", ())]:
-        if p[0] == " ":
-            if word:
-                items.append((gap, word))
-                word = []
-                gap = None
-            if gap is None:
-                gap = p
-        else:
-            word.append(p)
-    pad: Pairs = [(" ", ())] * indent
-    rows: List[Pairs] = []
-    cur: Pairs = list(pad)
-    curw = indent
-    has_word = False
-    for gap_p, word in items:
-        ww = sum(char_width(c) for c, _ in word)
-        if has_word and gap_p is not None and curw + 1 + ww <= width:
-            cur += [gap_p] + word
-            curw += 1 + ww
-            continue
-        if not has_word and curw + ww <= width:
-            cur += word
-            curw += ww
-            has_word = True
-            continue
-        if has_word:
-            rows.append(cur)
-            cur, curw, has_word = list(pad), indent, False
-        for p in word:   # a word that does not fit on a line of its own is split
-            cw = char_width(p[0])
-            if has_word and curw + cw > width:
-                rows.append(cur)
-                cur, curw, has_word = list(pad), indent, False
-            cur.append(p)
-            curw += cw
-            has_word = True
-    if has_word:
-        rows.append(cur)
-    return [_pairs_to_row(r) for r in rows]
-
-
-def _hard_wrap(s: str, width: int) -> List[str]:
-    """Split s into chunks of at most width display columns (no word handling).
-
-    Example: _hard_wrap("abcdef", 4) -> ["abcd", "ef"]; _hard_wrap("", 4) -> [""]
-    """
-    width = max(width, 1)
-    chunks: List[str] = []
-    while str_width(s) > width:
-        piece = clip(s, width) or s[:1]
-        chunks.append(piece)
-        s = s[len(piece):]
-    chunks.append(s)
-    return chunks
-
-
-def _split_table_row(line: str) -> List[str]:
-    """Split a table row into stripped cell strings; leading/trailing pipes are optional and
-    "\\|" does not split.
-
-    Example: _split_table_row("| a | b \\| c |") -> ["a", "b \\| c"]
-    """
-    s = line.strip()
-    cells: List[str] = []
-    cur: List[str] = []
-    j = 0
-    while j < len(s):
-        if s[j] == "\\" and j + 1 < len(s):
-            cur.append(s[j:j + 2])
-            j += 2
-            continue
-        if s[j] == "|":
-            cells.append("".join(cur))
-            cur = []
-        else:
-            cur.append(s[j])
-        j += 1
-    cells.append("".join(cur))
-    if s.startswith("|"):
-        cells = cells[1:]
-    if s.endswith("|") and not s.endswith("\\|"):
-        cells = cells[:-1]
-    return [c.strip() for c in cells]
-
-
-def _table_lines(header: List[str], aligns: List[str], body: List[List[str]],
-                 width: int) -> List[Line]:
-    """Lay out a table as box-drawn "table" rows, all the same display width.
-
-    Column widths come from the rendered (marker-stripped) cell text. When the table is wider
-    than `width`, the widest columns shrink (to at least 3, then 1 columns) and cell text wraps
-    onto several rows inside its cell. Header cells are bold, borders are "dim" spans and
-    columns honour the alignment ("left", "center" or "right").
-
-    Args:
-        header: Header cell source strings.
-        aligns: One alignment per column.
-        body: Body rows of cell source strings (padded or cut to the header's length).
-        width: Available display width.
-
-    Returns:
-        The rows: top border, header, rule, body rows, bottom border.
-
-    Example: _table_lines(["a", "b"], ["left", "left"], [["1", "2"]], 40) ->
-        "┌───┬───┐", "│ a │ b │", "├───┼───┤", "│ 1 │ 2 │", "└───┴───┘"
-    """
-    ncols = len(header)
-    utf8 = utf8_locale()
-    h, v = ("─", "│") if utf8 else ("-", "|")
-    corners = ("┌┬┐", "├┼┤", "└┴┘") if utf8 else ("+++", "+++", "+++")
-
-    def cells_of(row: List[str], bold: bool) -> List[List[Seg]]:
-        row = (row + [""] * ncols)[:ncols]
-        return [[(t, st + ("bold",)) if bold else (t, st) for t, st in parse_inline(c)]
-                for c in row]
-
-    grid = [cells_of(header, True)] + [cells_of(r, False) for r in body]
-    colw = [max(1, max(str_width(segs_text(r[c])) for r in grid)) for c in range(ncols)]
-    minw = 3
-    while sum(colw) + 3 * ncols + 1 > width:
-        widest = max(range(ncols), key=lambda c: colw[c])
-        if colw[widest] > minw:
-            colw[widest] -= 1
-        elif minw > 1:
-            minw = 1
-        else:
-            break
-
-    def border(kind: Tuple[str, str, str]) -> Line:
-        text = kind[0] + kind[1].join(h * (w + 2) for w in colw) + kind[2]
-        return (text, "table", ((0, len(text), "dim"),))
-
-    def row_lines(row: List[List[Seg]]) -> List[Line]:
-        wrapped = [wrap_segments(row[c], colw[c]) for c in range(ncols)]
-        out: List[Line] = []
-        for k in range(max(len(w) for w in wrapped)):
-            text = v
-            spans: List[Span] = [(0, 1, "dim")]
-            for c in range(ncols):
-                ct, cs = wrapped[c][k] if k < len(wrapped[c]) else ("", ())
-                gap = max(colw[c] - str_width(ct), 0)
-                left = {"right": gap, "center": gap // 2}.get(aligns[c], 0)
-                text += " " + " " * left
-                spans.extend((a + len(text), b + len(text), s) for a, b, s in cs)
-                text += ct + " " * (gap - left) + " "
-                spans.append((len(text), len(text) + 1, "dim"))
-                text += v
-            out.append((text, "table", tuple(spans)))
+            fence = self.FENCE.match(raw)
+            heading = self.HEADING.match(raw)
+            if fence and not (fence.group(2)[0] == "`" and "`" in fence.group(3)):
+                levels = []
+                indent, mark = len(fence.group(1)), fence.group(2)
+                i += 1
+                while i < n:
+                    st = lines[i].strip()
+                    if st and set(st) == {mark[0]} and len(st) >= len(mark):
+                        i += 1
+                        break
+                    body = lines[i].rstrip()
+                    lead = len(body) - len(body.lstrip(" "))
+                    for chunk in self._hard_wrap(body[min(lead, indent):], self.width - 2):
+                        out.append(("  " + chunk if chunk else "", "code", ()))
+                    i += 1
+            elif heading:
+                levels = []
+                if out and out[-1][0] != "":
+                    out.append(("", "text", ()))
+                add_wrapped(self.parse_inline(heading.group(2)), "heading", "", "")
+                i += 1
+            elif ("|" in raw and i + 1 < n and "|" in lines[i + 1]
+                  and self.TABLE_SEP.match(lines[i + 1].rstrip())
+                  and len(self._split_table_row(raw)) == len(self._split_table_row(lines[i + 1]))):
+                levels = []
+                seps = self._split_table_row(lines[i + 1])
+                aligns = ["center" if s.startswith(":") and s.endswith(":") else
+                          "right" if s.endswith(":") else "left" for s in seps]
+                header = self._split_table_row(raw)
+                rows: List[List[str]] = []
+                i += 2
+                while i < n and lines[i].strip() and "|" in lines[i]:
+                    rows.append(self._split_table_row(lines[i]))
+                    i += 1
+                out.extend(self.table_lines(header, aligns, rows))
+            elif self.HRULE.match(raw):
+                levels = []
+                out.append((rule_chars()[0] * self.width, "dim", ()))
+                i += 1
+            elif self.QUOTE.match(raw):
+                levels = []
+                inner: List[str] = []
+                while i < n and self.QUOTE.match(lines[i]):
+                    inner.append(self.QUOTE.sub("", lines[i], count=1))
+                    i += 1
+                for t, kind, sp in MarkdownRenderer(self.width - 2).blocks(inner):
+                    lead = bar + " " if t else bar
+                    if kind == "text":
+                        kind = "quote"
+                    out.append((lead + t, kind, tuple((a + len(lead), b + len(lead), s)
+                                                      for a, b, s in sp)))
+            elif self.BULLET.match(raw) or self.ORDERED.match(raw):
+                mb, mo = self.BULLET.match(raw), self.ORDERED.match(raw)
+                src_indent = len((mb or mo).group(1))  # type: ignore
+                while levels and levels[-1] > src_indent:
+                    levels.pop()
+                if not levels or levels[-1] < src_indent:
+                    levels.append(src_indent)
+                marker = (bullet if mb else mo.group(2)) + " "  # type: ignore
+                content = (mb.group(2) if mb else mo.group(3))  # type: ignore
+                pad = "  " * (len(levels) - 1)
+                add_wrapped(self.parse_inline(content), "text", pad + marker, pad + " " * len(marker))
+                i += 1
+            else:
+                levels = []
+                add_wrapped(self.parse_inline(raw), "text", "", "")
+                i += 1
+        while out and out[-1][0] == "":
+            out.pop()
         return out
 
-    out = [border(corners[0])]
-    out.extend(row_lines(grid[0]))
-    out.append(border(corners[1]))
-    for r in grid[1:]:
-        out.extend(row_lines(r))
-    out.append(border(corners[2]))
-    return out
+    def table_lines(self, header: List[str], aligns: List[str],
+                    body: List[List[str]]) -> List[Line]:
+        """Lay out a table as box-drawn "table" rows, all the same display width.
+
+        Column widths come from the rendered (marker-stripped) cell text. When the table is wider
+        than `self.width`, the widest columns shrink (to at least 3, then 1 columns) and cell text wraps
+        onto several rows inside its cell. Header cells are bold, borders are "dim" spans and
+        columns honour the alignment ("left", "center" or "right").
+
+        Args:
+            header: Header cell source strings.
+            aligns: One alignment per column.
+            body: Body rows of cell source strings (padded or cut to the header's length).
+        Returns:
+            The rows: top border, header, rule, body rows, bottom border.
+
+        Example: MarkdownRenderer(40).table_lines(["a", "b"], ["left", "left"], [["1", "2"]]) ->
+            "┌───┬───┐", "│ a │ b │", "├───┼───┤", "│ 1 │ 2 │", "└───┴───┘"
+        """
+        ncols = len(header)
+        utf8 = utf8_locale()
+        h, v = ("─", "│") if utf8 else ("-", "|")
+        corners = ("┌┬┐", "├┼┤", "└┴┘") if utf8 else ("+++", "+++", "+++")
+
+        def cells_of(row: List[str], bold: bool) -> List[List[Seg]]:
+            row = (row + [""] * ncols)[:ncols]
+            return [[(t, st + ("bold",)) if bold else (t, st) for t, st in self.parse_inline(c)]
+                    for c in row]
+
+        grid = [cells_of(header, True)] + [cells_of(r, False) for r in body]
+        colw = [max(1, max(str_width(self.segs_text(r[c])) for r in grid)) for c in range(ncols)]
+        minw = 3
+        while sum(colw) + 3 * ncols + 1 > self.width:
+            widest = max(range(ncols), key=lambda c: colw[c])
+            if colw[widest] > minw:
+                colw[widest] -= 1
+            elif minw > 1:
+                minw = 1
+            else:
+                break
+
+        def border(kind: Tuple[str, str, str]) -> Line:
+            text = kind[0] + kind[1].join(h * (w + 2) for w in colw) + kind[2]
+            return (text, "table", ((0, len(text), "dim"),))
+
+        def row_lines(row: List[List[Seg]]) -> List[Line]:
+            wrapped = [self.wrap_segments(row[c], colw[c]) for c in range(ncols)]
+            out: List[Line] = []
+            for k in range(max(len(w) for w in wrapped)):
+                text = v
+                spans: List[Span] = [(0, 1, "dim")]
+                for c in range(ncols):
+                    ct, cs = wrapped[c][k] if k < len(wrapped[c]) else ("", ())
+                    gap = max(colw[c] - str_width(ct), 0)
+                    left = {"right": gap, "center": gap // 2}.get(aligns[c], 0)
+                    text += " " + " " * left
+                    spans.extend((a + len(text), b + len(text), s) for a, b, s in cs)
+                    text += ct + " " * (gap - left) + " "
+                    spans.append((len(text), len(text) + 1, "dim"))
+                    text += v
+                out.append((text, "table", tuple(spans)))
+            return out
+
+        out = [border(corners[0])]
+        out.extend(row_lines(grid[0]))
+        out.append(border(corners[1]))
+        for r in grid[1:]:
+            out.extend(row_lines(r))
+        out.append(border(corners[2]))
+        return out
+
+    @staticmethod
+    def _code_run_end(text: str, start: int, n: int) -> int:
+        """Index of the first run of exactly n backticks at or after start, or -1.
+
+        Example: _code_run_end("a `b` c", 3, 1) -> 4
+        """
+        j = start
+        while True:
+            j = text.find("`" * n, j)
+            if j < 0:
+                return -1
+            k = j
+            while k < len(text) and text[k] == "`":
+                k += 1
+            if k - j == n:
+                return j
+            j = k
 
 
-def _markdown_blocks(lines: List[str], width: int) -> List[Line]:
-    """Render Markdown source lines into rows (no outer prefix), `width` columns wide.
+    @staticmethod
+    def _run_end(text: str, start: int) -> int:
+        """Index just past the run of identical characters beginning at start.
 
-    Blocks: fenced code, ATX headings, tables, horizontal rules, block quotes, bullet and
-    ordered lists, and paragraphs (each source line stays its own line). Blank-line runs
-    collapse to one and leading/trailing blanks are dropped. See markdown_lines.
+        Example: _run_end("a**b", 1) -> 3
+        """
+        k = start
+        while k < len(text) and text[k] == text[start]:
+            k += 1
+        return k
 
-    Args:
-        lines: Source lines (already sanitized with clean()).
-        width: Display width for the rows (at least 4).
 
-    Returns:
-        The rows as Line tuples.
+    @staticmethod
+    def _find_closer(text: str, start: int, ch: str, n: int) -> int:
+        """Find the closing emphasis delimiter (a run of exactly n `ch`) at or after start.
 
-    Example: _markdown_blocks(["# Hi", "- a"], 20) -> [("Hi", "heading", ()), ("• a", "text", ())]
-    """
-    width = max(width, 4)
-    bullet, bar = markdown_glyphs()
-    out: List[Line] = []
-    levels: List[int] = []   # source indents of the open list nesting levels
-    i, n = 0, len(lines)
+        Skips code spans and backslash escapes. A closer must follow non-space text and, for "_",
+        must not be followed by a letter or digit (so snake_case_names stay literal).
 
-    def add_wrapped(segs: List[Seg], kind: str, first: str, rest: str) -> None:
-        for k, (t, sp) in enumerate(wrap_segments(segs, width - len(rest))):
-            lead = first if k == 0 else rest
-            out.append((lead + t, kind, tuple((a + len(lead), b + len(lead), s) for a, b, s in sp)))
+        Args:
+            text: The inline text.
+            start: Index just after the opening delimiter.
+            ch: "*" or "_".
+            n: Length of the opening delimiter run (1, 2 or 3).
 
-    while i < n:
-        raw = lines[i].rstrip()
-        if not raw.strip():
-            if out and out[-1][0] != "":
-                out.append(("", "text", ()))
-            i += 1
-            continue
-        fence = MD_FENCE.match(raw)
-        heading = MD_HEADING.match(raw)
-        if fence and not (fence.group(2)[0] == "`" and "`" in fence.group(3)):
-            levels = []
-            indent, mark = len(fence.group(1)), fence.group(2)
-            i += 1
-            while i < n:
-                st = lines[i].strip()
-                if st and set(st) == {mark[0]} and len(st) >= len(mark):
-                    i += 1
+        Returns:
+            The index of the closing run, or -1 if there is none.
+
+        Example: _find_closer("a b* c", 0, "*", 1) -> 3; _find_closer("a * b", 0, "*", 1) -> -1
+        """
+        j, size = start, len(text)
+        while j < size:
+            c = text[j]
+            if c == "\\":
+                j += 2
+            elif c == "`":
+                k = MarkdownRenderer._run_end(text, j)
+                e = MarkdownRenderer._code_run_end(text, k, k - j)
+                j = k if e < 0 else e + (k - j)
+            elif c == ch:
+                k = MarkdownRenderer._run_end(text, j)
+                if (k - j == n and j > start and not text[j - 1].isspace()
+                        and (ch == "*" or k >= size or not text[k].isalnum())):
+                    return j
+                j = k
+            else:
+                j += 1
+        return -1
+
+
+    @staticmethod
+    def _match_link(text: str, i: int) -> Optional[Tuple[str, str, int]]:
+        """Match an inline link "[label](url)" starting at text[i] == "[".
+
+        Returns:
+            (label, url, end_index) or None when text[i:] is not a link. A title after the url
+            ("[a](u "t")") is dropped.
+
+        Example: _match_link("[a](http://x) y", 0) -> ("a", "http://x", 13)
+        """
+        size, depth, j = len(text), 0, i
+        while j < size:
+            c = text[j]
+            if c == "\\":
+                j += 2
+                continue
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
                     break
-                body = lines[i].rstrip()
-                lead = len(body) - len(body.lstrip(" "))
-                for chunk in _hard_wrap(body[min(lead, indent):], width - 2):
-                    out.append(("  " + chunk if chunk else "", "code", ()))
+            j += 1
+        if j >= size or j + 1 >= size or text[j + 1] != "(":
+            return None
+        depth, k = 1, j + 2
+        while k < size:
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if k >= size:
+            return None
+        inner = text[j + 2:k].strip()
+        return text[i + 1:j], (inner.split(" ")[0] if inner else ""), k + 1
+
+
+    @staticmethod
+    def _merge_segs(segs: List[Seg]) -> List[Seg]:
+        """Drop empty segments and join neighbours that have the same styles.
+
+        Example: [("a", ()), ("b", ()), ("", ("bold",))] -> [("ab", ())]
+        """
+        out: List[Seg] = []
+        for t, st in segs:
+            if not t:
+                continue
+            if out and out[-1][1] == st:
+                out[-1] = (out[-1][0] + t, st)
+            else:
+                out.append((t, st))
+        return out
+
+
+    @staticmethod
+    def parse_inline(text: str, styles: Tuple[str, ...] = ()) -> List[Seg]:
+        """Parse inline Markdown into styled segments with the markers removed.
+
+        Handles `code` (any backtick run length, literal content), **bold** / __bold__,
+        *italic* / _italic_ (underscores only at word boundaries), ***both***, [text](url)
+        (text styled "link" then " (url)" styled "dim" unless url == text), <https://autolinks>
+        and backslash escapes. Unmatched markers stay literal. Styles may nest.
+
+        Args:
+            text: One line of text (no newlines needed).
+            styles: Styles applied to everything in text (used for recursion).
+
+        Returns:
+            A list of (text, styles) segments with no empty or mergeable neighbours.
+
+        Examples:
+            parse_inline("a **b** c") -> [("a ", ()), ("b", ("bold",)), (" c", ())]
+            parse_inline("snake_case_name and 2 * 3") -> [("snake_case_name and 2 * 3", ())]
+            parse_inline("[x](http://u)") -> [("x", ("link",)), (" (http://u)", ("dim",))]
+        """
+        segs: List[Seg] = []
+        buf: List[str] = []
+
+        def flush() -> None:
+            if buf:
+                segs.append(("".join(buf), styles))
+                del buf[:]
+
+        i, size = 0, len(text)
+        while i < size:
+            c = text[i]
+            if c == "\\" and i + 1 < size and text[i + 1] in MarkdownRenderer.ESCAPABLE:
+                buf.append(text[i + 1])
+                i += 2
+            elif c == "`":
+                k = MarkdownRenderer._run_end(text, i)
+                e = MarkdownRenderer._code_run_end(text, k, k - i)
+                if e < 0:
+                    buf.append(text[i:k])
+                    i = k
+                    continue
+                inner = text[k:e]
+                if len(inner) > 2 and inner[0] == " " and inner[-1] == " " and inner.strip():
+                    inner = inner[1:-1]
+                flush()
+                segs.append((inner, styles + ("code",)))
+                i = e + (k - i)
+            elif c == "[":
+                link = MarkdownRenderer._match_link(text, i)
+                if link is None:
+                    buf.append(c)
+                    i += 1
+                    continue
+                label, url, end = link
+                flush()
+                segs.extend(MarkdownRenderer.parse_inline(label, styles + ("link",)))
+                if url and url != label:
+                    segs.append((" (%s)" % url, styles + ("dim",)))
+                i = end
+            elif c == "<" and MarkdownRenderer.AUTOLINK.match(text, i):
+                m = MarkdownRenderer.AUTOLINK.match(text, i)
+                assert m is not None
+                flush()
+                segs.append((m.group(1), styles + ("link",)))
+                i = m.end()
+            elif c in "*_":
+                k = MarkdownRenderer._run_end(text, i)
+                n = k - i
+                if (n <= 3 and k < size and not text[k].isspace()
+                        and (c == "*" or i == 0 or not text[i - 1].isalnum())):
+                    e = MarkdownRenderer._find_closer(text, k, c, n)
+                    if e >= 0:
+                        flush()
+                        added = {1: ("italic",), 2: ("bold",), 3: ("bold", "italic")}[n]
+                        segs.extend(MarkdownRenderer.parse_inline(text[k:e], styles + added))
+                        i = e + n
+                        continue
+                buf.append(text[i:k])
+                i = k
+            else:
+                buf.append(c)
                 i += 1
-        elif heading:
-            levels = []
-            if out and out[-1][0] != "":
-                out.append(("", "text", ()))
-            add_wrapped(parse_inline(heading.group(2)), "heading", "", "")
-            i += 1
-        elif ("|" in raw and i + 1 < n and "|" in lines[i + 1]
-              and MD_TABLE_SEP.match(lines[i + 1].rstrip())
-              and len(_split_table_row(raw)) == len(_split_table_row(lines[i + 1]))):
-            levels = []
-            seps = _split_table_row(lines[i + 1])
-            aligns = ["center" if s.startswith(":") and s.endswith(":") else
-                      "right" if s.endswith(":") else "left" for s in seps]
-            header = _split_table_row(raw)
-            rows: List[List[str]] = []
-            i += 2
-            while i < n and lines[i].strip() and "|" in lines[i]:
-                rows.append(_split_table_row(lines[i]))
-                i += 1
-            out.extend(_table_lines(header, aligns, rows, width))
-        elif MD_HRULE.match(raw):
-            levels = []
-            out.append((rule_chars()[0] * width, "dim", ()))
-            i += 1
-        elif MD_QUOTE.match(raw):
-            levels = []
-            inner: List[str] = []
-            while i < n and MD_QUOTE.match(lines[i]):
-                inner.append(MD_QUOTE.sub("", lines[i], count=1))
-                i += 1
-            for t, kind, sp in _markdown_blocks(inner, width - 2):
-                lead = bar + " " if t else bar
-                if kind == "text":
-                    kind = "quote"
-                out.append((lead + t, kind, tuple((a + len(lead), b + len(lead), s)
-                                                  for a, b, s in sp)))
-        elif MD_BULLET.match(raw) or MD_ORDERED.match(raw):
-            mb, mo = MD_BULLET.match(raw), MD_ORDERED.match(raw)
-            src_indent = len((mb or mo).group(1))  # type: ignore
-            while levels and levels[-1] > src_indent:
-                levels.pop()
-            if not levels or levels[-1] < src_indent:
-                levels.append(src_indent)
-            marker = (bullet if mb else mo.group(2)) + " "  # type: ignore
-            content = (mb.group(2) if mb else mo.group(3))  # type: ignore
-            pad = "  " * (len(levels) - 1)
-            add_wrapped(parse_inline(content), "text", pad + marker, pad + " " * len(marker))
-            i += 1
-        else:
-            levels = []
-            add_wrapped(parse_inline(raw), "text", "", "")
-            i += 1
-    while out and out[-1][0] == "":
-        out.pop()
-    return out
+        flush()
+        return MarkdownRenderer._merge_segs(segs)
 
 
-def markdown_lines(text: str, width: int, prefix: str = "") -> List[Line]:
-    """Render Markdown text (an assistant reply) into transcript rows with inline spans.
+    @staticmethod
+    def segs_text(segs: List[Seg]) -> str:
+        """The plain text of styled segments.
 
-    Markers are removed and the layout kept: headings ("heading"), fenced code ("code", verbatim,
-    hard-wrapped, indented 2 more), bullet / ordered lists with hanging indents, block quotes
-    ("quote", marked with a bar), horizontal rules ("dim"), box-drawn tables ("table") and
-    paragraphs ("text") whose **bold**, *italic*, `code` and [link](url) markup becomes spans.
-    Single newlines stay line breaks and blank-line runs collapse to one.
+        Example: segs_text([("a ", ()), ("b", ("bold",))]) -> "a b"
+        """
+        return "".join(t for t, _ in segs)
 
-    Args:
-        text: The Markdown source.
-        width: Total display width in columns, including prefix (at least len(prefix) + 4).
-        prefix: Plain text put before every non-blank row (the body indent), e.g. "  ".
 
-    Returns:
-        Line tuples (row text, kind, spans); spans are character offsets into the row text.
+    @staticmethod
+    def _pairs_to_row(pairs: Pairs) -> Tuple[str, Tuple[Span, ...]]:
+        """Turn (char, styles) pairs into row text plus spans (one span per style run).
 
-    Examples:
-        markdown_lines("hi **there**", 40, "  ") -> [("  hi there", "text", ((5, 10, "bold"),))]
-        markdown_lines("# T\\n- a", 40, "  ") -> [("  T", "heading", ()), ("  • a", "text", ())]
-    """
-    rows = _markdown_blocks(clean(text).split("\n"), max(width - len(prefix), 4))
-    return [((prefix + t, k, tuple((a + len(prefix), b + len(prefix), s) for a, b, s in sp))
-             if t else ("", k, ())) for t, k, sp in rows]
+        Example: [("a", ()), ("b", ("bold",)), ("c", ("bold",))] -> ("abc", ((1, 3, "bold"),))
+        """
+        spans: List[Span] = []
+        opened: Dict[str, int] = {}
+        for i, (_, st) in enumerate(pairs):
+            for name in list(opened):
+                if name not in st:
+                    spans.append((opened.pop(name), i, name))
+            for name in st:
+                if name not in opened:
+                    opened[name] = i
+        for name, start in opened.items():
+            spans.append((start, len(pairs), name))
+        spans.sort()
+        return "".join(c for c, _ in pairs), tuple(spans)
+
+
+    @staticmethod
+    def wrap_segments(segs: List[Seg], width: int) -> List[Tuple[str, Tuple[Span, ...]]]:
+        """Word-wrap styled text to a display width, keeping each character's styles.
+
+        Like wrap() for a single line: a line that fits is kept as is (minus trailing spaces);
+        otherwise runs of spaces collapse to one, continuation lines keep the leading indent (up to
+        half the width) and over-long words are split by display width (wide chars count 2).
+
+        Args:
+            segs: The styled text, as from parse_inline (no newlines).
+            width: Display width in columns (at least 1).
+
+        Returns:
+            A list of (row text, spans) pairs; never empty ([("", ())] for empty input).
+
+        Example: wrap_segments([("aa ", ()), ("bb", ("bold",))], 2) -> [("aa", ()), ("bb", ((0, 2, "bold"),))]
+        """
+        width = max(width, 1)
+        pairs: Pairs = [(ch, st) for t, st in segs for ch in t]
+        while pairs and pairs[-1][0] == " ":
+            pairs.pop()
+        if not pairs:
+            return [("", ())]
+        if sum(char_width(c) for c, _ in pairs) <= width:
+            return [MarkdownRenderer._pairs_to_row(pairs)]
+        lead = 0
+        while lead < len(pairs) and pairs[lead][0] == " ":
+            lead += 1
+        indent = min(lead, width // 2)
+        # Split into (gap space, word) items.
+        items: List[Tuple[Optional[Tuple[str, Tuple[str, ...]]], Pairs]] = []
+        gap: Optional[Tuple[str, Tuple[str, ...]]] = None
+        word: Pairs = []
+        for p in pairs[lead:] + [(" ", ())]:
+            if p[0] == " ":
+                if word:
+                    items.append((gap, word))
+                    word = []
+                    gap = None
+                if gap is None:
+                    gap = p
+            else:
+                word.append(p)
+        pad: Pairs = [(" ", ())] * indent
+        rows: List[Pairs] = []
+        cur: Pairs = list(pad)
+        curw = indent
+        has_word = False
+        for gap_p, word in items:
+            ww = sum(char_width(c) for c, _ in word)
+            if has_word and gap_p is not None and curw + 1 + ww <= width:
+                cur += [gap_p] + word
+                curw += 1 + ww
+                continue
+            if not has_word and curw + ww <= width:
+                cur += word
+                curw += ww
+                has_word = True
+                continue
+            if has_word:
+                rows.append(cur)
+                cur, curw, has_word = list(pad), indent, False
+            for p in word:   # a word that does not fit on a line of its own is split
+                cw = char_width(p[0])
+                if has_word and curw + cw > width:
+                    rows.append(cur)
+                    cur, curw, has_word = list(pad), indent, False
+                cur.append(p)
+                curw += cw
+                has_word = True
+        if has_word:
+            rows.append(cur)
+        return [MarkdownRenderer._pairs_to_row(r) for r in rows]
+
+
+    @staticmethod
+    def _hard_wrap(s: str, width: int) -> List[str]:
+        """Split s into chunks of at most width display columns (no word handling).
+
+        Example: _hard_wrap("abcdef", 4) -> ["abcd", "ef"]; _hard_wrap("", 4) -> [""]
+        """
+        width = max(width, 1)
+        chunks: List[str] = []
+        while str_width(s) > width:
+            piece = clip(s, width) or s[:1]
+            chunks.append(piece)
+            s = s[len(piece):]
+        chunks.append(s)
+        return chunks
+
+
+    @staticmethod
+    def _split_table_row(line: str) -> List[str]:
+        """Split a table row into stripped cell strings; leading/trailing pipes are optional and
+        "\\|" does not split.
+
+        Example: _split_table_row("| a | b \\| c |") -> ["a", "b \\| c"]
+        """
+        s = line.strip()
+        cells: List[str] = []
+        cur: List[str] = []
+        j = 0
+        while j < len(s):
+            if s[j] == "\\" and j + 1 < len(s):
+                cur.append(s[j:j + 2])
+                j += 2
+                continue
+            if s[j] == "|":
+                cells.append("".join(cur))
+                cur = []
+            else:
+                cur.append(s[j])
+            j += 1
+        cells.append("".join(cur))
+        if s.startswith("|"):
+            cells = cells[1:]
+        if s.endswith("|") and not s.endswith("\\|"):
+            cells = cells[:-1]
+        return [c.strip() for c in cells]
 
 
 # ---------------------------------------------------------------- rendering
@@ -2712,7 +2743,7 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
     labels); prompt (body of your own messages); text (other message bodies and blank
     separators and paragraphs); heading, code, quote, table (Markdown blocks in assistant
     replies); tool (calls and slash commands); result (tool output). Assistant replies are
-    rendered as Markdown (see markdown_lines) and carry inline style spans; everything else
+    rendered as Markdown (see MarkdownRenderer.lines) and carry inline style spans; everything else
     has spans (). show_results includes tool results; mine_only keeps only your own input (prompts
     and slash commands).
 
@@ -2768,7 +2799,7 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
             if role == "user":
                 add_wrapped(msg["text"], "prompt", "  ")
             else:
-                lines.extend(markdown_lines(msg["text"], width, "  "))
+                lines.extend(MarkdownRenderer.lines(msg["text"], width, "  "))
         elif role == "cmd":
             lines.append(("  > " + clip(clean(msg["text"]), width - 4), "tool", ()))
         elif role == "tool":
