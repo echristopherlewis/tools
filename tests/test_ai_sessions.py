@@ -1492,7 +1492,7 @@ class Tui(Env):
         self.assertTrue(app.view[0].starred)
 
     def test_help_mentions_star_keys(self) -> None:
-        keys = [k for _, ks in ai.HELP for k, _ in ks]
+        keys = [b.label for b in ai.KEY_BINDINGS if b.text]
         self.assertEqual(keys.count("* 8"), 2)
         self.assertIn("S", keys)
 

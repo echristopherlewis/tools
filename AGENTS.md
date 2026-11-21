@@ -55,6 +55,8 @@ One executable script (no `.py` suffix), in layers:
    `Source.resume_argv`, configured by `AI_SESSIONS_*_CMD`. `Theme` owns every color
    decision (terminal background detection, row stripe, palette) and builds the curses
    attribute table (`curses_attrs`) that `App` hands to its `Screen`.
+   `KEY_BINDINGS` is the single table behind both keymaps and the help screen
+   (`build_keymap`, `help_lines`), so adding a key means adding one row.
 
 Tests import the script with `SourceFileLoader`. They point every directory env var at temp
 dirs and drive the TUI with a `FakeScr` key script, so no real terminal is needed. The

@@ -51,7 +51,8 @@ import tempfile
 import termios
 import time
 import unicodedata
-from typing import Any, Callable, Dict, Iterator, List, Optional, Pattern, Tuple
+from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Pattern,
+                    Tuple)
 
 # A parsed transcript message: a dict with keys
 #   role  one of:
@@ -2837,69 +2838,145 @@ def copy_clipboard(text: str) -> Optional[str]:
 
 HELP_TITLE = "ai-sessions - browse Claude Code and Codex transcripts"
 
-# Help screen contents: (section title, [(keys, what they do), ...]). Keys are drawn in a
-# fixed-width column so the descriptions line up.
-HELP: List[Tuple[str, List[Tuple[str, str]]]] = [
-    ("Session list                                                  ", [
-        ("j k  Up Down", "move selection"),
-        ("PgUp PgDn", "page up / down"),
-        ("g G  Home End", "first / last session"),
-        ("J K", "scroll the preview"),
-        ("/", "filter (terms ANDed)"),
-        ("", "Enter accept, Esc clear, ^U erase"),
-        ("Esc", "clear the filter"),
-        ("Tab", "source: all > Claude Code > Codex"),
-        ("p", "toggle: only the selected session's project"),
-        ("* 8", "star / unstar the selected session"),
-        ("S", "toggle: only starred sessions"),
-        ("s", "sort: last activity / start time"),
-        ("l", "layout: side by side / stacked / list only"),
-        ("t", "toggle tool results (calls always shown)"),
-        ("u", "toggle showing only your input"),
-        ("Enter v", "open full-screen viewer"),
-        ("R", "rescan session files"),
-        ("click", "move selection to the clicked session"),
-    ]),
-    ("Viewer                                                          ", [
-        ("j k  Up Down", "scroll one line"),
-        ("PgDn Space f", "page down"),
-        ("PgUp b", "page up"),
-        ("g G  Home End", "top / bottom"),
-        ("/", "search"),
-        ("n N", "next / previous hit"),
-        ("t", "toggle tool results"),
-        ("u", "toggle showing only your input"),
-        ("* 8", "star / unstar this session"),
-        ("q Esc", "back to the list"),
-    ]),
-    ("Both                                                            ", [
-        ("r", "resume session (configured command, in its cwd)"),
-        ("e", "edit the resume command line, then resume"),
-        ("y", "copy the resume command to the clipboard"),
-        ("?", "this help"),
-        ("q", "quit (from the list)"),
-    ]),
-]
+class KeyBinding(NamedTuple):
+    """One row of KEY_BINDINGS: a help line, key bindings, or both.
+
+    Fields:
+        section: Help section the row is listed under: "list", "viewer" or "both".
+        label: Keys as drawn in the help screen's keys column; "" for a continuation row.
+        text: Help description; "" for a row that only binds keys and is not shown in help.
+        keys: Key names (see Screen.key) bound to handler; () for a help-only row.
+        handler: Name of the App/Viewer method the keys call; "" for a help-only row.
+        where: Which keymaps get the keys: ("list",), ("viewer",) or ("list", "viewer").
+
+    Example: KeyBinding("list", "j k  Up Down", "move selection", ("j", "DOWN"), "on_down",
+    ("list",)) shows "j k  Up Down  move selection" under "Session list" and binds j and
+    Down to App.on_down.
+    """
+
+    section: str
+    label: str
+    text: str
+    keys: Tuple[str, ...]
+    handler: str
+    where: Tuple[str, ...]
+
+
+# Help section headings (padded on purpose so the heading bar spans the screen).
+SECTION_TITLES: Dict[str, str] = {
+    "list": "Session list                                                  ",
+    "viewer": "Viewer                                                          ",
+    "both": "Both                                                            ",
+}
+
+_LIST = ("list",)
+_VIEWER = ("viewer",)
+_BOTH = ("list", "viewer")
+
+# The single source of truth for the key bindings: help_lines() draws the rows that have a
+# text, in this order grouped by section, and build_keymap() binds the keys of the rows
+# whose `where` names the keymap. Adding a key means adding one row here. A row with a text
+# but no keys is a help-only continuation row; a row with no text binds extra keys for the
+# help row above it (or keys the help leaves out, such as the viewer's Enter).
+KEY_BINDINGS: Tuple[KeyBinding, ...] = (
+    # Session list
+    KeyBinding("list", "j k  Up Down", "move selection", ("j", "DOWN"), "on_down", _LIST),
+    KeyBinding("list", "", "", ("k", "UP"), "on_up", _LIST),
+    KeyBinding("list", "PgUp PgDn", "page up / down", ("PGDN",), "on_page_down", _LIST),
+    KeyBinding("list", "", "", ("PGUP",), "on_page_up", _LIST),
+    KeyBinding("list", "g G  Home End", "first / last session", ("g", "HOME"), "on_first", _LIST),
+    KeyBinding("list", "", "", ("G", "END"), "on_last", _LIST),
+    KeyBinding("list", "J K", "scroll the preview", ("J", "SDOWN"), "on_preview_down", _LIST),
+    KeyBinding("list", "", "", ("K", "SUP"), "on_preview_up", _LIST),
+    KeyBinding("list", "/", "filter (terms ANDed)", ("/",), "on_filter", _LIST),
+    KeyBinding("list", "", "Enter accept, Esc clear, ^U erase", (), "", _LIST),
+    KeyBinding("list", "Esc", "clear the filter", ("ESC",), "on_clear_filter", _LIST),
+    KeyBinding("list", "Tab", "source: all > Claude Code > Codex", ("TAB",), "on_cycle_source",
+               _LIST),
+    KeyBinding("list", "p", "toggle: only the selected session's project", ("p",),
+               "on_toggle_project", _LIST),
+    KeyBinding("list", "* 8", "star / unstar the selected session", ("*", "8"), "on_star",
+               _LIST),
+    KeyBinding("list", "S", "toggle: only starred sessions", ("S",), "on_toggle_starred_only",
+               _LIST),
+    KeyBinding("list", "s", "sort: last activity / start time", ("s",), "on_toggle_sort", _LIST),
+    KeyBinding("list", "l", "layout: side by side / stacked / list only", ("l",),
+               "on_toggle_split", _LIST),
+    KeyBinding("list", "t", "toggle tool results (calls always shown)", ("t",),
+               "on_toggle_results", _LIST),
+    KeyBinding("list", "u", "toggle showing only your input", ("u",), "on_toggle_mine", _LIST),
+    KeyBinding("list", "Enter v", "open full-screen viewer", ("ENTER", "v"), "on_open", _LIST),
+    KeyBinding("list", "R", "rescan session files", ("R",), "on_rescan", _LIST),
+    KeyBinding("list", "click", "move selection to the clicked session", ("MOUSE",), "on_mouse",
+               _LIST),
+    # Viewer
+    KeyBinding("viewer", "j k  Up Down", "scroll one line", ("j", "DOWN", "ENTER"),
+               "on_line_down", _VIEWER),
+    KeyBinding("viewer", "", "", ("k", "UP"), "on_line_up", _VIEWER),
+    KeyBinding("viewer", "PgDn Space f", "page down", ("PGDN", " ", "f"), "on_page_down",
+               _VIEWER),
+    KeyBinding("viewer", "PgUp b", "page up", ("PGUP", "b"), "on_page_up", _VIEWER),
+    KeyBinding("viewer", "g G  Home End", "top / bottom", ("g", "HOME"), "on_top", _VIEWER),
+    KeyBinding("viewer", "", "", ("G", "END"), "on_bottom", _VIEWER),
+    KeyBinding("viewer", "/", "search", ("/",), "on_search", _VIEWER),
+    KeyBinding("viewer", "n N", "next / previous hit", ("n",), "on_next_hit", _VIEWER),
+    KeyBinding("viewer", "", "", ("N",), "on_prev_hit", _VIEWER),
+    KeyBinding("viewer", "t", "toggle tool results", ("t",), "on_toggle_results", _VIEWER),
+    KeyBinding("viewer", "u", "toggle showing only your input", ("u",), "on_toggle_mine",
+               _VIEWER),
+    KeyBinding("viewer", "* 8", "star / unstar this session", ("*", "8"), "on_star", _VIEWER),
+    KeyBinding("viewer", "q Esc", "back to the list", ("q", "ESC", "CTRL_C"), "on_back",
+               _VIEWER),
+    # Both
+    KeyBinding("both", "r", "resume session (configured command, in its cwd)", ("r",),
+               "on_resume", _BOTH),
+    KeyBinding("both", "e", "edit the resume command line, then resume", ("e",),
+               "on_edit_resume", _BOTH),
+    KeyBinding("both", "y", "copy the resume command to the clipboard", ("y",), "on_copy",
+               _BOTH),
+    KeyBinding("both", "?", "this help", ("?",), "on_help", _BOTH),
+    KeyBinding("both", "q", "quit (from the list)", ("q", "CTRL_C"), "on_quit", _LIST),
+)
 HELP_KEY_WIDTH = 15  # width of the keys column, including the gap before the description
 HELP_FOOTER = "Press any key to close."
 
 
 def help_lines() -> List[Tuple[str, str, str]]:
-    """Flatten HELP into drawable rows of (kind, keys, text).
+    """Build the drawable help rows (kind, keys, text) from KEY_BINDINGS.
 
     Returns:
         One tuple per screen row: ("title", "", title), ("section", "", name), ("key", keys,
-        description) or ("blank", "", ""). Sections are separated by a blank row.
+        description) or ("blank", "", ""). Sections come in the order list, viewer, both and
+        are separated by a blank row; KEY_BINDINGS rows without a text are not shown.
 
     Example: help_lines()[:3] -> [("title", "", HELP_TITLE), ("blank", "", ""),
     ("section", "", "Session list")]
     """
     rows: List[Tuple[str, str, str]] = [("title", "", HELP_TITLE)]
-    for name, keys in HELP:
+    for section in ("list", "viewer", "both"):
         rows.append(("blank", "", ""))
-        rows.append(("section", "", name))
-        rows.extend(("key", k, d) for k, d in keys)
+        rows.append(("section", "", SECTION_TITLES[section]))
+        rows.extend(("key", b.label, b.text)
+                    for b in KEY_BINDINGS if b.section == section and b.text)
     return rows
+
+
+def build_keymap(owner: Any, where: str) -> Dict[str, Callable[[], Optional[bool]]]:
+    """Key name (see Screen.key) -> handler method of owner, from KEY_BINDINGS.
+
+    Args:
+        owner: The App or Viewer whose on_* methods handle the keys.
+        where: "list" or "viewer": which rows of KEY_BINDINGS apply.
+
+    Returns:
+        A dict mapping each key name to its bound method. A handler name that owner lacks
+        raises AttributeError.
+
+    Example: build_keymap(app, "list")["j"] is app.on_down; build_keymap(viewer, "viewer")["n"]
+    is viewer.on_next_hit
+    """
+    return {key: getattr(owner, b.handler)
+            for b in KEY_BINDINGS if where in b.where for key in b.keys}
 
 
 class Screen(object):
@@ -3219,7 +3296,7 @@ class App(object):
         self._preview_scroll_key: Optional[Tuple[Any, ...]] = None
         self.init_colors()
         self.refilter()
-        self.keymap = self.build_keymap()
+        self.keymap = build_keymap(self, "list")
 
     # -- setup
     def init_colors(self) -> None:
@@ -3774,44 +3851,6 @@ class App(object):
         self.resume = s
         return True
 
-    def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
-        """Key name (see Screen.key) -> handler for the session list.
-
-        Returns:
-            A dict mapping each key name to its handler method.
-
-        Example: build_keymap()["j"] is self.on_down; build_keymap()["ENTER"] is self.on_open
-        """
-        bindings: List[Tuple[Tuple[str, ...], Callable[[], Optional[bool]]]] = [
-            (("q", "CTRL_C"), self.on_quit),
-            (("?",), self.on_help),
-            (("j", "DOWN"), self.on_down),
-            (("k", "UP"), self.on_up),
-            (("PGDN",), self.on_page_down),
-            (("PGUP",), self.on_page_up),
-            (("g", "HOME"), self.on_first),
-            (("G", "END"), self.on_last),
-            (("J", "SDOWN"), self.on_preview_down),
-            (("K", "SUP"), self.on_preview_up),
-            (("/",), self.on_filter),
-            (("ESC",), self.on_clear_filter),
-            (("TAB",), self.on_cycle_source),
-            (("p",), self.on_toggle_project),
-            (("*", "8"), self.on_star),
-            (("S",), self.on_toggle_starred_only),
-            (("s",), self.on_toggle_sort),
-            (("l",), self.on_toggle_split),
-            (("t",), self.on_toggle_results),
-            (("u",), self.on_toggle_mine),
-            (("R",), self.on_rescan),
-            (("ENTER", "v"), self.on_open),
-            (("r",), self.on_resume),
-            (("e",), self.on_edit_resume),
-            (("y",), self.on_copy),
-            (("MOUSE",), self.on_mouse),
-        ]
-        return {name: fn for names, fn in bindings for name in names}
-
     def run(self) -> None:
         """Main loop: draw, read a key, dispatch. Returns on quit or when a resume is chosen.
 
@@ -3890,7 +3929,7 @@ class Viewer(object):
         self.hits: List[int] = []
         # Re-render only when one of (width, results, mine, terms) changes.
         self._render_key: Optional[Tuple[Any, ...]] = None
-        self.keymap = self.build_keymap()
+        self.keymap = build_keymap(self, "viewer")
 
     # -- key handlers: True means "leave the viewer"
     def on_back(self) -> bool:
@@ -4005,35 +4044,6 @@ class Viewer(object):
             self.query = buf
             self.hit_index = -1
             self._render_key = None  # force a re-render with the new terms
-
-    def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
-        """Key name (see Screen.key) -> handler for the viewer.
-
-        Returns:
-            A dict mapping each key name to its handler method.
-
-        Example: build_keymap()["n"] is self.on_next_hit; build_keymap()[" "] is self.on_page_down
-        """
-        bindings: List[Tuple[Tuple[str, ...], Callable[[], Optional[bool]]]] = [
-            (("q", "ESC", "CTRL_C"), self.on_back),
-            (("j", "DOWN", "ENTER"), self.on_line_down),
-            (("k", "UP"), self.on_line_up),
-            (("PGDN", " ", "f"), self.on_page_down),
-            (("PGUP", "b"), self.on_page_up),
-            (("g", "HOME"), self.on_top),
-            (("G", "END"), self.on_bottom),
-            (("t",), self.on_toggle_results),
-            (("u",), self.on_toggle_mine),
-            (("*", "8"), self.on_star),
-            (("n",), self.on_next_hit),
-            (("N",), self.on_prev_hit),
-            (("/",), self.on_search),
-            (("r",), self.on_resume),
-            (("e",), self.on_edit_resume),
-            (("y",), self.on_copy),
-            (("?",), self.on_help),
-        ]
-        return {name: fn for names, fn in bindings for name in names}
 
     def handle_key(self, k: str) -> bool:
         handler = self.keymap.get(k)
