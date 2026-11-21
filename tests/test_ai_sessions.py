@@ -629,7 +629,7 @@ class Units(unittest.TestCase):
             self.assertIsNone(p(bad), bad)
 
     def test_stripe_color(self) -> None:
-        sc = ai.stripe_color
+        sc = lambda n, env, bg=None: ai.Theme(bg, env).stripe(n)
         self.assertEqual(sc(256, {}), 236)
         self.assertEqual(sc(256, {"COLORFGBG": "0;15"}), 255)
         self.assertEqual(sc(256, {"COLORFGBG": "0;default;7"}), 255)
@@ -646,7 +646,7 @@ class Units(unittest.TestCase):
         self.assertIsNone(sc(8, {}, (255, 255, 255)))
 
     def test_background_is_light(self) -> None:
-        f = ai.background_is_light
+        f = lambda env, bg=None: ai.Theme(bg, env).is_light()
         self.assertFalse(f({}))
         self.assertTrue(f({}, (255, 255, 255)))
         self.assertFalse(f({}, (30, 30, 30)))
@@ -657,8 +657,8 @@ class Units(unittest.TestCase):
         self.assertTrue(f({"COLORFGBG": "15;0"}, (250, 250, 250)))
 
     def test_pick_palette(self) -> None:
-        pp = ai.pick_palette
-        dark, light = ai.CLAUDE_PALETTES["dark"], ai.CLAUDE_PALETTES["light"]
+        pp = lambda n, env, bg=None: ai.Theme(bg, env).palette(n)
+        dark, light = ai.Theme.PALETTES["dark"], ai.Theme.PALETTES["light"]
         self.assertEqual(set(dark), set(light))
         self.assertIs(pp(256, {}), dark)
         self.assertIs(pp(256, {"COLORFGBG": "0;15"}), light)
@@ -678,14 +678,14 @@ class Units(unittest.TestCase):
             self.assertEqual(ai.transcript_glyphs(), ("*", "|"))
 
     def test_stripe_for_background(self) -> None:
-        f = ai.stripe_for_background
+        f = ai.Theme.stripe_for_background
         self.assertEqual(f((0, 0, 0)), 236)
         self.assertEqual(f((255, 255, 255)), 255)
         self.assertEqual(f((30, 30, 30)), 239)
         self.assertIn(f((253, 246, 227)), range(252, 256))
 
     def test_parse_osc11_reply(self) -> None:
-        p = ai.parse_osc11_reply
+        p = ai.Theme.parse_osc11_reply
         self.assertEqual(p("\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), (255, 255, 255))
         self.assertEqual(p("\x1b]11;rgb:1e/1e/1e\x07"), (30, 30, 30))
         self.assertEqual(p("\x1b]11;rgb:0000/8080/ffff\x07\x1b[?62;22c"), (0, 128, 255))
@@ -1107,7 +1107,7 @@ class Tui(Env):
 
     def test_init_colors_claude_theme(self) -> None:
         a = self.colored_attrs(256, {"AI_SESSIONS_THEME": "claude", "COLORFGBG": "15;0"})
-        pal = ai.CLAUDE_PALETTES["dark"]
+        pal = ai.Theme.PALETTES["dark"]
         self.assertEqual(self.pairs[a["prompt"] >> 8], (-1, pal["prompt_bg"]))
         self.assertEqual(self.pairs[a["sel"] >> 8 & 0xff], (pal["select_fg"], pal["select_bg"]))
         self.assertEqual(self.pairs[a["sel_cc"] >> 8 & 0xff], (pal["brand"], pal["select_bg"]))

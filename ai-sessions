@@ -77,7 +77,7 @@ Span = Tuple[int, int, str]
 Seg = Tuple[str, Tuple[str, ...]]
 # One rendered transcript row: (text, kind, spans). kind picks the color/attribute:
 # title, meta, dim, text, prompt, user, asst, tool, result, plus the Markdown body kinds
-# heading, code, quote, table (see App.init_colors). "prompt" is the body of your own messages
+# heading, code, quote, table (see Theme.curses_attrs). "prompt" is the body of your own messages
 # (drawn on a grey band); "text" is everything else. spans is () for unstyled rows.
 Line = Tuple[str, str, Tuple[Span, ...]]
 # curses window (curses._CursesWindow is not importable at runtime).
@@ -1309,211 +1309,337 @@ class Session(object):
 
 
 
-def parse_osc11_reply(reply: str) -> Optional[Tuple[int, int, int]]:
-    """Extract the background color from a terminal's reply to the OSC 11 query.
+class Theme(object):
+    """Colors for the TUI: terminal background detection, the row stripe, the palette, and the
+    curses attribute table.
 
     Args:
-        reply: Raw reply text, e.g. "ESC ] 11 ; rgb:RRRR/GGGG/BBBB" ended by BEL or ST, possibly
-            followed or preceded by other replies (such as a DA1 reply). Each component has 1-4
-            hex digits and is scaled to 0-255.
+        background: Terminal background (r, g, b), 0-255 each, from query_background, if known.
+        env: Environment mapping to read AI_SESSIONS_THEME, AI_SESSIONS_STRIPE and COLORFGBG
+            from (default: os.environ, read each time a method needs it).
 
-    Returns:
-        An (r, g, b) tuple with 0-255 components, or None when no valid color is present.
-
-    Example: parse_osc11_reply("\x1b]11;rgb:ffff/ffff/ffff\x1b\\") -> (255, 255, 255);
-    parse_osc11_reply("\x1b]11;rgb:1e/1e/1e\x07") -> (30, 30, 30); parse_osc11_reply("") -> None.
+    Example: Theme((255, 255, 255)).is_light() -> True; Theme(None, {}).stripe(256) -> 236.
     """
-    m = re.search(r"\]11;rgb:([0-9a-f]{1,4})/([0-9a-f]{1,4})/([0-9a-f]{1,4})", reply, re.I)
-    if not m:
-        return None
-    r, g, b = (round(int(h, 16) * 255 / (16 ** len(h) - 1)) for h in m.groups())
-    return (r, g, b)
+
+    # How far (in 0-255 brightness) the stripe sits from the terminal background; it moves toward
+    # mid-grey so it works on dark and light themes. Dark backgrounds take a bigger step so a black
+    # background gets grey 236; light backgrounds keep a small step so the stripe stays faint.
+    STRIPE_STEP_DARK = 48
+    STRIPE_STEP_LIGHT = 14
+
+    # Claude Code's theme as xterm-256 color numbers (the nearest cube/grey entry to each RGB).
+    # Keys: brand (Claude orange, assistant name / Claude Code tag), codex (Codex tag),
+    # secondary (muted text: dates, metadata, tool results), tool (tool-call marker),
+    # star (starred rows), select_fg / select_bg (selected row), prompt_bg (band behind your
+    # messages), head_bg (header and footer bars), hl_fg / hl_bg (search-match highlight),
+    # code (inline code and fenced code blocks in assistant replies).
+    PALETTES: Dict[str, Dict[str, int]] = {
+        # Source RGBs: brand 215,119,87; secondary 153,153,153; tool/success 78,186,101;
+        # star/warning 255,193,7; select_fg 177,185,249; prompt_bg 55,55,55.
+        "dark": {"brand": 173, "codex": 74, "secondary": 246, "tool": 71, "star": 214,
+                 "select_fg": 147, "select_bg": 239, "prompt_bg": 237, "head_bg": 237,
+                 "hl_fg": 16, "hl_bg": 214, "code": 153},
+        # Source RGBs: brand 215,119,87; secondary 102,102,102; tool/success 44,122,57;
+        # star/warning 150,108,30; select_fg 87,105,247; prompt_bg 240,240,240.
+        "light": {"brand": 173, "codex": 31, "secondary": 242, "tool": 28, "star": 172,
+                  "select_fg": 63, "select_bg": 252, "prompt_bg": 254, "head_bg": 254,
+                  "hl_fg": 16, "hl_bg": 214, "code": 25},
+    }
+
+    def __init__(self, background: Optional[Tuple[int, int, int]] = None,
+                 env: Optional[Dict[str, str]] = None) -> None:
+        """Remember the terminal background and environment to decide colors from.
+
+        Args:
+            background: Terminal background (r, g, b), 0-255 each, or None when unknown.
+            env: Environment mapping; None means os.environ, looked up at call time.
+
+        Example: Theme((0, 0, 0), {"AI_SESSIONS_THEME": "basic"}).palette(256) -> None
+        """
+        self.background = background
+        self.env = env
+
+    def _env(self) -> Dict[str, str]:
+        """The environment to read: the one given to __init__, else the current os.environ."""
+        return os.environ if self.env is None else self.env
+
+    @staticmethod
+    def parse_osc11_reply(reply: str) -> Optional[Tuple[int, int, int]]:
+        """Extract the background color from a terminal's reply to the OSC 11 query.
+
+        Args:
+            reply: Raw reply text, e.g. "ESC ] 11 ; rgb:RRRR/GGGG/BBBB" ended by BEL or ST, possibly
+                followed or preceded by other replies (such as a DA1 reply). Each component has 1-4
+                hex digits and is scaled to 0-255.
+
+        Returns:
+            An (r, g, b) tuple with 0-255 components, or None when no valid color is present.
+
+        Example: Theme.parse_osc11_reply("\x1b]11;rgb:ffff/ffff/ffff\x1b\\") -> (255, 255, 255);
+        Theme.parse_osc11_reply("\x1b]11;rgb:1e/1e/1e\x07") -> (30, 30, 30); Theme.parse_osc11_reply("") -> None.
+        """
+        m = re.search(r"\]11;rgb:([0-9a-f]{1,4})/([0-9a-f]{1,4})/([0-9a-f]{1,4})", reply, re.I)
+        if not m:
+            return None
+        r, g, b = (round(int(h, 16) * 255 / (16 ** len(h) - 1)) for h in m.groups())
+        return (r, g, b)
 
 
-def query_terminal_background(timeout: float = 0.2) -> Optional[Tuple[int, int, int]]:
-    """Ask the controlling terminal for its background color (OSC 11). Must run before curses
-    starts, or curses would swallow the reply. Never raises.
+    @staticmethod
+    def query_background(timeout: float = 0.2) -> Optional[Tuple[int, int, int]]:
+        """Ask the controlling terminal for its background color (OSC 11). Must run before curses
+        starts, or curses would swallow the reply. Never raises.
 
-    The query is followed by a DA1 query (ESC [ c), which nearly every terminal answers; its
-    reply marks the end of the output, so terminals that ignore OSC 11 do not cost the full timeout.
+        The query is followed by a DA1 query (ESC [ c), which nearly every terminal answers; its
+        reply marks the end of the output, so terminals that ignore OSC 11 do not cost the full timeout.
 
-    Args:
-        timeout: Longest time in seconds to wait for the reply.
+        Args:
+            timeout: Longest time in seconds to wait for the reply.
 
-    Returns:
-        An (r, g, b) tuple with 0-255 components, or None when there is no terminal or it does
-        not answer.
+        Returns:
+            An (r, g, b) tuple with 0-255 components, or None when there is no terminal or it does
+            not answer.
 
-    Example: an xterm with a white background -> (255, 255, 255); a terminal that ignores
-    OSC 11, or no controlling terminal -> None.
-    """
-    try:
-        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
-    except OSError:
-        return None
-    buf = b""
-    try:
-        saved = termios.tcgetattr(fd)
+        Example: an xterm with a white background -> (255, 255, 255); a terminal that ignores
+        OSC 11, or no controlling terminal -> None.
+        """
         try:
-            raw = list(saved)
-            raw[3] = raw[3] & ~(termios.ICANON | termios.ECHO)  # lflag: no line buffering or echo
-            raw[6] = list(saved[6])
-            raw[6][termios.VMIN] = 0
-            raw[6][termios.VTIME] = 0
-            termios.tcsetattr(fd, termios.TCSANOW, raw)
-            os.write(fd, b"\x1b]11;?\x1b\\" + b"\x1b[c")
-            deadline = time.monotonic() + timeout
-            while not re.search(rb"\x1b\[\?[0-9;]*c", buf):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                ready, _, _ = select.select([fd], [], [], remaining)
-                if not ready:
-                    break
-                chunk = os.read(fd, 1024)
-                if not chunk:
-                    break
-                buf += chunk
-        finally:
-            termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
-    except (OSError, termios.error, ValueError):
-        return None
-    finally:
-        try:
-            os.close(fd)
+            fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
         except OSError:
+            return None
+        buf = b""
+        try:
+            saved = termios.tcgetattr(fd)
+            try:
+                raw = list(saved)
+                raw[3] = raw[3] & ~(termios.ICANON | termios.ECHO)  # lflag: no line buffering or echo
+                raw[6] = list(saved[6])
+                raw[6][termios.VMIN] = 0
+                raw[6][termios.VTIME] = 0
+                termios.tcsetattr(fd, termios.TCSANOW, raw)
+                os.write(fd, b"\x1b]11;?\x1b\\" + b"\x1b[c")
+                deadline = time.monotonic() + timeout
+                while not re.search(rb"\x1b\[\?[0-9;]*c", buf):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    ready, _, _ = select.select([fd], [], [], remaining)
+                    if not ready:
+                        break
+                    chunk = os.read(fd, 1024)
+                    if not chunk:
+                        break
+                    buf += chunk
+            finally:
+                termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+        except (OSError, termios.error, ValueError):
+            return None
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return Theme.parse_osc11_reply(buf.decode("latin-1"))
+
+    def is_light(self) -> bool:
+        """Whether the terminal has a light background.
+
+        The real background color (from query_background) wins: light when its luminance
+        is at least 128. Otherwise COLORFGBG ("fg;bg" or "fg;default;bg") decides: light when its
+        last field is 7 or 15. With no information at all the terminal is assumed dark.
+
+        Returns:
+            True for a light background, False for a dark or unknown one.
+
+        Examples: Theme((255, 255, 255), {}).is_light() -> True; Theme(None, {}).is_light() -> False;
+        Theme(None, {"COLORFGBG": "0;15"}).is_light() -> True;
+        Theme((0, 0, 0), {"COLORFGBG": "0;15"}).is_light() -> False.
+        """
+        if self.background is not None:
+            r, g, b = self.background
+            return 0.299 * r + 0.587 * g + 0.114 * b >= 128
+        return (self._env().get("COLORFGBG") or "").split(";")[-1] in ("7", "15")
+
+    @staticmethod
+    def stripe_for_background(rgb: Tuple[int, int, int]) -> int:
+        """Pick the 256-color grey closest to a shade Theme.STRIPE_STEP_DARK/LIGHT away from the background.
+
+        Args:
+            rgb: Terminal background as (r, g, b), 0-255 each.
+
+        Returns:
+            An xterm-256 grey color number: 16 (level 0), 231 (level 255) or 232-255 (levels 8, 18, ... 238).
+
+        Example: Theme.stripe_for_background((0, 0, 0)) -> 236; (255, 255, 255) -> 255; (30, 30, 30) -> 239.
+        """
+        lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+        light = Theme(rgb, {}).is_light()
+        target = lum - Theme.STRIPE_STEP_LIGHT if light else lum + Theme.STRIPE_STEP_DARK
+        greys = [(0, 16), (255, 231)] + [(8 + 10 * k, 232 + k) for k in range(24)]
+        # min() keeps the first of equal distances, so ties are deterministic.
+        return min(greys, key=lambda g: abs(g[0] - target))[1]
+
+    def stripe(self, ncolors: int) -> Optional[int]:
+        """Pick the background color for every other row of the session list, or None for no stripes.
+
+        AI_SESSIONS_STRIPE wins when set: a color number (0..ncolors-1) or "off". Otherwise, on
+        256-color terminals, a grey just off the terminal's real background when it is known
+        (see Theme.stripe_for_background); failing that, 255 (light grey) when COLORFGBG says the
+        background is light (7 or 15), else 236 (very dark grey).
+
+        Args:
+            ncolors: Number of colors the terminal supports (curses.COLORS).
+
+        Returns:
+            A curses color number, or None when the list should not be striped.
+
+        Example: Theme(None, {}).stripe(256) -> 236; Theme(None, {"COLORFGBG": "0;15"}).stripe(256) -> 255;
+        Theme((255, 255, 255), {}).stripe(256) -> 255; Theme(None, {}).stripe(8) -> None;
+        Theme(None, {"AI_SESSIONS_STRIPE": "off"}).stripe(256) -> None.
+        """
+        setting = (self._env().get("AI_SESSIONS_STRIPE") or "").strip().lower()
+        if setting:
+            if setting.isdigit() and int(setting) < ncolors:
+                return int(setting)
+            return None  # "off", or a color the terminal cannot show
+        if ncolors < 256:
+            return None  # 8/16-color palettes have no subtle shades
+        if self.background is not None:
+            return Theme.stripe_for_background(self.background)  # the real color beats a stale COLORFGBG
+        return 255 if self.is_light() else 236
+
+    def palette(self, ncolors: int) -> Optional[Dict[str, int]]:
+        """Choose the TUI color palette, or None for the original 8-color ("basic") look.
+
+        AI_SESSIONS_THEME is "claude" (default; unknown values count as "claude") or "basic".
+        Basic is also used on terminals with fewer than 256 colors.
+
+        Args:
+            ncolors: Number of colors the terminal supports (curses.COLORS).
+
+        Returns:
+            A PALETTES entry (dark or light, see is_light), or None for basic.
+
+        Examples: Theme(None, {}).palette(256) -> Theme.PALETTES["dark"];
+        Theme(None, {"COLORFGBG": "0;15"}).palette(256) -> Theme.PALETTES["light"];
+        Theme(None, {"AI_SESSIONS_THEME": "basic"}).palette(256) -> None; Theme(None, {}).palette(8) -> None.
+        """
+        if (self._env().get("AI_SESSIONS_THEME") or "").strip().lower() == "basic" or ncolors < 256:
+            return None
+        return Theme.PALETTES["light" if self.is_light() else "dark"]
+
+    def curses_attrs(self) -> Dict[str, int]:
+        """Build the attribute table (name -> curses attribute). Uses color pairs when the
+        terminal has colors; otherwise (or on curses errors) it keeps the bold/dim/reverse fallbacks.
+
+        With the "claude" theme on a 256-color terminal (see Theme.palette) the colors come from
+        Claude Code's palette; otherwise the original 8-color look is used. Besides the kind
+        names (title, meta, dim, user, asst, tool, result, hl, head, and "prompt" in the claude
+        theme only) it holds the Markdown row kinds heading, code, quote and table and the inline
+        style attributes bold, italic (underline where curses has no A_ITALIC), code and link
+        (dim is shared); "code" is cyan in the basic theme and the palette's code color in the
+        claude theme, and monochrome terminals fall back to bold, dim and underline. It also holds the session-list row variants: cc, cx, star,
+        dim for plain rows and the same with a "stripe_" or "sel_" prefix (plus bare "stripe" / "sel" for the row's
+        own background) for every other row and the selected row.
+
+        Example: on a basic color terminal -> self.attrs["cc"] == color_pair(1) | A_BOLD and
+        self.attrs["sel"] == A_REVERSE; on a 256-color one, self.attrs["sel"] is the select_fg
+        color on the select_bg color and "prompt" is the grey band behind your messages;
+        on a monochrome one -> self.attrs["cc"] == A_BOLD and self.attrs["hl"] == A_REVERSE | A_BOLD
+        """
+        has_italic = hasattr(curses, "A_ITALIC")  # Python 3.7+ only
+        italic = getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
+        attrs: Dict[str, int] = {"plain": 0, "dim": curses.A_DIM, "bold": curses.A_BOLD, "rev": curses.A_REVERSE,
+             "cc": curses.A_BOLD, "cx": curses.A_UNDERLINE, "user": curses.A_BOLD,
+             "asst": curses.A_BOLD, "hl": curses.A_REVERSE | curses.A_BOLD,
+             "title": curses.A_BOLD, "tool": curses.A_DIM, "result": curses.A_DIM,
+             "meta": 0, "head": curses.A_REVERSE, "star": curses.A_BOLD,
+             # Markdown: row kinds (heading, code, quote, table) and inline span styles
+             # (bold, italic, code, link; dim is shared with the kind above).
+             "italic": italic, "code": curses.A_BOLD, "link": curses.A_UNDERLINE,
+             "heading": curses.A_BOLD, "quote": curses.A_DIM | (italic if has_italic else 0),
+             "table": 0}
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                try:
+                    curses.use_default_colors()
+                    bg = fg = -1
+                except curses.error:
+                    bg, fg = curses.COLOR_BLACK, curses.COLOR_WHITE
+                palette = self.palette(curses.COLORS)
+                next_pair = [1]  # pair numbers are handed out in order; 0 is the terminal default
+
+                def pair(f: int, b: int) -> int:
+                    """Allocate the next color pair (f on b) and return its attribute; 0 when
+                    the terminal has no pairs left. Example: pair(2, -1) -> color_pair(1)."""
+                    if next_pair[0] >= curses.COLOR_PAIRS:
+                        return 0
+                    curses.init_pair(next_pair[0], f, b)
+                    next_pair[0] += 1
+                    return curses.color_pair(next_pair[0] - 1)
+
+                def row_set(prefix: str, row_bg: int, base: int, cc: int, cx: int,
+                            star: int, dim: int) -> None:
+                    """Store the list-row attributes for one row background: attrs[prefix] (the
+                    row itself) and prefix_cc / _cx / _star / _dim, each fg on row_bg.
+                    Example: row_set("sel", 239, base_fg, 173, 74, 214, 246)."""
+                    attrs[prefix] = pair(base, row_bg)
+                    attrs[prefix + "_cc"] = pair(cc, row_bg) | curses.A_BOLD
+                    attrs[prefix + "_cx"] = pair(cx, row_bg) | curses.A_BOLD
+                    attrs[prefix + "_star"] = pair(star, row_bg) | curses.A_BOLD
+                    attrs[prefix + "_dim"] = pair(dim, row_bg)
+
+                stripe = self.stripe(curses.COLORS)
+                if palette is None:
+                    attrs["cc"] = pair(curses.COLOR_GREEN, bg) | curses.A_BOLD
+                    attrs["cx"] = pair(curses.COLOR_MAGENTA, bg) | curses.A_BOLD
+                    attrs["user"] = pair(curses.COLOR_GREEN, bg) | curses.A_BOLD
+                    attrs["asst"] = pair(curses.COLOR_CYAN, bg) | curses.A_BOLD
+                    attrs["hl"] = pair(curses.COLOR_BLACK, curses.COLOR_YELLOW)
+                    attrs["tool"] = pair(curses.COLOR_YELLOW, bg)
+                    attrs["head"] = pair(curses.COLOR_WHITE, curses.COLOR_BLUE) | curses.A_BOLD
+                    attrs["code"] = pair(curses.COLOR_CYAN, bg)
+                    attrs["star"] = pair(curses.COLOR_YELLOW, bg) | curses.A_BOLD
+                    # Shaded variants for every other session-list row, so long rows are easy
+                    # to follow across a wide screen.
+                    if stripe is not None:
+                        row_set("stripe", stripe, fg, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
+                                curses.COLOR_YELLOW, fg)
+                        attrs["stripe_dim"] |= curses.A_DIM
+                else:
+                    p = palette
+                    secondary = pair(p["secondary"], bg)
+                    attrs["cc"] = pair(p["brand"], bg) | curses.A_BOLD
+                    attrs["cx"] = pair(p["codex"], bg) | curses.A_BOLD
+                    attrs["user"] = curses.A_BOLD
+                    attrs["asst"] = attrs["cc"]
+                    attrs["title"] = curses.A_BOLD
+                    attrs["meta"] = attrs["dim"] = attrs["result"] = secondary
+                    attrs["tool"] = pair(p["tool"], bg)
+                    attrs["star"] = pair(p["star"], bg) | curses.A_BOLD
+                    attrs["hl"] = pair(p["hl_fg"], p["hl_bg"])
+                    attrs["head"] = pair(fg, p["head_bg"]) | curses.A_BOLD
+                    attrs["prompt"] = pair(fg, p["prompt_bg"])
+                    attrs["code"] = pair(p["code"], bg)
+                    attrs["quote"] = secondary | (italic if has_italic else 0)
+                    if stripe is not None:
+                        row_set("stripe", stripe, fg, p["brand"], p["codex"], p["star"], p["secondary"])
+                    row_set("sel", p["select_bg"], p["select_fg"], p["brand"], p["codex"],
+                            p["star"], p["secondary"])
+                    attrs["sel"] |= curses.A_BOLD
+        except curses.error:
             pass
-    return parse_osc11_reply(buf.decode("latin-1"))
+        # Without a stripe color, odd rows look like the even ones.
+        attrs.setdefault("stripe", 0)
+        for name in ("cc", "cx", "star", "dim"):
+            attrs.setdefault("stripe_" + name, attrs[name])
+        # The basic theme (and any failure above) marks the selected row with reverse video.
+        attrs.setdefault("sel", curses.A_REVERSE)
+        for name in ("cc", "cx", "star", "dim"):
+            attrs.setdefault("sel_" + name, attrs[name] | curses.A_REVERSE)
+        return attrs
 
-
-# How far (in 0-255 brightness) the stripe sits from the terminal background; it moves toward
-# mid-grey so it works on dark and light themes. Dark backgrounds take a bigger step so a black
-# background gets grey 236; light backgrounds keep a small step so the stripe stays faint.
-STRIPE_STEP_DARK = 48
-STRIPE_STEP_LIGHT = 14
-
-
-def background_is_light(env: Optional[Dict[str, str]] = None,
-                        background: Optional[Tuple[int, int, int]] = None) -> bool:
-    """Whether the terminal has a light background.
-
-    The real background color (from query_terminal_background) wins: light when its luminance
-    is at least 128. Otherwise COLORFGBG ("fg;bg" or "fg;default;bg") decides: light when its
-    last field is 7 or 15. With no information at all the terminal is assumed dark.
-
-    Args:
-        env: Environment mapping (default os.environ).
-        background: Terminal background (r, g, b), 0-255 each, if known.
-
-    Returns:
-        True for a light background, False for a dark or unknown one.
-
-    Examples: background_is_light({}, (255, 255, 255)) -> True; background_is_light({}) -> False;
-    background_is_light({"COLORFGBG": "0;15"}) -> True;
-    background_is_light({"COLORFGBG": "0;15"}, (0, 0, 0)) -> False.
-    """
-    env = os.environ if env is None else env
-    if background is not None:
-        lum = 0.299 * background[0] + 0.587 * background[1] + 0.114 * background[2]
-        return lum >= 128
-    return (env.get("COLORFGBG") or "").split(";")[-1] in ("7", "15")
-
-
-def stripe_for_background(rgb: Tuple[int, int, int]) -> int:
-    """Pick the 256-color grey closest to a shade STRIPE_STEP_DARK/LIGHT away from the background.
-
-    Args:
-        rgb: Terminal background as (r, g, b), 0-255 each.
-
-    Returns:
-        An xterm-256 grey color number: 16 (level 0), 231 (level 255) or 232-255 (levels 8, 18, ... 238).
-
-    Example: stripe_for_background((0, 0, 0)) -> 236; (255, 255, 255) -> 255; (30, 30, 30) -> 239.
-    """
-    lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-    target = lum - STRIPE_STEP_LIGHT if background_is_light({}, rgb) else lum + STRIPE_STEP_DARK
-    greys = [(0, 16), (255, 231)] + [(8 + 10 * k, 232 + k) for k in range(24)]
-    # min() keeps the first of equal distances, so ties are deterministic.
-    return min(greys, key=lambda g: abs(g[0] - target))[1]
-
-
-def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None,
-                 background: Optional[Tuple[int, int, int]] = None) -> Optional[int]:
-    """Pick the background color for every other row of the session list, or None for no stripes.
-
-    AI_SESSIONS_STRIPE wins when set: a color number (0..ncolors-1) or "off". Otherwise, on
-    256-color terminals, a grey just off the terminal's real background when it is known
-    (see stripe_for_background); failing that, 255 (light grey) when COLORFGBG says the
-    background is light (7 or 15), else 236 (very dark grey).
-
-    Args:
-        ncolors: Number of colors the terminal supports (curses.COLORS).
-        env: Environment mapping (default os.environ).
-        background: Terminal background (r, g, b) from query_terminal_background, if known.
-
-    Returns:
-        A curses color number, or None when the list should not be striped.
-
-    Example: stripe_color(256, {}) -> 236; stripe_color(256, {"COLORFGBG": "0;15"}) -> 255;
-    stripe_color(256, {}, (255, 255, 255)) -> 255; stripe_color(8, {}) -> None;
-    stripe_color(256, {"AI_SESSIONS_STRIPE": "off"}) -> None.
-    """
-    env = os.environ if env is None else env
-    setting = (env.get("AI_SESSIONS_STRIPE") or "").strip().lower()
-    if setting:
-        if setting.isdigit() and int(setting) < ncolors:
-            return int(setting)
-        return None  # "off", or a color the terminal cannot show
-    if ncolors < 256:
-        return None  # 8/16-color palettes have no subtle shades
-    if background is not None:
-        return stripe_for_background(background)  # the real color beats a stale COLORFGBG
-    return 255 if background_is_light(env) else 236
-
-
-# Claude Code's theme as xterm-256 color numbers (the nearest cube/grey entry to each RGB).
-# Keys: brand (Claude orange, assistant name / Claude Code tag), codex (Codex tag),
-# secondary (muted text: dates, metadata, tool results), tool (tool-call marker),
-# star (starred rows), select_fg / select_bg (selected row), prompt_bg (band behind your
-# messages), head_bg (header and footer bars), hl_fg / hl_bg (search-match highlight),
-# code (inline code and fenced code blocks in assistant replies).
-CLAUDE_PALETTES: Dict[str, Dict[str, int]] = {
-    # Source RGBs: brand 215,119,87; secondary 153,153,153; tool/success 78,186,101;
-    # star/warning 255,193,7; select_fg 177,185,249; prompt_bg 55,55,55.
-    "dark": {"brand": 173, "codex": 74, "secondary": 246, "tool": 71, "star": 214,
-             "select_fg": 147, "select_bg": 239, "prompt_bg": 237, "head_bg": 237,
-             "hl_fg": 16, "hl_bg": 214, "code": 153},
-    # Source RGBs: brand 215,119,87; secondary 102,102,102; tool/success 44,122,57;
-    # star/warning 150,108,30; select_fg 87,105,247; prompt_bg 240,240,240.
-    "light": {"brand": 173, "codex": 31, "secondary": 242, "tool": 28, "star": 172,
-              "select_fg": 63, "select_bg": 252, "prompt_bg": 254, "head_bg": 254,
-              "hl_fg": 16, "hl_bg": 214, "code": 25},
-}
-
-
-def pick_palette(ncolors: int, env: Optional[Dict[str, str]] = None,
-                 background: Optional[Tuple[int, int, int]] = None) -> Optional[Dict[str, int]]:
-    """Choose the TUI color palette, or None for the original 8-color ("basic") look.
-
-    AI_SESSIONS_THEME is "claude" (default; unknown values count as "claude") or "basic".
-    Basic is also used on terminals with fewer than 256 colors.
-
-    Args:
-        ncolors: Number of colors the terminal supports (curses.COLORS).
-        env: Environment mapping (default os.environ).
-        background: Terminal background (r, g, b) from query_terminal_background, if known.
-
-    Returns:
-        A CLAUDE_PALETTES entry (dark or light, see background_is_light), or None for basic.
-
-    Examples: pick_palette(256, {}) -> CLAUDE_PALETTES["dark"];
-    pick_palette(256, {"COLORFGBG": "0;15"}) -> CLAUDE_PALETTES["light"];
-    pick_palette(256, {"AI_SESSIONS_THEME": "basic"}) -> None; pick_palette(8, {}) -> None.
-    """
-    env = os.environ if env is None else env
-    if (env.get("AI_SESSIONS_THEME") or "").strip().lower() == "basic" or ncolors < 256:
-        return None
-    return CLAUDE_PALETTES["light" if background_is_light(env, background) else "dark"]
 
 
 def shell_quote(s: str) -> str:
@@ -2716,7 +2842,7 @@ class App(object):
             sessions: All sessions to browse.
             query: Initial filter text.
             source: Initial source filter: "all" (default), "claude" or "codex".
-            background: Terminal background (r, g, b) used to pick the row stripe color, or None.
+            background: Terminal background (r, g, b) for the Theme (row stripe, palette), or None.
 
         Example: App(scr, sessions, "fix", "claude") -> .view holds the Claude sessions matching
         "fix", newest first; .sel == 0; .sort == "last"; .split is None (layout chosen by width)
@@ -2725,7 +2851,7 @@ class App(object):
         self.all = sessions
         self.query = query
         self.source = source
-        self.background = background
+        self.theme = Theme(background)
         self.project: Optional[str] = None
         self.sort = "last"
         self.show_results = False
@@ -2749,116 +2875,11 @@ class App(object):
 
     # -- setup
     def init_colors(self) -> None:
-        """Fill self.attrs (name -> curses attribute) and hide the cursor. Uses color pairs when the
-        terminal has colors; otherwise (or on curses errors) it keeps the bold/dim/reverse fallbacks.
+        """Fill self.attrs from the theme (see Theme.curses_attrs) and hide the cursor.
 
-        With the "claude" theme on a 256-color terminal (see pick_palette) the colors come from
-        Claude Code's palette; otherwise the original 8-color look is used. Besides the kind
-        names (title, meta, dim, user, asst, tool, result, hl, head, and "prompt" in the claude
-        theme only) it holds the Markdown row kinds heading, code, quote and table and the inline
-        style attributes bold, italic (underline where curses has no A_ITALIC), code and link
-        (dim is shared); "code" is cyan in the basic theme and the palette's code color in the
-        claude theme, and monochrome terminals fall back to bold, dim and underline. It also holds the session-list row variants: cc, cx, star,
-        dim for plain rows and the same with a "stripe_" or "sel_" prefix (plus bare "stripe" / "sel" for the row's
-        own background) for every other row and the selected row.
-
-        Example: on a basic color terminal -> self.attrs["cc"] == color_pair(1) | A_BOLD and
-        self.attrs["sel"] == A_REVERSE; on a 256-color one, self.attrs["sel"] is the select_fg
-        color on the select_bg color and "prompt" is the grey band behind your messages;
-        on a monochrome one -> self.attrs["cc"] == A_BOLD and self.attrs["hl"] == A_REVERSE | A_BOLD
+        Example: on a basic color terminal -> self.attrs["sel"] == A_REVERSE
         """
-        has_italic = hasattr(curses, "A_ITALIC")  # Python 3.7+ only
-        italic = getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
-        attrs: Dict[str, int] = {"plain": 0, "dim": curses.A_DIM, "bold": curses.A_BOLD, "rev": curses.A_REVERSE,
-             "cc": curses.A_BOLD, "cx": curses.A_UNDERLINE, "user": curses.A_BOLD,
-             "asst": curses.A_BOLD, "hl": curses.A_REVERSE | curses.A_BOLD,
-             "title": curses.A_BOLD, "tool": curses.A_DIM, "result": curses.A_DIM,
-             "meta": 0, "head": curses.A_REVERSE, "star": curses.A_BOLD,
-             # Markdown: row kinds (heading, code, quote, table) and inline span styles
-             # (bold, italic, code, link; dim is shared with the kind above).
-             "italic": italic, "code": curses.A_BOLD, "link": curses.A_UNDERLINE,
-             "heading": curses.A_BOLD, "quote": curses.A_DIM | (italic if has_italic else 0),
-             "table": 0}
-        try:
-            if curses.has_colors():
-                curses.start_color()
-                try:
-                    curses.use_default_colors()
-                    bg = fg = -1
-                except curses.error:
-                    bg, fg = curses.COLOR_BLACK, curses.COLOR_WHITE
-                palette = pick_palette(curses.COLORS, background=self.background)
-                next_pair = [1]  # pair numbers are handed out in order; 0 is the terminal default
-
-                def pair(f: int, b: int) -> int:
-                    """Allocate the next color pair (f on b) and return its attribute; 0 when
-                    the terminal has no pairs left. Example: pair(2, -1) -> color_pair(1)."""
-                    if next_pair[0] >= curses.COLOR_PAIRS:
-                        return 0
-                    curses.init_pair(next_pair[0], f, b)
-                    next_pair[0] += 1
-                    return curses.color_pair(next_pair[0] - 1)
-
-                def row_set(prefix: str, row_bg: int, base: int, cc: int, cx: int,
-                            star: int, dim: int) -> None:
-                    """Store the list-row attributes for one row background: attrs[prefix] (the
-                    row itself) and prefix_cc / _cx / _star / _dim, each fg on row_bg.
-                    Example: row_set("sel", 239, base_fg, 173, 74, 214, 246)."""
-                    attrs[prefix] = pair(base, row_bg)
-                    attrs[prefix + "_cc"] = pair(cc, row_bg) | curses.A_BOLD
-                    attrs[prefix + "_cx"] = pair(cx, row_bg) | curses.A_BOLD
-                    attrs[prefix + "_star"] = pair(star, row_bg) | curses.A_BOLD
-                    attrs[prefix + "_dim"] = pair(dim, row_bg)
-
-                stripe = stripe_color(curses.COLORS, background=self.background)
-                if palette is None:
-                    attrs["cc"] = pair(curses.COLOR_GREEN, bg) | curses.A_BOLD
-                    attrs["cx"] = pair(curses.COLOR_MAGENTA, bg) | curses.A_BOLD
-                    attrs["user"] = pair(curses.COLOR_GREEN, bg) | curses.A_BOLD
-                    attrs["asst"] = pair(curses.COLOR_CYAN, bg) | curses.A_BOLD
-                    attrs["hl"] = pair(curses.COLOR_BLACK, curses.COLOR_YELLOW)
-                    attrs["tool"] = pair(curses.COLOR_YELLOW, bg)
-                    attrs["head"] = pair(curses.COLOR_WHITE, curses.COLOR_BLUE) | curses.A_BOLD
-                    attrs["code"] = pair(curses.COLOR_CYAN, bg)
-                    attrs["star"] = pair(curses.COLOR_YELLOW, bg) | curses.A_BOLD
-                    # Shaded variants for every other session-list row, so long rows are easy
-                    # to follow across a wide screen.
-                    if stripe is not None:
-                        row_set("stripe", stripe, fg, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
-                                curses.COLOR_YELLOW, fg)
-                        attrs["stripe_dim"] |= curses.A_DIM
-                else:
-                    p = palette
-                    secondary = pair(p["secondary"], bg)
-                    attrs["cc"] = pair(p["brand"], bg) | curses.A_BOLD
-                    attrs["cx"] = pair(p["codex"], bg) | curses.A_BOLD
-                    attrs["user"] = curses.A_BOLD
-                    attrs["asst"] = attrs["cc"]
-                    attrs["title"] = curses.A_BOLD
-                    attrs["meta"] = attrs["dim"] = attrs["result"] = secondary
-                    attrs["tool"] = pair(p["tool"], bg)
-                    attrs["star"] = pair(p["star"], bg) | curses.A_BOLD
-                    attrs["hl"] = pair(p["hl_fg"], p["hl_bg"])
-                    attrs["head"] = pair(fg, p["head_bg"]) | curses.A_BOLD
-                    attrs["prompt"] = pair(fg, p["prompt_bg"])
-                    attrs["code"] = pair(p["code"], bg)
-                    attrs["quote"] = secondary | (italic if has_italic else 0)
-                    if stripe is not None:
-                        row_set("stripe", stripe, fg, p["brand"], p["codex"], p["star"], p["secondary"])
-                    row_set("sel", p["select_bg"], p["select_fg"], p["brand"], p["codex"],
-                            p["star"], p["secondary"])
-                    attrs["sel"] |= curses.A_BOLD
-        except curses.error:
-            pass
-        # Without a stripe color, odd rows look like the even ones.
-        attrs.setdefault("stripe", 0)
-        for name in ("cc", "cx", "star", "dim"):
-            attrs.setdefault("stripe_" + name, attrs[name])
-        # The basic theme (and any failure above) marks the selected row with reverse video.
-        attrs.setdefault("sel", curses.A_REVERSE)
-        for name in ("cc", "cx", "star", "dim"):
-            attrs.setdefault("sel_" + name, attrs[name] | curses.A_REVERSE)
-        self.attrs = attrs
+        self.attrs = self.theme.curses_attrs()
         try:
             curses.curs_set(0)
         except curses.error:
@@ -3162,7 +3183,7 @@ class App(object):
     def draw_list(self, box: Box, pat: Optional[Pattern[str]]) -> None:
         """Draw the session rows into box, scrolling so the selection stays visible. Each row is
         "date  star  tag  project  title", with the selected row highlighted (reverse video in the basic theme), every other row on a
-        slightly different background (stripe_color), and filter matches highlighted.
+        slightly different background (Theme.stripe), and filter matches highlighted.
 
         Args:
             box: The (y, x, height, width) region to draw in.
@@ -3190,8 +3211,8 @@ class App(object):
             s = self.view[idx]
             y = y0 + i
             cur = idx == self.sel
-            # Every other row gets a slightly different background (see stripe_color);
-            # the selected row uses the "sel" attributes (see init_colors).
+            # Every other row gets a slightly different background (see Theme.stripe);
+            # the selected row uses the "sel" attributes (see Theme.curses_attrs).
             striped = idx % 2 == 1 and not cur
             row = "sel" if cur else ("stripe" if striped else "plain")
             pre = "" if row == "plain" else row + "_"  # attrs key prefix: "cc" vs "sel_cc"
@@ -4058,7 +4079,7 @@ def run_tui(query: str, source: Optional[str] = None) -> int:
     # Ask the terminal for its background before curses starts (it would swallow the reply).
     background = None
     if not (os.environ.get("AI_SESSIONS_STRIPE") or "").strip():
-        background = query_terminal_background()
+        background = Theme.query_background()
     try:
         chosen, argv_override = curses.wrapper(browse, sessions, query, source or "all", background)
     except KeyboardInterrupt:

@@ -50,7 +50,8 @@ One executable script (no `.py` suffix), in layers:
    `quote` and `table` kinds; user prompts, tool rows and results are not parsed.
 4. **TUI**: `App` (session list plus preview) and `Viewer` (full-screen transcript) share
    one curses window. Resuming goes through `Source.resume_argv`, configured by
-   `AI_SESSIONS_*_CMD`.
+   `AI_SESSIONS_*_CMD`. `Theme` owns every color decision (terminal background detection,
+   row stripe, palette) and builds the curses attribute table (`curses_attrs`) for `App`.
 
 Tests import the script with `SourceFileLoader`. They point every directory env var at temp
 dirs and drive the TUI with a `FakeScr` key script, so no real terminal is needed. The
