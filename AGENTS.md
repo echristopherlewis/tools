@@ -41,7 +41,8 @@ One executable script (no `.py` suffix), in layers:
    writing); they are applied in `INDEX.load` as `Session.starred`, not cached. The
    `skills/star-session` skill (Claude Code and Codex) calls `ai-sessions --star` /
    `--unstar` / `--star-status`, which find the current session via `CODEX_THREAD_ID` /
-   `CLAUDE_CODE_SESSION_ID`.
+   `CLAUDE_CODE_SESSION_ID`. `SessionFilter` (query, source, project, starred-only, sort) says
+   which sessions the list shows and in what order; `App.filter` and `cmd_list` both use it.
 3. **Output**: `cmd_list` / `cmd_show` for plain text; `render` builds the transcript
    lines that `--show` and the TUI both use. A `Line` is `(text, kind, spans)`, where `spans`
    are `(start, end, style)` character offsets for inline styles (`Screen.text` draws them).

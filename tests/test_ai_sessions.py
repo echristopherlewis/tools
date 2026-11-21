@@ -359,13 +359,13 @@ class LoadSessions(Env):
     def test_filter_and_sort(self) -> None:
         ss = list(self.sessions().values())
         ids = lambda xs: sorted(s.id for s in xs)  # noqa: E731
-        self.assertEqual(ids(ai.filter_sessions(ss, "QUOKKA")), [X_ID])   # case-insensitive
-        self.assertEqual(ids(ai.filter_sessions(ss, "beta charlie")), [C_ID])  # ANDed terms
-        self.assertEqual(ids(ai.filter_sessions(ss, "", "codex")), sorted([X_ID, Y_ID]))
-        self.assertEqual(ids(ai.filter_sessions(ss, "", "all", "/work/beta")), sorted([C_ID, D_ID]))
-        self.assertEqual(ai.filter_sessions(ss, "zzzz-nothing"), [])
-        self.assertEqual(ids(ai.filter_sessions(ss, "zebra")), [A_ID])  # transcript text
-        self.assertEqual([s.id for s in ai.sort_sessions(ss)],
+        self.assertEqual(ids(ai.SessionFilter("QUOKKA").select(ss)), [X_ID])   # case-insensitive
+        self.assertEqual(ids(ai.SessionFilter("beta charlie").select(ss)), [C_ID])  # ANDed terms
+        self.assertEqual(ids(ai.SessionFilter("", "codex").select(ss)), sorted([X_ID, Y_ID]))
+        self.assertEqual(ids(ai.SessionFilter("", "all", "/work/beta").select(ss)), sorted([C_ID, D_ID]))
+        self.assertEqual(ai.SessionFilter("zzzz-nothing").select(ss), [])
+        self.assertEqual(ids(ai.SessionFilter("zebra").select(ss)), [A_ID])  # transcript text
+        self.assertEqual([s.id for s in ai.SessionFilter().sorted(ss)],
                          [D_ID, Y_ID, C_ID, X_ID, B_ID, A_ID])
 
 
@@ -513,9 +513,9 @@ class Stars(Env):
         ai.STARS.set(B_ID, True)
         ai.STARS.set(X_ID, True)
         ss = list(self.sessions().values())
-        self.assertEqual(sorted(s.id for s in ai.filter_sessions(ss, starred_only=True)), [X_ID, B_ID])
-        self.assertEqual([s.id for s in ai.filter_sessions(ss, source="codex", starred_only=True)], [X_ID])
-        self.assertEqual(len(ai.filter_sessions(ss)), 6)
+        self.assertEqual(sorted(s.id for s in ai.SessionFilter(starred_only=True).select(ss)), [X_ID, B_ID])
+        self.assertEqual([s.id for s in ai.SessionFilter(source="codex", starred_only=True).select(ss)], [X_ID])
+        self.assertEqual(len(ai.SessionFilter().select(ss)), 6)
 
     def test_current_session_id(self) -> None:
         both = {"CODEX_THREAD_ID": "cx", "CLAUDE_CODE_SESSION_ID": "cc"}
@@ -1194,25 +1194,25 @@ class Tui(Env):
 
     def test_filter_enter_and_esc(self) -> None:
         app = self.run_keys(["/"] + list("quokka") + ["\n", "q"])
-        self.assertEqual(app.query, "quokka")
+        self.assertEqual(app.filter.query, "quokka")
         self.assertEqual([s.id for s in app.view], [X_ID])
         self.assertTrue(self.scr.any_frame("filter: /quokka"))
         app = self.run_keys(["/"] + list("quokka") + ["\n", "\x1b", "q"])
-        self.assertEqual(app.query, "")
+        self.assertEqual(app.filter.query, "")
         self.assertEqual(len(app.view), 6)
 
     def test_filter_live_and_edit_keys(self) -> None:
         app = self.make(["/", "w", "a", "l", "x", "\x7f", "r", "\n", "q"])
         app.run()
-        self.assertEqual(app.query, "walr")
+        self.assertEqual(app.filter.query, "walr")
         self.assertEqual([s.id for s in app.view], [Y_ID])
         app = self.run_keys(["/", "z", "z", "\x15", "b", "r", "a", "v", "o", "\n", "q"])
-        self.assertEqual(app.query, "bravo")
+        self.assertEqual(app.filter.query, "bravo")
         self.assertEqual([s.id for s in app.view], [B_ID])
 
     def test_filter_cancel_with_esc_clears(self) -> None:
         app = self.run_keys(["/"] + list("beta") + ["\x1b", "q"])
-        self.assertEqual(app.query, "")
+        self.assertEqual(app.filter.query, "")
         self.assertEqual(len(app.view), 6)
 
     def test_filter_terms_anded(self) -> None:
@@ -1221,29 +1221,29 @@ class Tui(Env):
 
     def test_tab_cycles_source(self) -> None:
         app = self.run_keys(["\t", "q"])
-        self.assertEqual((app.source, len(app.view)), ("claude", 4))
+        self.assertEqual((app.filter.source, len(app.view)), ("claude", 4))
         app = self.run_keys(["\t", "\t", "q"])
-        self.assertEqual((app.source, len(app.view)), ("codex", 2))
+        self.assertEqual((app.filter.source, len(app.view)), ("codex", 2))
         app = self.run_keys(["\t", "\t", "\t", "q"])
-        self.assertEqual((app.source, len(app.view)), ("all", 6))
+        self.assertEqual((app.filter.source, len(app.view)), ("all", 6))
         self.assertTrue(self.scr.any_frame("filter: none"))
 
     def test_project_toggle(self) -> None:
         app = self.run_keys(["p", "q"])
-        self.assertEqual(app.project, "/work/beta")
+        self.assertEqual(app.filter.project, "/work/beta")
         self.assertEqual([s.id for s in app.view], [D_ID, C_ID])
         self.assertTrue(self.scr.any_frame("project=beta"))
         app = self.run_keys(["p", "p", "q"])
-        self.assertIsNone(app.project)
+        self.assertIsNone(app.filter.project)
         self.assertEqual(len(app.view), 6)
 
     def test_sort_toggle_keeps_selection(self) -> None:
         app = self.run_keys(["j", "j", "j", "s", "q"])
-        self.assertEqual(app.sort, "start")
+        self.assertEqual(app.filter.sort, "start")
         self.assertEqual(app.current().id, X_ID)  # selection follows the session
         self.assertTrue(self.scr.any_frame("sort: start time"))
         app = self.run_keys(["s", "s", "q"])
-        self.assertEqual(app.sort, "last")
+        self.assertEqual(app.filter.sort, "last")
 
     def test_toggles_show_in_header_and_status(self) -> None:
         app = self.run_keys(["t", "u", "q"])

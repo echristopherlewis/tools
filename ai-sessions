@@ -1946,61 +1946,134 @@ class SessionIndex(object):
 INDEX = SessionIndex()
 
 
-def filter_sessions(sessions: List[Session], query: str = "", source: str = "all",
-                    project: Optional[str] = None, starred_only: bool = False) -> List[Session]:
-    """Sessions matching source ("all"/"claude"/"codex"), exact project cwd, starred, and query.
+class SessionFilter(object):
+    """Which sessions the list shows and in what order: a search query, a source, a project,
+    a starred-only switch, and a sort mode."""
 
-    The query is split on whitespace; every term must appear (case-insensitive
-    substring) in the session's title, project, cwd or transcript text.
+    def __init__(self, query: str = "", source: str = "all", project: Optional[str] = None,
+                 starred_only: bool = False, sort: str = "last") -> None:
+        """
+        Args:
+            query: Whitespace-separated terms; all must match. "" matches everything.
+            source: "all", "claude" or "codex".
+            project: Exact working directory to require, or None for any.
+            starred_only: True to keep only starred sessions.
+            sort: "last" sorts by last activity; any other value sorts by start time.
 
-    Args:
-        sessions: The sessions to filter.
-        query: Whitespace-separated terms; all must match. "" matches everything.
-        source: "all", "claude" or "codex".
-        project: Exact working directory to require, or None for any.
-        starred_only: True to keep only starred sessions.
+        Example: SessionFilter("fix", "claude") -> .query == "fix", .project is None, .sort == "last"
+        """
+        self.query = query
+        self.source = source
+        self.project = project
+        self.starred_only = starred_only
+        self.sort = sort
 
-    Returns:
-        The matching sessions, in their original order.
+    def terms(self) -> List[str]:
+        """The query's lowercase search terms.
 
-    Examples (sessions A = claude "Fix bug" in /work/proj, B = codex "Add tests" in /work/other):
-        filter_sessions([A, B], "fix") -> [A]
-        filter_sessions([A, B], "", source="codex") -> [B]
-        filter_sessions([A, B], "", project="/work/proj") -> [A]
-        filter_sessions([A, B], "", starred_only=True) -> [B] if only B is starred
-    """
-    terms = terms_of(query)
-    out: List[Session] = []
-    for s in sessions:
-        if source != "all" and s.source != source:
-            continue
-        if project is not None and s.cwd != project:
-            continue
-        if starred_only and not s.starred:
-            continue
+        Example: SessionFilter("Foo  BAR").terms() -> ["foo", "bar"]
+        """
+        return terms_of(self.query)
+
+    def regex(self) -> Optional[Pattern[str]]:
+        """A regex matching any query term (for highlighting), or None when there are none.
+
+        Example: SessionFilter("fo foobar").regex().pattern -> "foobar|fo"; SessionFilter().regex() -> None
+        """
+        return term_regex(self.terms())
+
+    def matches(self, s: Session, terms: Optional[List[str]] = None) -> bool:
+        """Whether one session passes the source, project, starred and query filters.
+
+        The query terms must all appear (case-insensitive substring) in the session's title,
+        project, cwd or transcript text.
+
+        Args:
+            s: The session to test.
+            terms: Precomputed self.terms(), to avoid recomputing them per session; None to compute.
+
+        Returns:
+            True if the session should be listed.
+
+        Examples (A = claude "Fix bug" in /work/proj, B = codex "Add tests" in /work/other):
+            SessionFilter("fix").matches(A) -> True; SessionFilter("fix").matches(B) -> False
+            SessionFilter(source="codex").matches(A) -> False
+        """
+        if self.source != "all" and s.source != self.source:
+            return False
+        if self.project is not None and s.cwd != self.project:
+            return False
+        if self.starred_only and not s.starred:
+            return False
+        if terms is None:
+            terms = self.terms()
         if terms and not all(t in s.search_text for t in terms):
-            continue
-        out.append(s)
-    return out
+            return False
+        return True
 
+    def select(self, sessions: List[Session]) -> List[Session]:
+        """The sessions that match, in their original order.
 
-def sort_sessions(sessions: List[Session], mode: str = "last") -> List[Session]:
-    """Newest first, by last activity (mode "last") or by start time (any other mode, e.g. "start").
+        Args:
+            sessions: The sessions to filter.
 
-    Args:
-        sessions: The sessions to sort.
-        mode: "last" (default) sorts by last activity; any other value sorts by start time.
+        Returns:
+            The matching sessions.
 
-    Returns:
-        A new list, newest first.
+        Examples (A = claude "Fix bug" in /work/proj, B = codex "Add tests" in /work/other):
+            SessionFilter("fix").select([A, B]) -> [A]
+            SessionFilter(source="codex").select([A, B]) -> [B]
+            SessionFilter(project="/work/proj").select([A, B]) -> [A]
+            SessionFilter(starred_only=True).select([A, B]) -> [B] if only B is starred
+        """
+        terms = self.terms()
+        return [s for s in sessions if self.matches(s, terms)]
 
-    Example: A(first_ts=1, last_ts=2), B(first_ts=5, last_ts=3):
-        sort_sessions([A, B]) -> [B, A]; sort_sessions([A, B], "start") -> [B, A]
-        with B(first_ts=0, last_ts=3): sort_sessions([A, B], "start") -> [A, B]
-    """
-    key: Callable[[Session], float] = (
-        (lambda s: s.last_ts) if mode == "last" else (lambda s: s.first_ts))
-    return sorted(sessions, key=key, reverse=True)
+    def sorted(self, sessions: List[Session]) -> List[Session]:
+        """Newest first, by last activity (sort "last") or by start time (any other sort).
+
+        Args:
+            sessions: The sessions to sort.
+
+        Returns:
+            A new list, newest first.
+
+        Example: A(first_ts=1, last_ts=2), B(first_ts=5, last_ts=3):
+            SessionFilter().sorted([A, B]) -> [B, A]; SessionFilter(sort="start").sorted([A, B]) -> [B, A]
+            with B(first_ts=0, last_ts=3): SessionFilter(sort="start").sorted([A, B]) -> [A, B]
+        """
+        key: Callable[[Session], float] = (
+            (lambda s: s.last_ts) if self.sort == "last" else (lambda s: s.first_ts))
+        return sorted(sessions, key=key, reverse=True)
+
+    def apply(self, sessions: List[Session]) -> List[Session]:
+        """The matching sessions, sorted: self.sorted(self.select(sessions)).
+
+        Example: SessionFilter("fix").apply([A, B]) -> [A] (B filtered out, the rest sorted)
+        """
+        return self.sorted(self.select(sessions))
+
+    def describe(self) -> List[str]:
+        """The active filters as short header-bar parts, in a fixed order.
+
+        Returns:
+            Parts such as ["source=Codex", "project=proj", "starred", "/fix"]; [] with no filters.
+
+        Examples:
+            SessionFilter() -> []
+            SessionFilter("fix", "claude", "/work/proj") -> ["source=Claude Code", "project=proj", "/fix"]
+            SessionFilter("fix", starred_only=True) -> ["starred", "/fix"]
+        """
+        parts: List[str] = []
+        if self.source != "all":
+            parts.append("source=" + SOURCES[self.source].label)
+        if self.project is not None:
+            parts.append("project=" + (os.path.basename(self.project.rstrip("/")) or "-"))
+        if self.starred_only:
+            parts.append("starred")
+        if self.query:
+            parts.append("/" + self.query)
+        return parts
 
 
 # ---------------------------------------------------------------- markdown
@@ -3125,18 +3198,14 @@ class App(object):
             background: Terminal background (r, g, b) for the Theme (row stripe, palette), or None.
 
         Example: App(scr, sessions, "fix", "claude") -> .view holds the Claude sessions matching
-        "fix", newest first; .sel == 0; .sort == "last"; .split is None (layout chosen by width)
+        "fix", newest first; .sel == 0; .filter.sort == "last"; .split is None (layout chosen by width)
         """
         self.screen = Screen(scr)
         self.all = sessions
-        self.query = query
-        self.source = source
+        self.filter = SessionFilter(query, source)
         self.theme = Theme(background)
-        self.project: Optional[str] = None
-        self.sort = "last"
         self.show_results = False
         self.mine_only = False
-        self.starred_only = False
         self.split: Optional[str] = None  # "side" / "stack" / "list"; None: by terminal width
         self.sel = 0
         self.top = 0
@@ -3177,8 +3246,7 @@ class App(object):
         view == [C], sel == 0; with keep=False after a filter change -> sel == 0.
         """
         cur = self.view[self.sel].path if (keep and self.view and self.sel < len(self.view)) else None
-        v = filter_sessions(self.all, self.query, self.source, self.project, self.starred_only)
-        self.view = sort_sessions(v, self.sort)
+        self.view = self.filter.apply(self.all)
         self.sel = 0
         if cur:
             for i, s in enumerate(self.view):
@@ -3201,15 +3269,7 @@ class App(object):
             source "claude", project "/work/proj", query "fix" -> "source=Claude Code project=proj /fix"
             starred_only with query "fix" -> "starred /fix"
         """
-        parts: List[str] = []
-        if self.source != "all":
-            parts.append("source=" + SOURCES[self.source].label)
-        if self.project is not None:
-            parts.append("project=" + (os.path.basename(self.project.rstrip("/")) or "-"))
-        if self.starred_only:
-            parts.append("starred")
-        if self.query:
-            parts.append("/" + self.query)
+        parts = self.filter.describe()
         return " ".join(parts) if parts else "none"
 
     # -- layout
@@ -3261,12 +3321,12 @@ class App(object):
             self.screen.put(0, 0, clip("terminal too small", max(w - 1, 1)))
             scr.refresh()
             return
-        pat = term_regex(terms_of(self.query))
+        pat = self.filter.regex()
         total = len(self.all)
         self.screen.fill(0, self.screen.attrs["head"])
         hdr = " ai-sessions  %d/%d sessions  filter: %s  sort: %s%s" % (
             len(self.view), total, self.filter_desc(),
-            "last activity" if self.sort == "last" else "start time",
+            "last activity" if self.filter.sort == "last" else "start time",
             "  [results]" if self.show_results else "") + ("  [mine]" if self.mine_only else "")
         self.screen.put(0, 0, clip(hdr, w - 1), self.screen.attrs["head"])
         lay = self.layout()
@@ -3325,7 +3385,7 @@ class App(object):
                 self.screen.put(y, x0, " " * (bw - 1), extra)
             tag_attr = self.screen.attrs[pre + ("cc" if s.source == "claude" else "cx")]
             x = x0
-            self.screen.put(y, x, fmt_ts(s.last_ts if self.sort == "last" else s.first_ts), self.screen.attrs[pre + "dim"])
+            self.screen.put(y, x, fmt_ts(s.last_ts if self.filter.sort == "last" else s.first_ts), self.screen.attrs[pre + "dim"])
             x += DATE_COL_WIDTH
             if s.starred:
                 self.screen.put(y, x, "*", self.screen.attrs[pre + "star"])
@@ -3377,7 +3437,7 @@ class App(object):
         s = self.current()
         if s is None or bh < 1 or bw < 12:
             return
-        terms = terms_of(self.query)
+        terms = self.filter.terms()
         lines, start, hits = self.preview_lines(s, bw - 1, terms)
         selkey = (s.path, tuple(terms), self.show_results, self.mine_only)
         if selkey != self._preview_scroll_key:
@@ -3476,8 +3536,8 @@ class App(object):
 
         Example: query "fix" -> query == "" and the view shows all sessions again.
         """
-        if self.query:
-            self.query = ""
+        if self.filter.query:
+            self.filter.query = ""
             self.refilter()
 
     def on_cycle_source(self) -> None:
@@ -3486,7 +3546,7 @@ class App(object):
         Example: source "claude" -> source "codex"; source "codex" -> "all"
         """
         order = ["all"] + [s.key for s in SOURCE_LIST]
-        self.source = order[(order.index(self.source) + 1) % len(order)]
+        self.filter.source = order[(order.index(self.filter.source) + 1) % len(order)]
         self.refilter()
 
     def on_toggle_project(self) -> None:
@@ -3496,10 +3556,10 @@ class App(object):
         pressed again -> project is None. A selected session with no cwd leaves project None.
         """
         s = self.current()
-        if self.project is not None:
-            self.project = None
+        if self.filter.project is not None:
+            self.filter.project = None
         elif s is not None and s.cwd:
-            self.project = s.cwd
+            self.filter.project = s.cwd
         self.refilter()
 
     def on_toggle_sort(self) -> None:
@@ -3507,7 +3567,7 @@ class App(object):
 
         Example: sort "last" -> sort "start" -> sort "last"
         """
-        self.sort = "start" if self.sort == "last" else "last"
+        self.filter.sort = "start" if self.filter.sort == "last" else "last"
         self.refilter()
 
     def on_toggle_split(self) -> None:
@@ -3545,9 +3605,9 @@ class App(object):
 
         Example: starred_only False -> True and the view holds just the starred sessions
         """
-        self.starred_only = not self.starred_only
+        self.filter.starred_only = not self.filter.starred_only
         self.refilter()
-        self.status = " showing %s" % ("only starred sessions" if self.starred_only else "all sessions")
+        self.status = " showing %s" % ("only starred sessions" if self.filter.starred_only else "all sessions")
 
     def toggle_star(self, s: Session) -> None:
         """Flip the star on s: write stars.json, update s.starred and report in the status line.
@@ -3568,7 +3628,7 @@ class App(object):
             return
         s.starred = on
         self.status = " %s: %s" % ("starred" if on else "unstarred", s.title)
-        if self.starred_only and not on:
+        if self.filter.starred_only and not on:
             self.refilter()
 
     def on_star(self) -> None:
@@ -3776,10 +3836,10 @@ class App(object):
         typing "fix" then Esc -> query == "" and the full list returns.
         """
         def live(b: str) -> None:
-            self.query = b
+            self.filter.query = b
             self.refilter()
-        buf, ok = self.screen.prompt("/", self.query, live, redraw=self.draw)
-        self.query = buf if ok else ""  # Esc clears the filter rather than restoring it
+        buf, ok = self.screen.prompt("/", self.filter.query, live, redraw=self.draw)
+        self.filter.query = buf if ok else ""  # Esc clears the filter rather than restoring it
         self.refilter()
 
     def viewer(self, s: Session) -> bool:
@@ -3814,14 +3874,14 @@ class Viewer(object):
             app: The App whose window, colors and settings are shared.
             s: The session to show.
 
-        Example: Viewer(app, s) with app.query == "fix" -> .query == "fix", .offset == 0,
+        Example: Viewer(app, s) with app.filter.query == "fix" -> .query == "fix", .offset == 0,
         .hit_index == -1, .msgs == INDEX.transcript(s)
         """
         self.app = app
         self.screen = app.screen
         self.session = s
         self.msgs = INDEX.transcript(s)
-        self.query = app.query
+        self.query = app.filter.query
         self.offset = 0          # first visible line
         self.hit_index = -1      # current search hit (-1: none chosen yet)
         self.body_height = 1     # visible rows, set by draw()
@@ -4150,7 +4210,7 @@ def cmd_list(sessions: List[Session], query: str, source: Optional[str],
 
     Example: stdout gets "2025-03-01 10:00\\tclaude\\ta1\\tproj\\tFix bug\\n" for a1.
     """
-    for s in sort_sessions(filter_sessions(sessions, query, source or "all", None, starred_only)):
+    for s in SessionFilter(query, source or "all", starred_only=starred_only).apply(sessions):
         row = (fmt_ts(s.last_ts), s.source, s.id, s.project, s.title)
         sys.stdout.write("\t".join(one_line(c) for c in row) + "\n")
     return 0
