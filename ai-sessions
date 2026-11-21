@@ -2893,11 +2893,11 @@ class KeyBinding(NamedTuple):
     where: Tuple[str, ...]
 
 
-# Help section headings (padded on purpose so the heading bar spans the screen).
+# Help section headings (Screen.show_help pads them into equal-width bands).
 SECTION_TITLES: Dict[str, str] = {
-    "list": "Session list                                                  ",
-    "viewer": "Viewer                                                          ",
-    "both": "Both                                                            ",
+    "list": "Session list",
+    "viewer": "Viewer",
+    "both": "Both",
 }
 
 _LIST = ("list",)
@@ -3257,6 +3257,10 @@ class Screen(object):
         "  /              filter (terms ANDed)", and returns when the user presses "x".
         """
         rows = help_lines()
+        # Every section heading is drawn as a band as wide as the widest row in the help
+        # (a key row spans from the heading's column to the end of its description).
+        band = max(2 + HELP_KEY_WIDTH + str_width(text) if kind == "key" else str_width(text)
+                   for kind, _keys, text in rows if kind in ("key", "section"))
         top = 0
         while True:
             self.scr.erase()
@@ -3267,7 +3271,7 @@ class Screen(object):
                 if kind == "title":
                     self.put(y, 1, clip(text, w - 2), self.attrs["bold"])
                 elif kind == "section":
-                    self.put(y, 1, clip(text, w - 2), self.attrs["head"])
+                    self.put(y, 1, pad(text, min(band, w - 2)), self.attrs["head"])
                 elif kind == "key":
                     self.put(y, 3, clip(keys, w - 4), self.attrs["asst"])
                     if w > 3 + HELP_KEY_WIDTH:
