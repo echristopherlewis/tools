@@ -725,14 +725,14 @@ class Units(unittest.TestCase):
 
     def test_summarize_tool_and_content_text(self) -> None:
         # TOOL_KEYS order decides which argument is shown ("path" before "pattern")
-        self.assertEqual(ai.summarize_tool("Grep", {"pattern": "foo", "path": "/x"}), "Grep: /x")
-        self.assertEqual(ai.summarize_tool("Bash", {"command": "echo hi"}), "Bash: echo hi")
-        self.assertEqual(ai.summarize_tool("sh", '{"cmd": ["ls", "-l"]}'), "sh: ls -l")
-        self.assertEqual(ai.summarize_tool("raw", "just text\nsecond"), "raw: just text")
-        self.assertEqual(ai.summarize_tool(None, None), "tool")
-        self.assertEqual(ai.content_text("s"), "s")
-        self.assertEqual(ai.content_text([{"type": "text", "text": "a"}, "b", {"x": 1}]), "a\nb")
-        self.assertEqual(ai.content_text(None), "")
+        self.assertEqual(ai.Source.summarize_tool("Grep", {"pattern": "foo", "path": "/x"}), "Grep: /x")
+        self.assertEqual(ai.Source.summarize_tool("Bash", {"command": "echo hi"}), "Bash: echo hi")
+        self.assertEqual(ai.Source.summarize_tool("sh", '{"cmd": ["ls", "-l"]}'), "sh: ls -l")
+        self.assertEqual(ai.Source.summarize_tool("raw", "just text\nsecond"), "raw: just text")
+        self.assertEqual(ai.Source.summarize_tool(None, None), "tool")
+        self.assertEqual(ai.Source.content_text("s"), "s")
+        self.assertEqual(ai.Source.content_text([{"type": "text", "text": "a"}, "b", {"x": 1}]), "a\nb")
+        self.assertEqual(ai.Source.content_text(None), "")
 
     def test_shell_quote(self) -> None:
         self.assertEqual(ai.shell_quote("abc-1/x.y"), "abc-1/x.y")

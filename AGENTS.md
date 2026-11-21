@@ -29,7 +29,8 @@ One executable script (no `.py` suffix), in layers:
    `title_overrides`, `resume_template` and `resume_argv`. `Source.parse` turns a JSONL
    transcript into a `Summary` (index entry) and a list of `Msg` dicts; the type comments
    near the top of the script define both. Injected harness messages are dropped via each
-   source's `NOISE`. Shared helpers (`iter_json`, `make_summary`, ...) stay module-level.
+   source's `NOISE`. Shared helpers (`iter_json`, `make_summary`, ...) are static/instance
+   methods on `Source`.
    Adding a tool means adding a `Source` subclass and putting an instance in `SOURCE_LIST`.
 2. **Index**: `SessionIndex` (singleton `INDEX`) caches summaries in
    `$XDG_CACHE_HOME/ai-sessions/index.json` (`INDEX.load()`), keyed by path and invalidated
