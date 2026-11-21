@@ -42,8 +42,9 @@ Environment:
 
 ## Starring
 
-In the browser, `*` stars or unstars the selected session (or the open one in
-the viewer) and `S` shows only starred sessions; starred rows show a `*` before
+In the browser, `*` (or `8`, its unshifted key) stars or unstars the selected
+session (or the open one in the viewer) and `S` shows only starred sessions;
+starred rows show a `*` before
 the `CC` / `CX` tag. From the command line use `--star ID` / `--unstar ID`; each
 prints one line (`starred claude <id> <title>`) and exits 1 if the ID matches
 nothing or the file cannot be written. `--star-status ID` prints

@@ -1288,6 +1288,13 @@ class Tui(Env):
         app = self.run_keys(["*", "q"])
         self.assertEqual(sorted(ai.read_stars()), sorted([A_ID, D_ID]))
 
+    def test_eight_stars_like_asterisk(self) -> None:
+        app = self.run_keys(["8", "j", "8", "8", "q"])
+        self.assertEqual(sorted(ai.read_stars()), [D_ID])
+        app = self.run_keys(["\n", "8", "q", "q"])
+        self.assertEqual(sorted(ai.read_stars()), [])
+        self.assertFalse(app.view[0].starred)
+
     def test_star_in_viewer(self) -> None:
         app = self.run_keys(["\n", "*", "q", "q"])
         self.assertEqual(sorted(ai.read_stars()), [D_ID])
@@ -1297,7 +1304,7 @@ class Tui(Env):
 
     def test_help_mentions_star_keys(self) -> None:
         keys = [k for _, ks in ai.HELP for k, _ in ks]
-        self.assertEqual(keys.count("*"), 2)
+        self.assertEqual(keys.count("* 8"), 2)
         self.assertIn("S", keys)
 
     def test_too_small_terminal(self) -> None:
