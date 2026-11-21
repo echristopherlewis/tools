@@ -388,6 +388,25 @@ def one_line(s: Any) -> str:
     return " ".join(str(s).split())
 
 
+def shell_quote(s: str) -> str:
+    """Quote s for a POSIX shell, leaving it bare when it only has safe characters.
+
+    Args:
+        s: Any string.
+
+    Returns:
+        s unchanged if it has only safe characters, otherwise s wrapped in single quotes.
+
+    Examples:
+        shell_quote("/tmp/x") -> "/tmp/x"
+        shell_quote("a b") -> "'a b'"
+        shell_quote("it's") -> "'it'\\\\''s'"
+    """
+    if re.match(r"^[\w@%+=:,./-]+$", s):
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
 def terms_of(query: Optional[str]) -> List[str]:
     """Split a filter query into lowercase terms (all must match).
 
@@ -1641,26 +1660,6 @@ class Theme(object):
         return attrs
 
 
-
-def shell_quote(s: str) -> str:
-    """Quote s for a POSIX shell, leaving it bare when it only has safe characters.
-
-    Args:
-        s: Any string.
-
-    Returns:
-        s unchanged if it has only safe characters, otherwise s wrapped in single quotes.
-
-    Examples:
-        shell_quote("/tmp/x") -> "/tmp/x"
-        shell_quote("a b") -> "'a b'"
-        shell_quote("it's") -> "'it'\\\\''s'"
-    """
-    if re.match(r"^[\w@%+=:,./-]+$", s):
-        return s
-    return "'" + s.replace("'", "'\\''") + "'"
-
-
 class StarStore(object):
     """The starred sessions, kept in stars.json in the data directory.
 
@@ -2003,8 +2002,6 @@ def sort_sessions(sessions: List[Session], mode: str = "last") -> List[Session]:
         (lambda s: s.last_ts) if mode == "last" else (lambda s: s.first_ts))
     return sorted(sessions, key=key, reverse=True)
 
-
-# ---------------------------------------------------------------- rendering
 
 # ---------------------------------------------------------------- markdown
 
@@ -2602,6 +2599,8 @@ def markdown_lines(text: str, width: int, prefix: str = "") -> List[Line]:
     return [((prefix + t, k, tuple((a + len(prefix), b + len(prefix), s) for a, b, s in sp))
              if t else ("", k, ())) for t, k, sp in rows]
 
+
+# ---------------------------------------------------------------- rendering
 
 def result_preview_lines(text: str, width: int) -> List[Line]:
     """Render a tool result as at most RESULT_PREVIEW_LINES "result" rows plus a "more" note,
