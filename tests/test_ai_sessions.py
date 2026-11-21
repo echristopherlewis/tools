@@ -95,9 +95,9 @@ class Env(unittest.TestCase):
         for k in ("AI_SESSIONS_CLAUDE_CMD", "AI_SESSIONS_CODEX_CMD",
                   "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             os.environ.pop(k, None)
-        if hasattr(ai, "CMD_OVERRIDES"):
-            ai.CMD_OVERRIDES.clear()
-            self.addCleanup(ai.CMD_OVERRIDES.clear)
+        for src in ai.SOURCE_LIST:
+            src.cmd_override = None
+            self.addCleanup(setattr, src, "cmd_override", None)
 
     def fx(self, *parts: str) -> str:
         return os.path.join(self.tmp, *parts)
@@ -125,7 +125,7 @@ Y_ID = "22222222-2222-4222-8222-222222222222"
 
 class ClaudeParsing(Env):
     def parse(self, *parts: str) -> Any:
-        return ai.parse_claude(self.fx("claude", *parts))
+        return ai.SOURCES["claude"].parse(self.fx("claude", *parts))
 
     def test_full_session(self) -> None:
         summary, msgs = self.parse("-work-alpha", A_ID + ".jsonl")
@@ -167,7 +167,7 @@ class ClaudeParsing(Env):
     def test_first_prompt_title_truncated(self) -> None:
         p = self.fx("claude", "-x", "t.jsonl")
         write_jsonl(p, [{"type": "user", "message": {"content": "w" * 300}}])
-        self.assertEqual(ai.parse_claude(p)[0]["title"], "w" * 100)
+        self.assertEqual(ai.SOURCES["claude"].parse(p)[0]["title"], "w" * 100)
 
     def test_string_content_for_assistant(self) -> None:
         _, msgs = self.parse("-work-alpha", B_ID + ".jsonl")
@@ -178,7 +178,7 @@ class ClaudeParsing(Env):
         p = self.fx("claude", "-x", "h.jsonl")
         write_jsonl(p, [{"type": "user", "gitBranch": "HEAD", "cwd": "/w",
                          "message": {"content": "hi"}}])
-        s = ai.parse_claude(p)[0]
+        s = ai.SOURCES["claude"].parse(p)[0]
         self.assertEqual(s["branch"], "")
         self.assertEqual(s["cwd"], "/w")
 
@@ -186,14 +186,14 @@ class ClaudeParsing(Env):
         p = self.fx("claude", "-x", "c.jsonl")
         write_jsonl(p, [{"type": "user", "message": {
             "content": "<command-name>/clear</command-name>\n<command-args></command-args>"}}])
-        msgs = ai.parse_claude(p)[1]
+        msgs = ai.SOURCES["claude"].parse(p)[1]
         self.assertEqual([(role(m), mtext(m)) for m in msgs], [("cmd", "/clear")])
 
     def test_garbage_lines_are_skipped(self) -> None:
         p = self.fx("claude", "-x", "g.jsonl")
         write_jsonl(p, ["not json", "[1,2]", "{bad", "",
                         {"type": "user", "message": {"content": "ok"}}])
-        self.assertEqual(ai.parse_claude(p)[0]["n_user"], 1)
+        self.assertEqual(ai.SOURCES["claude"].parse(p)[0]["n_user"], 1)
 
     def test_tool_use_summaries(self) -> None:
         p = self.fx("claude", "-x", "tu.jsonl")
@@ -201,7 +201,7 @@ class ClaudeParsing(Env):
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls -l\nmore", "description": "d"}},
             {"type": "tool_use", "name": "Odd", "input": {"zzz": "fallback value"}},
             {"type": "tool_use", "name": "NoInput"}]}}])
-        msgs = ai.parse_claude(p)[1]
+        msgs = ai.SOURCES["claude"].parse(p)[1]
         self.assertEqual([mtext(m) for m in msgs],
                          ["Bash: ls -l", "Odd: fallback value", "NoInput"])
 
@@ -211,7 +211,7 @@ class CodexParsing(Env):
                           "rollout-2025-03-02T09-00-00-" + X_ID + ".jsonl")
 
     def test_full_session(self) -> None:
-        summary, msgs = ai.parse_codex(self.fx("codex", self.X_PATH))
+        summary, msgs = ai.SOURCES["codex"].parse(self.fx("codex", self.X_PATH))
         self.assertEqual(summary["source"], "codex")
         self.assertEqual(summary["id"], X_ID)
         self.assertEqual(summary["cwd"], "/work/codex-proj")
@@ -236,7 +236,7 @@ class CodexParsing(Env):
         write_jsonl(p, [{"timestamp": "2025-01-01T00:00:00Z", "type": "response_item",
                          "payload": {"type": "message", "role": "assistant",
                                      "content": [{"type": "output_text", "text": "hi"}]}}])
-        s, msgs = ai.parse_codex(p)
+        s, msgs = ai.SOURCES["codex"].parse(p)
         self.assertEqual(s["id"], uuid)
         # With no user prompt, the first assistant text titles the session.
         self.assertEqual(s["title"], "hi")
@@ -247,12 +247,12 @@ class CodexParsing(Env):
         write_jsonl(p, [{"type": "turn_context", "payload": {"cwd": "/tc"}},
                         {"type": "response_item", "payload": {
                             "type": "message", "role": "user", "content": "plain str"}}])
-        s, msgs = ai.parse_codex(p)
+        s, msgs = ai.SOURCES["codex"].parse(p)
         self.assertEqual(s["cwd"], "/tc")
         self.assertEqual(mtext(msgs[0]), "plain str")
 
     def test_user_noise_detection(self) -> None:
-        noise = ai.codex_user_noise
+        noise = ai.SOURCES["codex"].user_noise
         self.assertTrue(noise("# AGENTS.md instructions for /x"))
         self.assertTrue(noise("<environment_context>\n</environment_context>"))
         self.assertTrue(noise("<turn_aborted>\n</turn_aborted>"))
@@ -748,7 +748,7 @@ class Units(unittest.TestCase):
                 {"role": "tool", "name": "Read", "text": "Read: /x", "ts": None},
                 {"role": "result", "text": "\n".join("r%d" % i for i in range(9)), "ts": None},
                 {"role": "assistant", "text": "bye", "ts": None}]
-        if not isinstance(ai.parse_claude, type(None)) and hasattr(ai, "Msg") and \
+        if not isinstance(ai.SOURCES["claude"].parse, type(None)) and hasattr(ai, "Msg") and \
                 not isinstance(getattr(ai, "Msg"), type(Dict)) and hasattr(ai.Msg, "_fields"):
             msgs = [ai.Msg(*[m.get(f) for f in ai.Msg._fields]) for m in msgs]  # type: ignore
         lines, start = ai.render(s, msgs, 40, True)
@@ -947,31 +947,31 @@ class MarkdownRendering(unittest.TestCase):
 
 class ResumeArgv(Env):
     def test_defaults(self) -> None:
-        self.assertEqual(ai.build_resume_argv("claude", "S1"), (["claude", "--resume", "S1"], None))
-        self.assertEqual(ai.build_resume_argv("codex", "S1"), (["codex", "resume", "S1"], None))
+        self.assertEqual(ai.SOURCES["claude"].resume_argv("S1"), (["claude", "--resume", "S1"], None))
+        self.assertEqual(ai.SOURCES["codex"].resume_argv("S1"), (["codex", "resume", "S1"], None))
 
     def test_id_substitution(self) -> None:
         os.environ["AI_SESSIONS_CODEX_CMD"] = "codex resume {id} --yolo"
-        self.assertEqual(ai.build_resume_argv("codex", "S1")[0], ["codex", "resume", "S1", "--yolo"])
+        self.assertEqual(ai.SOURCES["codex"].resume_argv("S1")[0], ["codex", "resume", "S1", "--yolo"])
 
     def test_args_appended(self) -> None:
         os.environ["AI_SESSIONS_CLAUDE_CMD"] = "claude --model opus"
-        self.assertEqual(ai.build_resume_argv("claude", "S1")[0],
+        self.assertEqual(ai.SOURCES["claude"].resume_argv("S1")[0],
                          ["claude", "--model", "opus", "--resume", "S1"])
 
     def test_cli_override_beats_env(self) -> None:
         os.environ["AI_SESSIONS_CLAUDE_CMD"] = "fromenv"
-        ai.CMD_OVERRIDES["claude"] = "fromcli {id}"
-        self.assertEqual(ai.build_resume_argv("claude", "S1")[0], ["fromcli", "S1"])
-        self.assertEqual(ai.build_resume_argv("codex", "S1")[0], ["codex", "resume", "S1"])
+        ai.SOURCES["claude"].cmd_override = "fromcli {id}"
+        self.assertEqual(ai.SOURCES["claude"].resume_argv("S1")[0], ["fromcli", "S1"])
+        self.assertEqual(ai.SOURCES["codex"].resume_argv("S1")[0], ["codex", "resume", "S1"])
 
     def test_bad_and_empty_templates_warn(self) -> None:
         os.environ["AI_SESSIONS_CLAUDE_CMD"] = 'claude "unterminated'
-        argv, warn = ai.build_resume_argv("claude", "S1")
+        argv, warn = ai.SOURCES["claude"].resume_argv("S1")
         self.assertEqual(argv, ["claude", "--resume", "S1"])
         self.assertIn("bad claude command", warn or "")
         os.environ["AI_SESSIONS_CLAUDE_CMD"] = "  "
-        argv, warn = ai.build_resume_argv("claude", "S1")
+        argv, warn = ai.SOURCES["claude"].resume_argv("S1")
         self.assertEqual(argv, ["claude", "--resume", "S1"])
         self.assertIn("empty claude command", warn or "")
 

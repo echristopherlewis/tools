@@ -103,26 +103,6 @@ STAR_COL_WIDTH = 2         # "* " (starred) or "  " in the session list, before 
 TAG_COL_WIDTH = 3          # "CC " / "CX " in the session list
 STARS_VERSION = 1          # format version of stars.json
 SIDE_BY_SIDE_MIN_COLS = 100  # at least this wide: list | preview, else list over preview
-TAG: Dict[str, str] = {"claude": "CC", "codex": "CX"}
-LABEL: Dict[str, str] = {"claude": "Claude Code", "codex": "Codex"}
-ASSISTANT_NAME: Dict[str, str] = {"claude": "Claude", "codex": "Codex"}
-
-# User "messages" that the harness injects rather than the human typing them. They
-# would otherwise pollute titles and search, so parse_claude drops them.
-CLAUDE_NOISE: Tuple[str, ...] = (
-    "<local-command-caveat>", "<local-command-stdout>", "<local-command-stderr>",
-    "<system-reminder>", "<task-notification>", "<bash-input>", "<bash-stdout>",
-    "<bash-stderr>", "<command-message>", "<user-prompt-submit-hook>",
-    "Caveat:", "[Request interrupted", "This session is being continued",
-)
-# Codex injects context as user messages: a leading XML-ish tag wrapping the whole
-# message (CODEX_TAG, checked together with a trailing ">") or one of these prefixes.
-CODEX_TAG: Pattern[str] = re.compile(r"^<[A-Za-z_][\w\-]*[\s>/]")
-CODEX_NOISE: Tuple[str, ...] = ("# AGENTS.md", "<environment_context>", "<user_instructions>",
-               "<permissions", "<INSTRUCTIONS>")
-# Claude records a slash command as a user message containing these tags.
-CMD_NAME: Pattern[str] = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
-CMD_ARGS: Pattern[str] = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
 # ISO-8601-ish timestamps with optional fraction and Z / +hh:mm / +hhmm offset.
 TS_RE: Pattern[str] = re.compile(
     r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.(\d+))?\s*(Z|[+-]\d\d:?\d\d)?")
@@ -588,350 +568,6 @@ def iter_json(path: str) -> Iterator[Dict[str, Any]]:
         return
 
 
-def content_blocks(content: Any) -> Optional[List[Any]]:
-    """Normalize Claude message content to a block list: a bare string becomes one text
-    block; anything that is neither string nor list yields None (caller skips it).
-
-    Args:
-        content: A Claude message's "content": a string, a list of blocks, or something else.
-
-    Returns:
-        A list of blocks, or None if content is neither a string nor a list.
-
-    Examples:
-        content_blocks("hi") -> [{"type": "text", "text": "hi"}]
-        content_blocks([{"type": "text", "text": "hi"}]) -> the same list
-        content_blocks(5) -> None
-    """
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    return content if isinstance(content, list) else None
-
-
-def claude_user_msgs(blocks: List[Any], ts: Optional[float]) -> List[Msg]:
-    """Turn the content blocks of a Claude "user" record into Msgs.
-
-    Text blocks become "user" messages, or "cmd" messages for slash commands; harness-injected
-    text (CLAUDE_NOISE) is dropped; tool_result blocks become "result" messages.
-
-    Args:
-        blocks: The normalized content blocks (see content_blocks()); non-dict blocks are skipped.
-        ts: The record's timestamp, copied onto every message.
-
-    Returns:
-        The messages in block order.
-
-    Examples:
-        claude_user_msgs([{"type": "text", "text": " hi "}], 1.0) -> [{"role": "user", "text": "hi", "ts": 1.0}]
-        claude_user_msgs([{"type": "text", "text": "<command-name>/clear</command-name>"}], None)
-            -> [{"role": "cmd", "text": "/clear", "ts": None}]
-        claude_user_msgs([{"type": "tool_result", "content": "ok"}], None)
-            -> [{"role": "result", "text": "ok", "ts": None}]
-    """
-    out: List[Msg] = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        block_type = block.get("type")
-        if block_type == "tool_result":
-            out.append({"role": "result",
-                        "text": content_text(block.get("content"))[:RESULT_CAP], "ts": ts})
-            continue
-        if block_type != "text":
-            continue
-        text = block.get("text")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        stripped = text.lstrip()
-        # Peek only at the start: a command tag deep inside a long prompt is
-        # just text the user pasted, not a slash command.
-        head = stripped[:CMD_PEEK]
-        cmd_match = CMD_NAME.search(head) if "<command-name>" in head else None
-        if cmd_match:
-            args_match = CMD_ARGS.search(stripped)
-            cmd = cmd_match.group(1)
-            if args_match and args_match.group(1):
-                cmd += " " + one_line(args_match.group(1))
-            out.append({"role": "cmd", "text": cmd, "ts": ts})
-        elif not stripped.startswith(CLAUDE_NOISE):
-            out.append({"role": "user", "text": text.strip(), "ts": ts})
-    return out
-
-
-def claude_assistant_msgs(blocks: List[Any], ts: Optional[float]) -> List[Msg]:
-    """Turn the content blocks of a Claude "assistant" record into Msgs.
-
-    Args:
-        blocks: The normalized content blocks (see content_blocks()); non-dict blocks are skipped.
-        ts: The record's timestamp, copied onto every message.
-
-    Returns:
-        "assistant" messages for non-blank text blocks and "tool" messages for tool_use blocks,
-        in block order.
-
-    Examples:
-        claude_assistant_msgs([{"type": "text", "text": "done"}], 2.0)
-            -> [{"role": "assistant", "text": "done", "ts": 2.0}]
-        claude_assistant_msgs([{"type": "tool_use", "name": "Read", "input": {"file_path": "/x"}}], None)
-            -> [{"role": "tool", "name": "Read", "text": "Read: /x", "ts": None}]
-    """
-    out: List[Msg] = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        block_type = block.get("type")
-        if block_type == "text" and isinstance(block.get("text"), str) and block["text"].strip():
-            out.append({"role": "assistant", "text": block["text"].strip(), "ts": ts})
-        elif block_type == "tool_use":
-            out.append({"role": "tool", "name": str(block.get("name") or "tool"),
-                        "text": summarize_tool(block.get("name"), block.get("input")), "ts": ts})
-    return out
-
-
-def parse_claude(path: str) -> Tuple[Summary, List[Msg]]:
-    """Parse a Claude Code transcript (~/.claude/projects/<project-dir>/<uuid>.jsonl).
-
-    One JSON object per line. Records used (everything else is ignored):
-
-        {"type": "custom-title", "customTitle": "Name set with /rename"}
-        {"type": "ai-title", "aiTitle": "Generated title"}
-        {"type": "summary", "summary": "Compaction summary"}
-        {"type": "user", "cwd": "/work/proj", "gitBranch": "main",
-         "timestamp": "2025-03-01T10:00:00.000Z", "isSidechain": false, "isMeta": false,
-         "message": {"role": "user", "content": "text"
-                     | [{"type": "text", "text": "..."},
-                        {"type": "tool_result", "tool_use_id": "t1", "content": "..."}]}}
-        {"type": "assistant", ...,
-         "message": {"role": "assistant", "content": "text"
-                     | [{"type": "text", "text": "..."},
-                        {"type": "tool_use", "id": "t1", "name": "Read",
-                         "input": {"file_path": "/x"}}]}}
-
-    Skipped on purpose:
-      * isSidechain records: subagent transcripts interleaved in the file; they are not
-        the conversation with you.
-      * isMeta records: synthetic messages the harness adds. Their cwd/branch are
-        still harvested, but not their text or timestamps.
-      * gitBranch "HEAD": a detached HEAD, which says nothing about the branch.
-      * harness-injected user text (CLAUDE_NOISE: system reminders, hook output,
-        "Caveat:" notices, ...).
-    Slash commands arrive as user text with <command-name>/<command-args> tags and
-    become "cmd" messages.
-
-    The session id is the filename stem. Title priority: custom-title > ai-title >
-    summary > the first real prompt (shortened to TITLE_MAX). Later records of the
-    same title type replace earlier ones.
-
-    Args:
-        path: Path of the Claude Code .jsonl transcript. The session id is its filename without
-            ".jsonl".
-
-    Returns:
-        A (summary, messages) tuple: summary is the index Summary (via make_summary), messages is
-        the list of Msg dicts in file order.
-
-    Example: for ~/.claude/projects/-work-proj/abc.jsonl holding one user line
-    {"type": "user", "cwd": "/work/proj", "timestamp": "2025-03-01T10:00:00Z",
-    "message": {"content": "fix the bug"}} and one assistant text reply "done":
-
-        parse_claude(path) -> ({"source": "claude", "id": "abc", "cwd": "/work/proj",
-                                "title": "fix the bug", "n_user": 1, "n_asst": 1, ...},
-                               [{"role": "user", "text": "fix the bug", "ts": 1740823200.0},
-                                {"role": "assistant", "text": "done", "ts": ...}])
-    """
-    sid = os.path.basename(path)[:-6]
-    cwd: Optional[str] = None
-    branch: Optional[str] = None
-    custom: Optional[str] = None
-    ai_title: Optional[str] = None
-    summary_title: Optional[str] = None
-    first_ts: Optional[float] = None
-    last_ts: Optional[float] = None
-    msgs: List[Msg] = []
-    for record in iter_json(path):
-        rtype = record.get("type")
-        if rtype == "custom-title" and record.get("customTitle"):
-            custom = record["customTitle"]
-            continue
-        if rtype == "ai-title" and record.get("aiTitle"):
-            ai_title = record["aiTitle"]
-            continue
-        if rtype == "summary" and record.get("summary"):
-            summary_title = record["summary"]
-            continue
-        if rtype not in ("user", "assistant"):
-            continue
-        if record.get("isSidechain"):
-            continue
-        if not cwd and isinstance(record.get("cwd"), str):
-            cwd = record["cwd"]
-        if not branch and isinstance(record.get("gitBranch"), str) and record["gitBranch"] != "HEAD":
-            branch = record["gitBranch"]
-        if record.get("isMeta"):
-            continue
-        message = record.get("message")
-        if not isinstance(message, dict):
-            continue
-        ts = parse_ts(record.get("timestamp"))
-        if ts:
-            first_ts = first_ts or ts
-            last_ts = ts
-        blocks = content_blocks(message.get("content"))
-        if blocks is None:
-            continue
-        if rtype == "user":
-            msgs.extend(claude_user_msgs(blocks, ts))
-        else:
-            msgs.extend(claude_assistant_msgs(blocks, ts))
-    first_prompt = next((m["text"] for m in msgs if m["role"] == "user"), None)
-    title = custom or ai_title or summary_title or (
-        one_line(first_prompt)[:TITLE_MAX] if first_prompt else None)
-    return make_summary("claude", sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
-
-
-def codex_user_noise(text: str) -> bool:
-    """True for Codex user messages that are injected context, not typed prompts.
-
-    Args:
-        text: The text of a Codex user message.
-
-    Returns:
-        True if it is injected context (AGENTS.md text, an XML-style wrapper tag, ...) rather than
-        something the user typed.
-
-    Examples:
-        codex_user_noise("<environment_context>cwd: /x</environment_context>") -> True
-        codex_user_noise("# AGENTS.md instructions for /x") -> True
-        codex_user_noise("fix the bug") -> False
-    """
-    s = text.lstrip()
-    return s.startswith(CODEX_NOISE) or bool(CODEX_TAG.match(s) and s.rstrip().endswith(">"))
-
-
-def codex_message_text(payload: Dict[str, Any]) -> str:
-    """Join the non-blank text parts of a Codex "message" payload.
-
-    Args:
-        payload: A response_item payload; its "content" is a string or a list of blocks that
-            carry "text" (input_text / output_text).
-
-    Returns:
-        The text parts joined with newlines and stripped; "" if there are none.
-
-    Examples:
-        codex_message_text({"content": [{"type": "input_text", "text": "a"}, {"text": " "}, {"text": "b"}]})
-            -> "a\\nb"
-        codex_message_text({"content": "hi"}) -> "hi"
-        codex_message_text({}) -> ""
-    """
-    blocks = payload.get("content")
-    if isinstance(blocks, str):
-        blocks = [{"text": blocks}]
-    texts = [block["text"] for block in (blocks or []) if isinstance(block, dict)
-             and isinstance(block.get("text"), str) and block["text"].strip()]
-    return "\n".join(texts).strip()
-
-
-def parse_codex(path: str) -> Tuple[Summary, List[Msg]]:
-    """Parse a Codex rollout (~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl).
-
-    One JSON object per line, {"timestamp", "type", "payload"}. Records used:
-
-        {"type": "session_meta", "payload": {"id": "<uuid>", "timestamp": "...",
-                                              "cwd": "/work/proj", "git": {"branch": "main"}}}
-        {"type": "turn_context", "payload": {"cwd": "/work/proj", ...}}
-        {"type": "response_item", "payload": {
-            "type": "message", "role": "user" | "assistant",
-            "content": [{"type": "input_text" | "output_text", "text": "..."}]}}
-        {"type": "response_item", "payload": {
-            "type": "function_call", "name": "shell", "arguments": "{\\"command\\": [...]}"}}
-        {"type": "response_item", "payload": {
-            "type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch..."}}
-        {"type": "response_item", "payload": {
-            "type": "function_call_output" | "custom_tool_call_output", "output": "..."}}
-
-    Skipped: other roles (developer/system), other record types, and user messages that
-    are injected context (see codex_user_noise: AGENTS.md text, <environment_context>...).
-
-    The id comes from session_meta when present. Otherwise it is the last 36 characters
-    of the filename stem: rollout-<timestamp>-<uuid> always ends in a 36-char UUID.
-    Codex has no title records, so the title is the first user prompt (or the first
-    assistant message); load_sessions() overrides it with session_index.jsonl names.
-
-    Args:
-        path: Path of the Codex rollout .jsonl file.
-
-    Returns:
-        A (summary, messages) tuple: summary is the index Summary (via make_summary), messages is
-        the list of Msg dicts in file order.
-
-    Example: for ~/.codex/sessions/2025/03/01/rollout-2025-03-01T10-00-00-<uuid>.jsonl with a
-    session_meta record (id "<uuid>", cwd "/work/proj"), a user message "fix the bug" and a
-    shell function_call:
-
-        parse_codex(path) -> ({"source": "codex", "id": "<uuid>", "cwd": "/work/proj",
-                               "title": "fix the bug", "n_user": 1, "n_asst": 0, ...},
-                              [{"role": "user", "text": "fix the bug", "ts": 1.7e9},
-                               {"role": "tool", "name": "shell", "text": "shell: ls -l", "ts": 1.7e9}])
-    """
-    stem = os.path.basename(path)[:-6]
-    sid = stem[-36:] if len(stem) >= 36 else stem
-    cwd: Optional[str] = None
-    branch: Optional[str] = None
-    first_ts: Optional[float] = None
-    last_ts: Optional[float] = None
-    msgs: List[Msg] = []
-    for record in iter_json(path):
-        rtype = record.get("type")
-        payload = record.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        ts = parse_ts(record.get("timestamp"))
-        if rtype == "session_meta":
-            if isinstance(payload.get("id"), str):
-                sid = payload["id"]
-            if isinstance(payload.get("cwd"), str):
-                cwd = payload["cwd"]
-            git = payload.get("git")
-            if isinstance(git, dict) and isinstance(git.get("branch"), str):
-                branch = git["branch"]
-            first_ts = parse_ts(payload.get("timestamp")) or first_ts
-            continue
-        if rtype == "turn_context" and not cwd and isinstance(payload.get("cwd"), str):
-            cwd = payload["cwd"]
-            continue
-        if rtype != "response_item":
-            continue
-        ptype = payload.get("type")
-        if ptype == "message":
-            role = payload.get("role")
-            if role not in ("user", "assistant"):
-                continue
-            text = codex_message_text(payload)
-            if not text or (role == "user" and codex_user_noise(text)):
-                continue
-            if ts:
-                first_ts = first_ts or ts
-                last_ts = ts
-            msgs.append({"role": role, "text": text, "ts": ts})
-        elif ptype in ("function_call", "custom_tool_call"):
-            inp = payload.get("arguments") if ptype == "function_call" else payload.get("input")
-            if inp is None:
-                inp = payload.get("arguments", payload.get("input"))
-            if ts:
-                last_ts = ts
-            msgs.append({"role": "tool", "name": str(payload.get("name") or "tool"),
-                         "text": summarize_tool(payload.get("name"), inp), "ts": ts})
-        elif ptype in ("function_call_output", "custom_tool_call_output"):
-            msgs.append({"role": "result", "text": content_text(payload.get("output"))[:RESULT_CAP],
-                         "ts": ts})
-    # Title: the first user prompt, else the first assistant message.
-    first_prompt = (next((m["text"] for m in msgs if m["role"] == "user"), None)
-                    or next((m["text"] for m in msgs if m["role"] == "assistant"), None))
-    title = one_line(first_prompt)[:TITLE_MAX] if first_prompt else None
-    return make_summary("codex", sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
-
-
 def make_summary(source: str, sid: str, path: str, cwd: Optional[str], branch: Optional[str],
            title: Optional[str], first_ts: Optional[float], last_ts: Optional[float],
            msgs: List[Msg]) -> Summary:
@@ -987,8 +623,626 @@ def make_summary(source: str, sid: str, path: str, cwd: Optional[str], branch: O
     }
 
 
+class Source(object):
+    """Base class: one AI tool whose transcripts ai-sessions reads.
+
+    A subclass fills in the class attributes and implements root(), scan_root(), discover()
+    and parse(); to support another tool, add a subclass and put an instance in SOURCE_LIST.
+    """
+    key = ""              # "claude" / "codex": the value stored in Summary["source"]
+    tag = ""              # two-letter tag shown in the session list ("CC" / "CX")
+    label = ""            # display name ("Claude Code" / "Codex")
+    assistant_name = ""   # name of the assistant in transcripts ("Claude" / "Codex")
+    default_cmd = ""      # bare command that starts the tool
+    resume_args: List[str] = []   # appended to the command when it has no {id} word
+    session_env_var = ""  # environment variable the tool sets to the current session id
+    # Command template from --claude-cmd/--codex-cmd. Written once by main() before
+    # anything reads it, because resume commands are built deep inside Session/App;
+    # threading it through every layer would add plumbing for no benefit.
+    cmd_override: Optional[str] = None
+
+    def root(self) -> str:
+        """The tool's data directory (set by AI_SESSIONS_<KEY>_DIR).
+
+        Returns:
+            The expanded directory path.
+        """
+        raise NotImplementedError
+
+    def scan_root(self) -> str:
+        """The directory whose vanished transcript files load_sessions() prunes from the index.
+
+        Returns:
+            A directory path, equal to or below root().
+        """
+        raise NotImplementedError
+
+    def discover(self) -> List[str]:
+        """List this tool's transcript files without opening any of them.
+
+        Returns:
+            The transcript paths found.
+        """
+        raise NotImplementedError
+
+    def parse(self, path: str) -> Tuple[Summary, List[Msg]]:
+        """Parse one transcript file.
+
+        Args:
+            path: Path of a file returned by discover().
+
+        Returns:
+            A (summary, messages) tuple: summary is the index Summary, messages the Msg list.
+        """
+        raise NotImplementedError
+
+    def title_overrides(self) -> Dict[str, str]:
+        """Titles kept outside the transcripts, which replace the parsed ones.
+
+        Returns:
+            A dict mapping session id to title; empty unless the tool keeps names elsewhere.
+
+        Example: the base class -> {}
+        """
+        return {}
+
+    def resume_template(self) -> str:
+        """Command template: CLI flag, then AI_SESSIONS_<KEY>_CMD, then the bare command.
+
+        Returns:
+            The command template: the --claude-cmd/--codex-cmd flag if given, else the
+            AI_SESSIONS_<KEY>_CMD variable, else the bare command name.
+
+        Examples:
+            with no override and no env var: ClaudeSource().resume_template() -> "claude"
+            with AI_SESSIONS_CLAUDE_CMD="mycl --x {id}":
+                ClaudeSource().resume_template() -> "mycl --x {id}"
+        """
+        return (self.cmd_override
+                or os.environ.get("AI_SESSIONS_%s_CMD" % self.key.upper())
+                or self.default_cmd)
+
+    def resume_argv(self, sid: str) -> Tuple[List[str], Optional[str]]:
+        """Returns (argv, warning). warning is None unless the template was unusable.
+
+        Args:
+            sid: Session id, substituted for "{id}" in the command template.
+
+        Returns:
+            An (argv, warning) tuple: argv is the command as a list of words; warning is a message when
+            the template was unparsable or empty (the default command is used), else None.
+
+        Examples:
+            ClaudeSource().resume_argv("abc") -> (["claude", "--resume", "abc"], None)
+            CodexSource().resume_argv("abc") -> (["codex", "resume", "abc"], None)
+            with AI_SESSIONS_CLAUDE_CMD="mycl --x {id} --y":
+                ClaudeSource().resume_argv("abc") -> (["mycl", "--x", "abc", "--y"], None)
+            with AI_SESSIONS_CLAUDE_CMD="'unterminated":
+                ClaudeSource().resume_argv("abc") ->
+                    (["claude", "--resume", "abc"], "bad claude command: No closing quotation")
+        """
+        warn: Optional[str] = None
+        try:
+            words = shlex.split(self.resume_template())
+        except ValueError as e:
+            words, warn = [], "bad %s command: %s" % (self.key, e)
+        if not words:
+            words = [self.default_cmd]
+            warn = warn or "empty %s command" % self.key
+        if not any("{id}" in w for w in words):
+            words = words + self.resume_args
+        return [w.replace("{id}", sid) for w in words], warn
+
+
+class ClaudeSource(Source):
+    """Claude Code: ~/.claude/projects/<project-dir>/<uuid>.jsonl transcripts."""
+    key = "claude"
+    tag = "CC"
+    label = "Claude Code"
+    assistant_name = "Claude"
+    default_cmd = "claude"
+    resume_args = ["--resume", "{id}"]
+    session_env_var = "CLAUDE_CODE_SESSION_ID"
+
+    # User "messages" that the harness injects rather than the human typing them. They
+    # would otherwise pollute titles and search, so parse() drops them.
+    NOISE: Tuple[str, ...] = (
+        "<local-command-caveat>", "<local-command-stdout>", "<local-command-stderr>",
+        "<system-reminder>", "<task-notification>", "<bash-input>", "<bash-stdout>",
+        "<bash-stderr>", "<command-message>", "<user-prompt-submit-hook>",
+        "Caveat:", "[Request interrupted", "This session is being continued",
+    )
+    # Claude records a slash command as a user message containing these tags.
+    CMD_NAME: Pattern[str] = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+    CMD_ARGS: Pattern[str] = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
+
+    def root(self) -> str:
+        """The Claude Code projects directory.
+
+        Returns:
+            $AI_SESSIONS_CLAUDE_DIR, else ~/.claude/projects, with "~" expanded.
+
+        Example: no env var -> "/home/me/.claude/projects"
+        """
+        return os.path.expanduser(os.environ.get("AI_SESSIONS_CLAUDE_DIR") or "~/.claude/projects")
+
+    def scan_root(self) -> str:
+        """Transcripts live anywhere under the projects directory.
+
+        Returns:
+            root().
+
+        Example: no env var -> "/home/me/.claude/projects"
+        """
+        return self.root()
+
+    def discover(self) -> List[str]:
+        """List the transcripts: <root>/<project-dir>/*.jsonl.
+
+        Returns:
+            The transcript paths found.
+
+        Example: ~/.claude/projects/-work-proj/abc.jsonl on disk ->
+        ["/home/me/.claude/projects/-work-proj/abc.jsonl"]
+        """
+        found: List[str] = []
+        try:
+            project_dirs = list(os.scandir(self.root()))
+        except OSError:
+            project_dirs = []
+        for d in project_dirs:
+            # ~/.claude/projects/memory holds memory files, not session transcripts.
+            if not d.is_dir(follow_symlinks=True) or d.name == "memory":
+                continue
+            try:
+                for f in os.scandir(d.path):
+                    if f.name.endswith(".jsonl") and f.is_file():
+                        found.append(f.path)
+            except OSError:
+                pass
+        return found
+
+    @staticmethod
+    def content_blocks(content: Any) -> Optional[List[Any]]:
+        """Normalize Claude message content to a block list: a bare string becomes one text
+        block; anything that is neither string nor list yields None (caller skips it).
+
+        Args:
+            content: A Claude message's "content": a string, a list of blocks, or something else.
+
+        Returns:
+            A list of blocks, or None if content is neither a string nor a list.
+
+        Examples:
+            ClaudeSource.content_blocks("hi") -> [{"type": "text", "text": "hi"}]
+            ClaudeSource.content_blocks([{"type": "text", "text": "hi"}]) -> the same list
+            ClaudeSource.content_blocks(5) -> None
+        """
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        return content if isinstance(content, list) else None
+
+    def user_msgs(self, blocks: List[Any], ts: Optional[float]) -> List[Msg]:
+        """Turn the content blocks of a Claude "user" record into Msgs.
+
+        Text blocks become "user" messages, or "cmd" messages for slash commands; harness-injected
+        text (NOISE) is dropped; tool_result blocks become "result" messages.
+
+        Args:
+            blocks: The normalized content blocks (see content_blocks()); non-dict blocks are skipped.
+            ts: The record's timestamp, copied onto every message.
+
+        Returns:
+            The messages in block order.
+
+        Examples:
+            ClaudeSource().user_msgs([{"type": "text", "text": " hi "}], 1.0) -> [{"role": "user", "text": "hi", "ts": 1.0}]
+            ClaudeSource().user_msgs([{"type": "text", "text": "<command-name>/clear</command-name>"}], None)
+                -> [{"role": "cmd", "text": "/clear", "ts": None}]
+            ClaudeSource().user_msgs([{"type": "tool_result", "content": "ok"}], None)
+                -> [{"role": "result", "text": "ok", "ts": None}]
+        """
+        out: List[Msg] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "tool_result":
+                out.append({"role": "result",
+                            "text": content_text(block.get("content"))[:RESULT_CAP], "ts": ts})
+                continue
+            if block_type != "text":
+                continue
+            text = block.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            stripped = text.lstrip()
+            # Peek only at the start: a command tag deep inside a long prompt is
+            # just text the user pasted, not a slash command.
+            head = stripped[:CMD_PEEK]
+            cmd_match = self.CMD_NAME.search(head) if "<command-name>" in head else None
+            if cmd_match:
+                args_match = self.CMD_ARGS.search(stripped)
+                cmd = cmd_match.group(1)
+                if args_match and args_match.group(1):
+                    cmd += " " + one_line(args_match.group(1))
+                out.append({"role": "cmd", "text": cmd, "ts": ts})
+            elif not stripped.startswith(self.NOISE):
+                out.append({"role": "user", "text": text.strip(), "ts": ts})
+        return out
+
+    def assistant_msgs(self, blocks: List[Any], ts: Optional[float]) -> List[Msg]:
+        """Turn the content blocks of a Claude "assistant" record into Msgs.
+
+        Args:
+            blocks: The normalized content blocks (see content_blocks()); non-dict blocks are skipped.
+            ts: The record's timestamp, copied onto every message.
+
+        Returns:
+            "assistant" messages for non-blank text blocks and "tool" messages for tool_use blocks,
+            in block order.
+
+        Examples:
+            ClaudeSource().assistant_msgs([{"type": "text", "text": "done"}], 2.0)
+                -> [{"role": "assistant", "text": "done", "ts": 2.0}]
+            ClaudeSource().assistant_msgs([{"type": "tool_use", "name": "Read", "input": {"file_path": "/x"}}], None)
+                -> [{"role": "tool", "name": "Read", "text": "Read: /x", "ts": None}]
+        """
+        out: List[Msg] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text" and isinstance(block.get("text"), str) and block["text"].strip():
+                out.append({"role": "assistant", "text": block["text"].strip(), "ts": ts})
+            elif block_type == "tool_use":
+                out.append({"role": "tool", "name": str(block.get("name") or "tool"),
+                            "text": summarize_tool(block.get("name"), block.get("input")), "ts": ts})
+        return out
+
+    def parse(self, path: str) -> Tuple[Summary, List[Msg]]:
+        """Parse a Claude Code transcript (~/.claude/projects/<project-dir>/<uuid>.jsonl).
+
+        One JSON object per line. Records used (everything else is ignored):
+
+            {"type": "custom-title", "customTitle": "Name set with /rename"}
+            {"type": "ai-title", "aiTitle": "Generated title"}
+            {"type": "summary", "summary": "Compaction summary"}
+            {"type": "user", "cwd": "/work/proj", "gitBranch": "main",
+             "timestamp": "2025-03-01T10:00:00.000Z", "isSidechain": false, "isMeta": false,
+             "message": {"role": "user", "content": "text"
+                         | [{"type": "text", "text": "..."},
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "..."}]}}
+            {"type": "assistant", ...,
+             "message": {"role": "assistant", "content": "text"
+                         | [{"type": "text", "text": "..."},
+                            {"type": "tool_use", "id": "t1", "name": "Read",
+                             "input": {"file_path": "/x"}}]}}
+
+        Skipped on purpose:
+          * isSidechain records: subagent transcripts interleaved in the file; they are not
+            the conversation with you.
+          * isMeta records: synthetic messages the harness adds. Their cwd/branch are
+            still harvested, but not their text or timestamps.
+          * gitBranch "HEAD": a detached HEAD, which says nothing about the branch.
+          * harness-injected user text (NOISE: system reminders, hook output,
+            "Caveat:" notices, ...).
+        Slash commands arrive as user text with <command-name>/<command-args> tags and
+        become "cmd" messages.
+
+        The session id is the filename stem. Title priority: custom-title > ai-title >
+        summary > the first real prompt (shortened to TITLE_MAX). Later records of the
+        same title type replace earlier ones.
+
+        Args:
+            path: Path of the Claude Code .jsonl transcript. The session id is its filename without
+                ".jsonl".
+
+        Returns:
+            A (summary, messages) tuple: summary is the index Summary (via make_summary), messages is
+            the list of Msg dicts in file order.
+
+        Example: for ~/.claude/projects/-work-proj/abc.jsonl holding one user line
+        {"type": "user", "cwd": "/work/proj", "timestamp": "2025-03-01T10:00:00Z",
+        "message": {"content": "fix the bug"}} and one assistant text reply "done":
+
+            ClaudeSource().parse(path) -> ({"source": "claude", "id": "abc", "cwd": "/work/proj",
+                                            "title": "fix the bug", "n_user": 1, "n_asst": 1, ...},
+                                           [{"role": "user", "text": "fix the bug", "ts": 1740823200.0},
+                                            {"role": "assistant", "text": "done", "ts": ...}])
+        """
+        sid = os.path.basename(path)[:-6]
+        cwd: Optional[str] = None
+        branch: Optional[str] = None
+        custom: Optional[str] = None
+        ai_title: Optional[str] = None
+        summary_title: Optional[str] = None
+        first_ts: Optional[float] = None
+        last_ts: Optional[float] = None
+        msgs: List[Msg] = []
+        for record in iter_json(path):
+            rtype = record.get("type")
+            if rtype == "custom-title" and record.get("customTitle"):
+                custom = record["customTitle"]
+                continue
+            if rtype == "ai-title" and record.get("aiTitle"):
+                ai_title = record["aiTitle"]
+                continue
+            if rtype == "summary" and record.get("summary"):
+                summary_title = record["summary"]
+                continue
+            if rtype not in ("user", "assistant"):
+                continue
+            if record.get("isSidechain"):
+                continue
+            if not cwd and isinstance(record.get("cwd"), str):
+                cwd = record["cwd"]
+            if not branch and isinstance(record.get("gitBranch"), str) and record["gitBranch"] != "HEAD":
+                branch = record["gitBranch"]
+            if record.get("isMeta"):
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict):
+                continue
+            ts = parse_ts(record.get("timestamp"))
+            if ts:
+                first_ts = first_ts or ts
+                last_ts = ts
+            blocks = self.content_blocks(message.get("content"))
+            if blocks is None:
+                continue
+            if rtype == "user":
+                msgs.extend(self.user_msgs(blocks, ts))
+            else:
+                msgs.extend(self.assistant_msgs(blocks, ts))
+        first_prompt = next((m["text"] for m in msgs if m["role"] == "user"), None)
+        title = custom or ai_title or summary_title or (
+            one_line(first_prompt)[:TITLE_MAX] if first_prompt else None)
+        return make_summary(self.key, sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
+
+
+class CodexSource(Source):
+    """Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl transcripts."""
+    key = "codex"
+    tag = "CX"
+    label = "Codex"
+    assistant_name = "Codex"
+    default_cmd = "codex"
+    resume_args = ["resume", "{id}"]
+    session_env_var = "CODEX_THREAD_ID"
+
+    # Codex injects context as user messages: a leading XML-ish tag wrapping the whole
+    # message (WRAPPER_TAG, checked together with a trailing ">") or one of these prefixes.
+    WRAPPER_TAG: Pattern[str] = re.compile(r"^<[A-Za-z_][\w\-]*[\s>/]")
+    NOISE: Tuple[str, ...] = ("# AGENTS.md", "<environment_context>", "<user_instructions>",
+                              "<permissions", "<INSTRUCTIONS>")
+
+    def root(self) -> str:
+        """The Codex home directory.
+
+        Returns:
+            $AI_SESSIONS_CODEX_DIR, else ~/.codex, with "~" expanded.
+
+        Example: no env var -> "/home/me/.codex"
+        """
+        return os.path.expanduser(os.environ.get("AI_SESSIONS_CODEX_DIR") or "~/.codex")
+
+    def scan_root(self) -> str:
+        """Transcripts live under <root>/sessions (the rest of the Codex home is not scanned).
+
+        Returns:
+            <root>/sessions.
+
+        Example: no env var -> "/home/me/.codex/sessions"
+        """
+        return os.path.join(self.root(), "sessions")
+
+    def discover(self) -> List[str]:
+        """List the rollouts: <root>/sessions/**/rollout-*.jsonl.
+
+        Returns:
+            The transcript paths found.
+
+        Example: ~/.codex/sessions/2025/03/01/rollout-2025-03-01T10-00-00-<uuid>.jsonl on disk ->
+        ["/home/me/.codex/sessions/2025/03/01/rollout-2025-03-01T10-00-00-<uuid>.jsonl"]
+        """
+        found: List[str] = []
+        for dirpath, _dirnames, filenames in os.walk(self.scan_root()):
+            for name in filenames:
+                if name.startswith("rollout-") and name.endswith(".jsonl"):
+                    found.append(os.path.join(dirpath, name))
+        return found
+
+    def title_overrides(self) -> Dict[str, str]:
+        """Map Codex session id -> thread name from session_index.jsonl (may be absent).
+
+        Returns:
+            A dict mapping session id to a one-line title; empty if the file is missing or has no usable
+            entries.
+
+        Example: a session_index.jsonl line {"id": "u1", "thread_name": "Fix\\nbug"} ->
+        {"u1": "Fix bug"}; a missing file -> {}
+        """
+        names: Dict[str, str] = {}
+        for o in iter_json(os.path.join(self.root(), "session_index.jsonl")):
+            if isinstance(o.get("id"), str) and isinstance(o.get("thread_name"), str) \
+                    and o["thread_name"].strip():
+                names[o["id"]] = one_line(o["thread_name"])
+        return names
+
+    def user_noise(self, text: str) -> bool:
+        """True for Codex user messages that are injected context, not typed prompts.
+
+        Args:
+            text: The text of a Codex user message.
+
+        Returns:
+            True if it is injected context (AGENTS.md text, an XML-style wrapper tag, ...) rather than
+            something the user typed.
+
+        Examples:
+            CodexSource().user_noise("<environment_context>cwd: /x</environment_context>") -> True
+            CodexSource().user_noise("# AGENTS.md instructions for /x") -> True
+            CodexSource().user_noise("fix the bug") -> False
+        """
+        s = text.lstrip()
+        return s.startswith(self.NOISE) or bool(self.WRAPPER_TAG.match(s) and s.rstrip().endswith(">"))
+
+    def message_text(self, payload: Dict[str, Any]) -> str:
+        """Join the non-blank text parts of a Codex "message" payload.
+
+        Args:
+            payload: A response_item payload; its "content" is a string or a list of blocks that
+                carry "text" (input_text / output_text).
+
+        Returns:
+            The text parts joined with newlines and stripped; "" if there are none.
+
+        Examples:
+            CodexSource().message_text({"content": [{"type": "input_text", "text": "a"}, {"text": " "}, {"text": "b"}]})
+                -> "a\\nb"
+            CodexSource().message_text({"content": "hi"}) -> "hi"
+            CodexSource().message_text({}) -> ""
+        """
+        blocks = payload.get("content")
+        if isinstance(blocks, str):
+            blocks = [{"text": blocks}]
+        texts = [block["text"] for block in (blocks or []) if isinstance(block, dict)
+                 and isinstance(block.get("text"), str) and block["text"].strip()]
+        return "\n".join(texts).strip()
+
+    def parse(self, path: str) -> Tuple[Summary, List[Msg]]:
+        """Parse a Codex rollout (~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl).
+
+        One JSON object per line, {"timestamp", "type", "payload"}. Records used:
+
+            {"type": "session_meta", "payload": {"id": "<uuid>", "timestamp": "...",
+                                                  "cwd": "/work/proj", "git": {"branch": "main"}}}
+            {"type": "turn_context", "payload": {"cwd": "/work/proj", ...}}
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user" | "assistant",
+                "content": [{"type": "input_text" | "output_text", "text": "..."}]}}
+            {"type": "response_item", "payload": {
+                "type": "function_call", "name": "shell", "arguments": "{\\"command\\": [...]}"}}
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch..."}}
+            {"type": "response_item", "payload": {
+                "type": "function_call_output" | "custom_tool_call_output", "output": "..."}}
+
+        Skipped: other roles (developer/system), other record types, and user messages that
+        are injected context (see CodexSource.user_noise: AGENTS.md text, <environment_context>...).
+
+        The id comes from session_meta when present. Otherwise it is the last 36 characters
+        of the filename stem: rollout-<timestamp>-<uuid> always ends in a 36-char UUID.
+        Codex has no title records, so the title is the first user prompt (or the first
+        assistant message); load_sessions() overrides it with session_index.jsonl names.
+
+        Args:
+            path: Path of the Codex rollout .jsonl file.
+
+        Returns:
+            A (summary, messages) tuple: summary is the index Summary (via make_summary), messages is
+            the list of Msg dicts in file order.
+
+        Example: for ~/.codex/sessions/2025/03/01/rollout-2025-03-01T10-00-00-<uuid>.jsonl with a
+        session_meta record (id "<uuid>", cwd "/work/proj"), a user message "fix the bug" and a
+        shell function_call:
+
+            CodexSource().parse(path) -> ({"source": "codex", "id": "<uuid>", "cwd": "/work/proj",
+                                           "title": "fix the bug", "n_user": 1, "n_asst": 0, ...},
+                                          [{"role": "user", "text": "fix the bug", "ts": 1.7e9},
+                                           {"role": "tool", "name": "shell", "text": "shell: ls -l", "ts": 1.7e9}])
+        """
+        stem = os.path.basename(path)[:-6]
+        sid = stem[-36:] if len(stem) >= 36 else stem
+        cwd: Optional[str] = None
+        branch: Optional[str] = None
+        first_ts: Optional[float] = None
+        last_ts: Optional[float] = None
+        msgs: List[Msg] = []
+        for record in iter_json(path):
+            rtype = record.get("type")
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            ts = parse_ts(record.get("timestamp"))
+            if rtype == "session_meta":
+                if isinstance(payload.get("id"), str):
+                    sid = payload["id"]
+                if isinstance(payload.get("cwd"), str):
+                    cwd = payload["cwd"]
+                git = payload.get("git")
+                if isinstance(git, dict) and isinstance(git.get("branch"), str):
+                    branch = git["branch"]
+                first_ts = parse_ts(payload.get("timestamp")) or first_ts
+                continue
+            if rtype == "turn_context" and not cwd and isinstance(payload.get("cwd"), str):
+                cwd = payload["cwd"]
+                continue
+            if rtype != "response_item":
+                continue
+            ptype = payload.get("type")
+            if ptype == "message":
+                role = payload.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = self.message_text(payload)
+                if not text or (role == "user" and self.user_noise(text)):
+                    continue
+                if ts:
+                    first_ts = first_ts or ts
+                    last_ts = ts
+                msgs.append({"role": role, "text": text, "ts": ts})
+            elif ptype in ("function_call", "custom_tool_call"):
+                inp = payload.get("arguments") if ptype == "function_call" else payload.get("input")
+                if inp is None:
+                    inp = payload.get("arguments", payload.get("input"))
+                if ts:
+                    last_ts = ts
+                msgs.append({"role": "tool", "name": str(payload.get("name") or "tool"),
+                             "text": summarize_tool(payload.get("name"), inp), "ts": ts})
+            elif ptype in ("function_call_output", "custom_tool_call_output"):
+                msgs.append({"role": "result", "text": content_text(payload.get("output"))[:RESULT_CAP],
+                             "ts": ts})
+        # Title: the first user prompt, else the first assistant message.
+        first_prompt = (next((m["text"] for m in msgs if m["role"] == "user"), None)
+                        or next((m["text"] for m in msgs if m["role"] == "assistant"), None))
+        title = one_line(first_prompt)[:TITLE_MAX] if first_prompt else None
+        return make_summary(self.key, sid, path, cwd, branch, title, first_ts, last_ts, msgs), msgs
+
+
+SOURCE_LIST: Tuple[Source, ...] = (ClaudeSource(), CodexSource())   # order matters: claude first
+SOURCES: Dict[str, Source] = {s.key: s for s in SOURCE_LIST}  # iterate SOURCE_LIST when order matters
+
+
 def parse_any(source: str, path: str) -> Tuple[Summary, List[Msg]]:
-    return parse_claude(path) if source == "claude" else parse_codex(path)
+    """Parse a transcript with the Source named by source.
+
+    Args:
+        source: "claude" or "codex".
+        path: Path of the transcript file.
+
+    Returns:
+        The (summary, messages) tuple from Source.parse().
+
+    Example: parse_any("claude", "/p/abc.jsonl") -> ClaudeSource().parse("/p/abc.jsonl")
+    """
+    return SOURCES[source].parse(path)
+
+
+def discover() -> List[Tuple[str, str]]:
+    """List every transcript file as (source, path) without opening any of them.
+
+    Returns:
+        A list of (source, path) pairs, one per transcript file found; all Claude Code files
+        first, then all Codex files.
+
+    Example: with ~/.claude/projects/-work-proj/abc.jsonl and
+    ~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl on disk ->
+    [("claude", "~/.claude/projects/-work-proj/abc.jsonl"),
+    ("codex", "~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl")] (paths expanded)
+    """
+    return [(s.key, path) for s in SOURCE_LIST for path in s.discover()]
 
 
 # ---------------------------------------------------------------- index
@@ -1030,7 +1284,7 @@ class Session(object):
         self.search_text = "\n".join((self.title, self.project, self.cwd, self.blob)).lower()
 
     def resume_argv(self) -> List[str]:
-        return build_resume_argv(self.source, self.id)[0]
+        return SOURCES[self.source].resume_argv(self.id)[0]
 
     def resume_warning(self) -> Optional[str]:
         """Why the configured resume command was unusable (default is used), or None.
@@ -1038,7 +1292,7 @@ class Session(object):
         Returns:
             A short message if the configured command was unusable, else None.
         """
-        return build_resume_argv(self.source, self.id)[1]
+        return SOURCES[self.source].resume_argv(self.id)[1]
 
     def resume_cmd(self) -> str:
         """Shell command line that resumes this session, prefixed with a cd into its cwd.
@@ -1054,65 +1308,6 @@ class Session(object):
         cmd = " ".join(shell_quote(w) for w in self.resume_argv())
         return ("cd %s && %s" % (shell_quote(self.cwd), cmd)) if self.cwd else cmd
 
-
-# source -> command template from --claude-cmd/--codex-cmd. A module global, written once
-# by main() before anything reads it, because resume commands are built deep inside
-# Session/App; threading it through every layer would add plumbing for no benefit.
-CMD_OVERRIDES: Dict[str, str] = {}
-DEFAULT_CMDS: Dict[str, str] = {"claude": "claude", "codex": "codex"}
-DEFAULT_RESUME_ARGS: Dict[str, List[str]] = {"claude": ["--resume", "{id}"], "codex": ["resume", "{id}"]}
-
-
-def resume_template(source: str) -> str:
-    """Command template: CLI flag, then AI_SESSIONS_<SRC>_CMD, then the bare command.
-
-    Args:
-        source: "claude" or "codex".
-
-    Returns:
-        The command template: the --claude-cmd/--codex-cmd flag if given, else the
-        AI_SESSIONS_<SOURCE>_CMD variable, else the bare command name.
-
-    Examples:
-        with no override and no env var: resume_template("claude") -> "claude"
-        with AI_SESSIONS_CLAUDE_CMD="mycl --x {id}": resume_template("claude") -> "mycl --x {id}"
-    """
-    return (CMD_OVERRIDES.get(source)
-            or os.environ.get("AI_SESSIONS_%s_CMD" % source.upper())
-            or DEFAULT_CMDS[source])
-
-
-def build_resume_argv(source: str, sid: str) -> Tuple[List[str], Optional[str]]:
-    """Returns (argv, warning). warning is None unless the template was unusable.
-
-    Args:
-        source: "claude" or "codex".
-        sid: Session id, substituted for "{id}" in the command template.
-
-    Returns:
-        An (argv, warning) tuple: argv is the command as a list of words; warning is a message when
-        the template was unparsable or empty (the default command is used), else None.
-
-    Examples:
-        build_resume_argv("claude", "abc") -> (["claude", "--resume", "abc"], None)
-        build_resume_argv("codex", "abc") -> (["codex", "resume", "abc"], None)
-        with AI_SESSIONS_CLAUDE_CMD="mycl --x {id} --y":
-            build_resume_argv("claude", "abc") -> (["mycl", "--x", "abc", "--y"], None)
-        with AI_SESSIONS_CLAUDE_CMD="'unterminated":
-            build_resume_argv("claude", "abc") ->
-                (["claude", "--resume", "abc"], "bad claude command: No closing quotation")
-    """
-    warn: Optional[str] = None
-    try:
-        words = shlex.split(resume_template(source))
-    except ValueError as e:
-        words, warn = [], "bad %s command: %s" % (source, e)
-    if not words:
-        words = [DEFAULT_CMDS[source]]
-        warn = warn or "empty %s command" % source
-    if not any("{id}" in w for w in words):
-        words = words + DEFAULT_RESUME_ARGS[source]
-    return [w.replace("{id}", sid) for w in words], warn
 
 
 def parse_osc11_reply(reply: str) -> Optional[Tuple[int, int, int]]:
@@ -1341,14 +1536,6 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def claude_dir() -> str:
-    return os.path.expanduser(os.environ.get("AI_SESSIONS_CLAUDE_DIR") or "~/.claude/projects")
-
-
-def codex_dir() -> str:
-    return os.path.expanduser(os.environ.get("AI_SESSIONS_CODEX_DIR") or "~/.codex")
-
-
 def cache_path() -> str:
     """Location of the summary index: $XDG_CACHE_HOME (default ~/.cache) / ai-sessions / index.json.
 
@@ -1359,57 +1546,6 @@ def cache_path() -> str:
     """
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     return os.path.join(base, "ai-sessions", "index.json")
-
-
-def discover() -> List[Tuple[str, str]]:
-    """List every transcript file as (source, path) without opening any of them.
-
-    Returns:
-        A list of (source, path) pairs, one per transcript file found.
-
-    Example: with ~/.claude/projects/-work-proj/abc.jsonl and
-    ~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl on disk ->
-    [("claude", "~/.claude/projects/-work-proj/abc.jsonl"),
-    ("codex", "~/.codex/sessions/2025/03/01/rollout-...-<uuid>.jsonl")] (paths expanded)
-    """
-    found: List[Tuple[str, str]] = []
-    try:
-        project_dirs = list(os.scandir(claude_dir()))
-    except OSError:
-        project_dirs = []
-    for d in project_dirs:
-        # ~/.claude/projects/memory holds memory files, not session transcripts.
-        if not d.is_dir(follow_symlinks=True) or d.name == "memory":
-            continue
-        try:
-            for f in os.scandir(d.path):
-                if f.name.endswith(".jsonl") and f.is_file():
-                    found.append(("claude", f.path))
-        except OSError:
-            pass
-    for dirpath, _dirnames, filenames in os.walk(os.path.join(codex_dir(), "sessions")):
-        for name in filenames:
-            if name.startswith("rollout-") and name.endswith(".jsonl"):
-                found.append(("codex", os.path.join(dirpath, name)))
-    return found
-
-
-def read_codex_titles() -> Dict[str, str]:
-    """Map Codex session id -> thread name from session_index.jsonl (may be absent).
-
-    Returns:
-        A dict mapping session id to a one-line title; empty if the file is missing or has no usable
-        entries.
-
-    Example: a session_index.jsonl line {"id": "u1", "thread_name": "Fix\\nbug"} ->
-    {"u1": "Fix bug"}; a missing file -> {}
-    """
-    names: Dict[str, str] = {}
-    for o in iter_json(os.path.join(codex_dir(), "session_index.jsonl")):
-        if isinstance(o.get("id"), str) and isinstance(o.get("thread_name"), str) \
-                and o["thread_name"].strip():
-            names[o["id"]] = one_line(o["thread_name"])
-    return names
 
 
 def read_index_cache(cp: str) -> Dict[str, Any]:
@@ -1612,7 +1748,7 @@ def load_sessions(progress: bool = False) -> List[Session]:
             continue
         entries[path] = {"mtime": st.st_mtime, "size": st.st_size, "summary": summary}
         dirty = True
-    roots = (claude_dir(), os.path.join(codex_dir(), "sessions"))
+    roots = tuple(s.scan_root() for s in SOURCE_LIST)
     merged = dict(cache)
     merged.update(entries)
     for p in list(merged):
@@ -1621,12 +1757,13 @@ def load_sessions(progress: bool = False) -> List[Session]:
             dirty = True
     if dirty:
         write_index_cache(cp, merged)
-    titles = read_codex_titles()
+    titles: Dict[str, Dict[str, str]] = {s.key: s.title_overrides() for s in SOURCE_LIST}
     stars = read_stars()
     for entry in entries.values():
         summary = dict(entry["summary"])
-        if summary["source"] == "codex" and summary["id"] in titles:
-            summary["title"] = titles[summary["id"]]
+        override = titles.get(summary["source"], {}).get(summary["id"])
+        if override is not None:
+            summary["title"] = override
         if summary["n_user"] + summary["n_asst"] == 0:
             continue
         summary["starred"] = summary["id"] in stars
@@ -2393,12 +2530,12 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
             lines.append(((prefix + ln) if ln else "", kind, ()))
 
     add_wrapped(s.title, "title")
-    lines.append(("%s   %s" % (LABEL[s.source], s.id), "meta", ()))
+    lines.append(("%s   %s" % (SOURCES[s.source].label, s.id), "meta", ()))
     add_wrapped("Dir:     " + (s.cwd or "-"), "meta")
     if s.branch:
         add_wrapped("Branch:  " + s.branch, "meta")
     lines.append(("Started: %s   Updated: %s" % (fmt_ts(s.first_ts), fmt_ts(s.last_ts)), "meta", ()))
-    lines.append(("Messages: %d you, %d %s" % (s.n_user, s.n_asst, ASSISTANT_NAME[s.source].lower()),
+    lines.append(("Messages: %d you, %d %s" % (s.n_user, s.n_asst, SOURCES[s.source].assistant_name.lower()),
                   "meta", ()))
     lines.append((rule_chars()[0] * min(width, 200), "dim", ()))
     body_start = len(lines)
@@ -2411,7 +2548,7 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
         if role in ("user", "assistant"):
             if lines and lines[-1][0] != "":
                 lines.append(("", "text", ()))
-            who = "You:" if role == "user" else ASSISTANT_NAME[s.source] + ":"
+            who = "You:" if role == "user" else SOURCES[s.source].assistant_name + ":"
             lines.append((who + ("  " + fmt_ts(msg["ts"], False) if msg.get("ts") else ""),
                           "user" if role == "user" else "asst", ()))
             if role == "user":
@@ -2862,7 +2999,7 @@ class App(object):
         """
         parts: List[str] = []
         if self.source != "all":
-            parts.append("source=" + LABEL[self.source])
+            parts.append("source=" + SOURCES[self.source].label)
         if self.project is not None:
             parts.append("project=" + (os.path.basename(self.project.rstrip("/")) or "-"))
         if self.starred_only:
@@ -3053,7 +3190,7 @@ class App(object):
             if s.starred:
                 self.put(y, x, "*", self.attrs[pre + "star"])
             x += STAR_COL_WIDTH
-            self.put(y, x, TAG[s.source], tag_attr)
+            self.put(y, x, SOURCES[s.source].tag, tag_attr)
             x += TAG_COL_WIDTH
             self.text(y, x, pad(s.project, projw), projw, extra, pat)
             x += projw + 1
@@ -3208,7 +3345,7 @@ class App(object):
 
         Example: source "claude" -> source "codex"; source "codex" -> "all"
         """
-        order = ["all", "claude", "codex"]
+        order = ["all"] + [s.key for s in SOURCE_LIST]
         self.source = order[(order.index(self.source) + 1) % len(order)]
         self.refilter()
 
@@ -3809,7 +3946,7 @@ class Viewer(object):
         title = clip(("* " if self.session.starred else "") + self.session.title, max(0, w - 40))
         hit_text = ("hit %d/%d" % (self.hit_index + 1, len(self.hits))) if self.hits else \
             ("no hits" if terms else "")
-        app.put(0, 0, clip(" %s %s  %s" % (TAG[self.session.source], title, hit_text), w - 1),
+        app.put(0, 0, clip(" %s %s  %s" % (SOURCES[self.session.source].tag, title, hit_text), w - 1),
                 app.attrs["head"])
         for i in range(bh):
             j = self.offset + i
@@ -3996,11 +4133,10 @@ def current_session_id(source: Optional[str], env: Optional[Dict[str, str]] = No
     """
     if env is None:
         env = dict(os.environ)
-    names = {"codex": ["CODEX_THREAD_ID"], "claude": ["CLAUDE_CODE_SESSION_ID"]}.get(
-        source or "", ["CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"])
-    for name in names:
-        if env.get(name):
-            return env[name]
+    # Codex is checked first (see above); an unrecognized source means "both".
+    for src in (SOURCES["codex"], SOURCES["claude"]):
+        if (source not in SOURCES or source == src.key) and env.get(src.session_env_var):
+            return env[src.session_env_var]
     return None
 
 
@@ -4103,7 +4239,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--list", action="store_true",
                     help="print tab-separated rows: date, source, id, project, title")
     ap.add_argument("--search", metavar="QUERY", help="with --list: only sessions matching QUERY")
-    ap.add_argument("--source", choices=("claude", "codex"), help="restrict to one source")
+    ap.add_argument("--source", choices=tuple(s.key for s in SOURCE_LIST), help="restrict to one source")
     ap.add_argument("--show", metavar="ID", help="print a transcript (id or unique prefix)")
     ap.add_argument("--starred", action="store_true", help="with --list: only starred sessions")
     star = ap.add_mutually_exclusive_group()
@@ -4147,9 +4283,9 @@ def main() -> int:
     ap = build_arg_parser()
     args = ap.parse_args()
     if args.claude_cmd:
-        CMD_OVERRIDES["claude"] = args.claude_cmd
+        SOURCES["claude"].cmd_override = args.claude_cmd
     if args.codex_cmd:
-        CMD_OVERRIDES["codex"] = args.codex_cmd
+        SOURCES["codex"].cmd_override = args.codex_cmd
     stream: Any
     for stream in (sys.stdout, sys.stderr):
         try:

@@ -21,12 +21,19 @@ Small standalone CLI tools; see [README.md](README.md).
 
 One executable script (no `.py` suffix), in layers:
 
-1. **Parsing**: `parse_claude` / `parse_codex` turn a JSONL transcript into a `Summary`
-   (index entry) and a list of `Msg` dicts. The type comments near the top of the script
-   define both. Injected harness messages are dropped via `CLAUDE_NOISE` / `CODEX_NOISE`.
+1. **Parsing**: everything specific to one tool lives in a `Source` subclass
+   (`ClaudeSource`, `CodexSource`), registered in `SOURCE_LIST` (order matters: claude first)
+   and looked up by key in `SOURCES`. A source has display attributes (`tag`, `label`,
+   `assistant_name`), resume settings (`default_cmd`, `resume_args`, `cmd_override`),
+   `session_env_var`, and methods `root`, `scan_root`, `discover`, `parse`,
+   `title_overrides`, `resume_template` and `resume_argv`. `Source.parse` turns a JSONL
+   transcript into a `Summary` (index entry) and a list of `Msg` dicts; the type comments
+   near the top of the script define both. Injected harness messages are dropped via each
+   source's `NOISE`. Shared helpers (`iter_json`, `make_summary`, ...) stay module-level.
+   Adding a tool means adding a `Source` subclass and putting an instance in `SOURCE_LIST`.
 2. **Index**: `load_sessions` caches summaries in `$XDG_CACHE_HOME/ai-sessions/index.json`,
    keyed by path and invalidated by mtime and size. **Bump `INDEX_VERSION` whenever
-   `Summary` keys or meaning change.** Codex titles from `session_index.jsonl` are applied
+   `Summary` keys or meaning change.** Titles from `Source.title_overrides` (Codex's `session_index.jsonl`) are applied
    after the cache and never stored in it. Stars are user data in
    `$XDG_DATA_HOME/ai-sessions/stars.json` (`read_stars` / `set_star`, which re-reads before
    writing); they are applied in `load_sessions` as `Session.starred`, not cached. The
@@ -39,7 +46,7 @@ One executable script (no `.py` suffix), in layers:
    `wrap_segments`, `_table_lines`), which strips the markup and emits the `heading`, `code`,
    `quote` and `table` kinds; user prompts, tool rows and results are not parsed.
 4. **TUI**: `App` (session list plus preview) and `Viewer` (full-screen transcript) share
-   one curses window. Resuming goes through `build_resume_argv`, configured by
+   one curses window. Resuming goes through `Source.resume_argv`, configured by
    `AI_SESSIONS_*_CMD`.
 
 Tests import the script with `SourceFileLoader`. They point every directory env var at temp
