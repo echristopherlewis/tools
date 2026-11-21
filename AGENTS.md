@@ -44,14 +44,16 @@ One executable script (no `.py` suffix), in layers:
    `CLAUDE_CODE_SESSION_ID`.
 3. **Output**: `cmd_list` / `cmd_show` for plain text; `render` builds the transcript
    lines that `--show` and the TUI both use. A `Line` is `(text, kind, spans)`, where `spans`
-   are `(start, end, style)` character offsets for inline styles (`App.text` draws them).
+   are `(start, end, style)` character offsets for inline styles (`Screen.text` draws them).
    Assistant replies go through the markdown layer (`markdown_lines`, `parse_inline`,
    `wrap_segments`, `_table_lines`), which strips the markup and emits the `heading`, `code`,
    `quote` and `table` kinds; user prompts, tool rows and results are not parsed.
-4. **TUI**: `App` (session list plus preview) and `Viewer` (full-screen transcript) share
-   one curses window. Resuming goes through `Source.resume_argv`, configured by
-   `AI_SESSIONS_*_CMD`. `Theme` owns every color decision (terminal background detection,
-   row stripe, palette) and builds the curses attribute table (`curses_attrs`) for `App`.
+4. **TUI**: `Screen` wraps the curses window and its attribute table (drawing, key input,
+   the footer prompt, the help screen); `App` (session list plus preview) and `Viewer`
+   (full-screen transcript) share one. Resuming goes through `App.choose_resume` and
+   `Source.resume_argv`, configured by `AI_SESSIONS_*_CMD`. `Theme` owns every color
+   decision (terminal background detection, row stripe, palette) and builds the curses
+   attribute table (`curses_attrs`) that `App` hands to its `Screen`.
 
 Tests import the script with `SourceFileLoader`. They point every directory env var at temp
 dirs and drive the TUI with a `FakeScr` key script, so no real terminal is needed. The

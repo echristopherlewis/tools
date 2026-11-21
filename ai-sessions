@@ -1661,7 +1661,7 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-class StarStore:
+class StarStore(object):
     """The starred sessions, kept in stars.json in the data directory.
 
     Stars are user data (not cache), so write errors are raised. Paths are computed from
@@ -1769,7 +1769,7 @@ class StarStore:
 STARS = StarStore()
 
 
-class SessionIndex:
+class SessionIndex(object):
     """The summary index of all sessions, plus an in-memory cache of parsed transcripts.
 
     Paths come from the environment on every call, never from __init__, so a changed
@@ -2830,60 +2830,23 @@ def help_lines() -> List[Tuple[str, str, str]]:
     return rows
 
 
-class App(object):
-    def __init__(self, scr: Window, sessions: List[Session], query: str,
-                 source: str = "all",
-                 background: Optional[Tuple[int, int, int]] = None) -> None:
-        """Set up UI state (filter, sort, selection, scroll, caches), colors, the filtered view
-        and the key map. scr is the curses window; query/source are the initial filter.
+class Screen(object):
+    """The curses window plus its attribute table: drawing primitives, key input, the footer
+    line editor and the help screen. Shared by App and Viewer.
+    """
+
+    def __init__(self, scr: Window, attrs: Optional[Dict[str, int]] = None) -> None:
+        """Wrap the curses window scr.
 
         Args:
             scr: The curses window.
-            sessions: All sessions to browse.
-            query: Initial filter text.
-            source: Initial source filter: "all" (default), "claude" or "codex".
-            background: Terminal background (r, g, b) for the Theme (row stripe, palette), or None.
+            attrs: Attribute table (name -> curses attribute, see Theme.curses_attrs); default
+                empty, App.init_colors fills it.
 
-        Example: App(scr, sessions, "fix", "claude") -> .view holds the Claude sessions matching
-        "fix", newest first; .sel == 0; .sort == "last"; .split is None (layout chosen by width)
+        Example: Screen(scr).attrs == {}; Screen(scr, {"head": A_REVERSE}).attrs["head"] == A_REVERSE
         """
         self.scr = scr
-        self.all = sessions
-        self.query = query
-        self.source = source
-        self.theme = Theme(background)
-        self.project: Optional[str] = None
-        self.sort = "last"
-        self.show_results = False
-        self.mine_only = False
-        self.starred_only = False
-        self.split: Optional[str] = None  # "side" / "stack" / "list"; None: by terminal width
-        self.sel = 0
-        self.top = 0
-        self.preview_offset = 0
-        self.status = ""
-        self.resume: Optional[Session] = None
-        self.resume_override: Optional[List[str]] = None
-        self.view: List[Session] = []
-        self._preview_cache_key: Optional[Tuple[Any, ...]] = None
-        self._preview_cache: Tuple[List[Line], int, List[int]] = ([], 0, [])
-        self._preview_scroll_key: Optional[Tuple[Any, ...]] = None
-        self.attrs: Dict[str, int] = {}
-        self.init_colors()
-        self.refilter()
-        self.keymap = self.build_keymap()
-
-    # -- setup
-    def init_colors(self) -> None:
-        """Fill self.attrs from the theme (see Theme.curses_attrs) and hide the cursor.
-
-        Example: on a basic color terminal -> self.attrs["sel"] == A_REVERSE
-        """
-        self.attrs = self.theme.curses_attrs()
-        try:
-            curses.curs_set(0)
-        except curses.error:
-            pass
+        self.attrs: Dict[str, int] = attrs if attrs is not None else {}
 
     # -- drawing primitives
     def put(self, y: int, x: int, s: str, attr: int = 0) -> None:
@@ -2996,6 +2959,212 @@ class App(object):
         except curses.error:
             pass
 
+    # -- key input
+    def key(self) -> Optional[str]:
+        """Read one key and return its name: printable keys as themselves; special keys as names
+        ("ENTER", "ESC", "BS", "CU", "TAB", "CTRL_C", "UP", "DOWN", "PGUP", "PGDN", "HOME", "END",
+        "SUP", "SDOWN", "RESIZE", "MOUSE"); unmapped special keys as "UNKNOWN"; None if nothing arrived.
+
+        Returns:
+            A key name (a printable character or a name from the list above), or None if no key
+            arrived.
+
+        Examples: pressing j -> "j"; pressing Enter -> "ENTER"; pressing F5 -> "UNKNOWN";
+        Ctrl-U -> "CU"; read timeout -> None
+        """
+        try:
+            k = self.scr.get_wch()
+        except KeyboardInterrupt:
+            return "CTRL_C"
+        except curses.error:
+            return None
+        if isinstance(k, str):
+            return {"\n": "ENTER", "\r": "ENTER", "\x1b": "ESC", "\x7f": "BS", "\b": "BS",
+                    "\x15": "CU", "\t": "TAB", "\x03": "CTRL_C"}.get(k, k)
+        names: Dict[int, str] = {curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_PPAGE: "PGUP",
+                 curses.KEY_NPAGE: "PGDN", curses.KEY_HOME: "HOME", curses.KEY_END: "END",
+                 curses.KEY_RESIZE: "RESIZE", curses.KEY_BACKSPACE: "BS", curses.KEY_ENTER: "ENTER",
+                 curses.KEY_MOUSE: "MOUSE"}
+        for nm, val in (("KEY_SR", "SUP"), ("KEY_SF", "SDOWN"), ("KEY_BTAB", "TAB")):
+            if hasattr(curses, nm):
+                names[getattr(curses, nm)] = val
+        # Unmapped special keys (F-keys etc.) get a name no keymap binds, so they are
+        # ignored; they must not collide with a printable key such as "?" (help).
+        return names.get(k, "UNKNOWN")
+
+    @staticmethod
+    def edit(buf: str, k: Optional[str]) -> Tuple[str, Optional[str]]:
+        """Apply a line-edit key to buf; return (new, done) where done in (None,'ok','cancel').
+
+        Args:
+            buf: The text being edited.
+            k: A key name from key(), or None.
+
+        Returns:
+            A (new_buf, done) tuple: new_buf is the edited text; done is "ok" after Enter, "cancel"
+            after Esc or Ctrl-C, else None.
+
+        Examples:
+            edit("ab", "c") -> ("abc", None)
+            edit("ab", "BS") -> ("a", None)
+            edit("ab", "CU") -> ("", None)
+            edit("ab", "ENTER") -> ("ab", "ok")
+            edit("ab", "ESC") -> ("ab", "cancel")
+            edit("ab", "UP") -> ("ab", None)   (non-printable keys are ignored)
+        """
+        if k == "ENTER":
+            return buf, "ok"
+        if k == "ESC" or k == "CTRL_C":
+            return buf, "cancel"
+        if k == "BS":
+            return buf[:-1], None
+        if k == "CU":
+            return "", None
+        if isinstance(k, str) and len(k) == 1 and k.isprintable():
+            return buf + k, None
+        return buf, None
+
+    def prompt(self, label: str, initial: str, live: Optional[Callable[[str], None]] = None,
+               redraw: Optional[Callable[[], None]] = None) -> Tuple[str, bool]:
+        """Footer line editor. Returns (text, accepted); Esc/^C cancel, ^U erases.
+
+        live(text) is called after each edit (the filter prompt re-filters as you type).
+        redraw, if given, is called before each keystroke is read to repaint the whole view
+        (so live changes show); the full-screen viewer passes None to keep its already-drawn
+        frame and only repaint the footer.
+
+        Args:
+            label: Text shown before the input, e.g. "/".
+            initial: Starting text of the input.
+            live: Optional callback called with the text after every edit.
+            redraw: Optional callback that repaints the whole view each keystroke (the list
+                passes App.draw); None (default) leaves the current frame.
+
+        Returns:
+            A (text, accepted) tuple: the final text, and True for Enter or False if cancelled.
+
+        Examples: prompt("/", "fi") with keys "x", ENTER -> ("fix", True);
+                  prompt("/", "fi") with key ESC -> ("fi", False)
+        """
+        buf = initial
+        while True:
+            if redraw is not None:
+                redraw()
+            h, w = self.scr.getmaxyx()
+            if h >= 2 and w > 2:
+                self.fill(h - 1, self.attrs["head"])
+                shown = label + buf
+                self.put(h - 1, 0, clip(" " + shown, w - 2), self.attrs["head"])
+                self.put(h - 1, min(w - 2, 1 + str_width(clip(shown, w - 3))), "_",
+                         self.attrs["head"])
+                self.scr.refresh()
+            k = self.key()
+            if k is None or k == "RESIZE":
+                continue
+            buf, done = self.edit(buf, k)
+            if done == "ok":
+                return buf, True
+            if done == "cancel":
+                return buf, False
+            if live is not None:
+                live(buf)
+
+    def show_help(self) -> None:
+        """Show the key bindings full-screen and wait for a key. j/k, arrows and PgUp/PgDn scroll
+        when the help is taller than the screen; any other key closes it. Redraws on resize.
+
+        Example: show_help() draws HELP_TITLE (bold), a "Session list" heading, rows such as
+        "  /              filter (terms ANDed)", and returns when the user presses "x".
+        """
+        rows = help_lines()
+        top = 0
+        while True:
+            self.scr.erase()
+            h, w = self.scr.getmaxyx()
+            body = max(1, h - 1)  # last row is the footer
+            top = max(0, min(top, len(rows) - body))
+            for y, (kind, keys, text) in enumerate(rows[top:top + body]):
+                if kind == "title":
+                    self.put(y, 1, clip(text, w - 2), self.attrs["bold"])
+                elif kind == "section":
+                    self.put(y, 1, clip(text, w - 2), self.attrs["head"])
+                elif kind == "key":
+                    self.put(y, 3, clip(keys, w - 4), self.attrs["asst"])
+                    if w > 3 + HELP_KEY_WIDTH:
+                        self.put(y, 3 + HELP_KEY_WIDTH, clip(text, w - 4 - HELP_KEY_WIDTH))
+            more = len(rows) > body
+            footer = HELP_FOOTER + ("  j/k scroll" if more else "")
+            self.put(h - 1, 1, clip(footer, w - 2), self.attrs["dim"])
+            self.scr.refresh()
+            k = self.key()
+            if k in (None, "RESIZE", "MOUSE"):
+                continue
+            if more and k in ("j", "DOWN", "SDOWN"):
+                top += 1
+            elif more and k in ("k", "UP", "SUP"):
+                top -= 1
+            elif more and k in ("PGDN", " "):
+                top += body
+            elif more and k in ("PGUP", "b"):
+                top -= body
+            else:
+                return
+
+
+class App(object):
+    def __init__(self, scr: Window, sessions: List[Session], query: str,
+                 source: str = "all",
+                 background: Optional[Tuple[int, int, int]] = None) -> None:
+        """Set up UI state (filter, sort, selection, scroll, caches), colors, the filtered view
+        and the key map. scr is the curses window; query/source are the initial filter.
+
+        Args:
+            scr: The curses window.
+            sessions: All sessions to browse.
+            query: Initial filter text.
+            source: Initial source filter: "all" (default), "claude" or "codex".
+            background: Terminal background (r, g, b) for the Theme (row stripe, palette), or None.
+
+        Example: App(scr, sessions, "fix", "claude") -> .view holds the Claude sessions matching
+        "fix", newest first; .sel == 0; .sort == "last"; .split is None (layout chosen by width)
+        """
+        self.screen = Screen(scr)
+        self.all = sessions
+        self.query = query
+        self.source = source
+        self.theme = Theme(background)
+        self.project: Optional[str] = None
+        self.sort = "last"
+        self.show_results = False
+        self.mine_only = False
+        self.starred_only = False
+        self.split: Optional[str] = None  # "side" / "stack" / "list"; None: by terminal width
+        self.sel = 0
+        self.top = 0
+        self.preview_offset = 0
+        self.status = ""
+        self.resume: Optional[Session] = None
+        self.resume_override: Optional[List[str]] = None
+        self.view: List[Session] = []
+        self._preview_cache_key: Optional[Tuple[Any, ...]] = None
+        self._preview_cache: Tuple[List[Line], int, List[int]] = ([], 0, [])
+        self._preview_scroll_key: Optional[Tuple[Any, ...]] = None
+        self.init_colors()
+        self.refilter()
+        self.keymap = self.build_keymap()
+
+    # -- setup
+    def init_colors(self) -> None:
+        """Fill self.screen.attrs from the theme (see Theme.curses_attrs) and hide the cursor.
+
+        Example: on a basic color terminal -> self.screen.attrs["sel"] == A_REVERSE
+        """
+        self.screen.attrs = self.theme.curses_attrs()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
     # -- state
     def refilter(self, keep: bool = True) -> None:
         """Recompute self.view from the query/source/project filters and the sort mode, reset the
@@ -3044,70 +3213,6 @@ class App(object):
             parts.append("/" + self.query)
         return " ".join(parts) if parts else "none"
 
-    # -- key input
-    def key(self) -> Optional[str]:
-        """Read one key and return its name: printable keys as themselves; special keys as names
-        ("ENTER", "ESC", "BS", "CU", "TAB", "CTRL_C", "UP", "DOWN", "PGUP", "PGDN", "HOME", "END",
-        "SUP", "SDOWN", "RESIZE", "MOUSE"); unmapped special keys as "UNKNOWN"; None if nothing arrived.
-
-        Returns:
-            A key name (a printable character or a name from the list above), or None if no key
-            arrived.
-
-        Examples: pressing j -> "j"; pressing Enter -> "ENTER"; pressing F5 -> "UNKNOWN";
-        Ctrl-U -> "CU"; read timeout -> None
-        """
-        try:
-            k = self.scr.get_wch()
-        except KeyboardInterrupt:
-            return "CTRL_C"
-        except curses.error:
-            return None
-        if isinstance(k, str):
-            return {"\n": "ENTER", "\r": "ENTER", "\x1b": "ESC", "\x7f": "BS", "\b": "BS",
-                    "\x15": "CU", "\t": "TAB", "\x03": "CTRL_C"}.get(k, k)
-        names: Dict[int, str] = {curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_PPAGE: "PGUP",
-                 curses.KEY_NPAGE: "PGDN", curses.KEY_HOME: "HOME", curses.KEY_END: "END",
-                 curses.KEY_RESIZE: "RESIZE", curses.KEY_BACKSPACE: "BS", curses.KEY_ENTER: "ENTER",
-                 curses.KEY_MOUSE: "MOUSE"}
-        for nm, val in (("KEY_SR", "SUP"), ("KEY_SF", "SDOWN"), ("KEY_BTAB", "TAB")):
-            if hasattr(curses, nm):
-                names[getattr(curses, nm)] = val
-        # Unmapped special keys (F-keys etc.) get a name no keymap binds, so they are
-        # ignored; they must not collide with a printable key such as "?" (help).
-        return names.get(k, "UNKNOWN")
-
-    def edit(self, buf: str, k: Optional[str]) -> Tuple[str, Optional[str]]:
-        """Apply a line-edit key to buf; return (new, done) where done in (None,'ok','cancel').
-
-        Args:
-            buf: The text being edited.
-            k: A key name from key(), or None.
-
-        Returns:
-            A (new_buf, done) tuple: new_buf is the edited text; done is "ok" after Enter, "cancel"
-            after Esc or Ctrl-C, else None.
-
-        Examples:
-            edit("ab", "c") -> ("abc", None)
-            edit("ab", "BS") -> ("a", None)
-            edit("ab", "CU") -> ("", None)
-            edit("ab", "ENTER") -> ("ab", "ok")
-            edit("ab", "ESC") -> ("ab", "cancel")
-            edit("ab", "UP") -> ("ab", None)   (non-printable keys are ignored)
-        """
-        if k == "ENTER":
-            return buf, "ok"
-        if k == "ESC" or k == "CTRL_C":
-            return buf, "cancel"
-        if k == "BS":
-            return buf[:-1], None
-        if k == "CU":
-            return "", None
-        if isinstance(k, str) and len(k) == 1 and k.isprintable():
-            return buf + k, None
-        return buf, None
-
     # -- layout
     def layout(self) -> Dict[str, Any]:
         """Compute screen regions for the list and preview. Returns {"mode": "side" | "stack" |
@@ -3127,7 +3232,7 @@ class App(object):
             80 cols x 24 rows, split "list" -> {"mode": "list", "list": (1, 0, 22, 80),
                                                 "prev": (1, 0, 0, 0), "sep": None}
         """
-        h, w = self.scr.getmaxyx()
+        h, w = self.screen.scr.getmaxyx()
         body_top, body_bot = 1, h - 2  # inclusive rows
         bh = body_bot - body_top + 1
         mode = self.split or ("side" if w >= SIDE_BY_SIDE_MIN_COLS else "stack")
@@ -3150,34 +3255,34 @@ class App(object):
         " ai-sessions  3/10 sessions  filter: /fix  sort: last activity", the footer shows the
         key hints (or self.status if set); a screen under 24x6 shows only "terminal too small".
         """
-        scr = self.scr
+        scr = self.screen.scr
         scr.erase()
         h, w = scr.getmaxyx()
         if h < 6 or w < 24:
-            self.put(0, 0, clip("terminal too small", max(w - 1, 1)))
+            self.screen.put(0, 0, clip("terminal too small", max(w - 1, 1)))
             scr.refresh()
             return
         pat = term_regex(terms_of(self.query))
         total = len(self.all)
-        self.fill(0, self.attrs["head"])
+        self.screen.fill(0, self.screen.attrs["head"])
         hdr = " ai-sessions  %d/%d sessions  filter: %s  sort: %s%s" % (
             len(self.view), total, self.filter_desc(),
             "last activity" if self.sort == "last" else "start time",
             "  [results]" if self.show_results else "") + ("  [mine]" if self.mine_only else "")
-        self.put(0, 0, clip(hdr, w - 1), self.attrs["head"])
+        self.screen.put(0, 0, clip(hdr, w - 1), self.screen.attrs["head"])
         lay = self.layout()
         self.draw_list(lay["list"], pat)
         hz, vt = rule_chars()
         if lay["mode"] == "side":
             for y in range(1, h - 1):
-                self.put(y, lay["sep"], vt, self.attrs["dim"])
+                self.screen.put(y, lay["sep"], vt, self.screen.attrs["dim"])
         elif lay["mode"] == "stack":
-            self.put(lay["sep"], 0, hz * (w - 1), self.attrs["dim"])
+            self.screen.put(lay["sep"], 0, hz * (w - 1), self.screen.attrs["dim"])
         self.draw_preview(lay["prev"], pat)
-        self.fill(h - 1, self.attrs["head"])
+        self.screen.fill(h - 1, self.screen.attrs["head"])
         foot = self.status or (" j/k move  / filter  Tab source  p project  * star  S starred  s sort  "
                                "t results  u mine  Enter view  r resume  e edit+resume  y copy  R rescan  ? help  q quit")
-        self.put(h - 1, 0, clip(foot, w - 1), self.attrs["head"])
+        self.screen.put(h - 1, 0, clip(foot, w - 1), self.screen.attrs["head"])
         scr.refresh()
 
     def draw_list(self, box: Box, pat: Optional[Pattern[str]]) -> None:
@@ -3201,7 +3306,7 @@ class App(object):
         if self.sel >= self.top + bh:
             self.top = self.sel - bh + 1
         if not self.view:
-            self.put(y0, x0, clip("(no matching sessions)", bw - 1), self.attrs["dim"])
+            self.screen.put(y0, x0, clip("(no matching sessions)", bw - 1), self.screen.attrs["dim"])
             return
         projw = min(14, max(6, bw // 6))
         for i in range(bh):
@@ -3216,21 +3321,21 @@ class App(object):
             striped = idx % 2 == 1 and not cur
             row = "sel" if cur else ("stripe" if striped else "plain")
             pre = "" if row == "plain" else row + "_"  # attrs key prefix: "cc" vs "sel_cc"
-            extra = self.attrs[row]
+            extra = self.screen.attrs[row]
             if cur or striped:
-                self.put(y, x0, " " * (bw - 1), extra)
-            tag_attr = self.attrs[pre + ("cc" if s.source == "claude" else "cx")]
+                self.screen.put(y, x0, " " * (bw - 1), extra)
+            tag_attr = self.screen.attrs[pre + ("cc" if s.source == "claude" else "cx")]
             x = x0
-            self.put(y, x, fmt_ts(s.last_ts if self.sort == "last" else s.first_ts), self.attrs[pre + "dim"])
+            self.screen.put(y, x, fmt_ts(s.last_ts if self.sort == "last" else s.first_ts), self.screen.attrs[pre + "dim"])
             x += DATE_COL_WIDTH
             if s.starred:
-                self.put(y, x, "*", self.attrs[pre + "star"])
+                self.screen.put(y, x, "*", self.screen.attrs[pre + "star"])
             x += STAR_COL_WIDTH
-            self.put(y, x, SOURCES[s.source].tag, tag_attr)
+            self.screen.put(y, x, SOURCES[s.source].tag, tag_attr)
             x += TAG_COL_WIDTH
-            self.text(y, x, pad(s.project, projw), projw, extra, pat)
+            self.screen.text(y, x, pad(s.project, projw), projw, extra, pat)
             x += projw + 1
-            self.text(y, x, s.title, bw - 1 - (x - x0), extra, pat)
+            self.screen.text(y, x, s.title, bw - 1 - (x - x0), extra, pat)
 
     def preview_lines(self, s: Session, width: int,
                       pat_terms: List[str]) -> Tuple[List[Line], int, List[int]]:
@@ -3285,7 +3390,7 @@ class App(object):
             if j >= len(lines):
                 break
             t, kind, spans = lines[j]
-            self.draw_line(y0 + i, x0, t, bw - 1, kind, pat, spans)
+            self.screen.draw_line(y0 + i, x0, t, bw - 1, kind, pat, spans)
 
     # -- actions
     def move(self, d: int) -> None:
@@ -3338,7 +3443,7 @@ class App(object):
         return True
 
     def on_help(self) -> None:
-        self.help()
+        self.screen.show_help()
 
     def on_down(self) -> None:
         self.move(1)
@@ -3497,10 +3602,7 @@ class App(object):
         with an empty list or a vanished cwd -> returns False (status explains why).
         """
         s = self.current()
-        if s is None or not self.can_resume(s):
-            return False
-        self.resume = s
-        return True
+        return s is not None and self.choose_resume(s, edit=False)
 
     def on_edit_resume(self) -> bool:
         """e: let the user edit the resume command, then choose the session for resuming.
@@ -3513,14 +3615,7 @@ class App(object):
         "--model", "opus"], returns True; pressing Esc -> returns False.
         """
         s = self.current()
-        if s is None or not self.can_resume(s):
-            return False
-        argv = self.edit_resume_command(s)
-        if argv is None:
-            return False
-        self.resume = s
-        self.resume_override = argv
-        return True
+        return s is not None and self.choose_resume(s, edit=True)
 
     def on_copy(self) -> None:
         s = self.current()
@@ -3558,13 +3653,13 @@ class App(object):
             return False
         return True
 
-    def edit_resume_command(self, s: Session, redraw_screen: bool = True) -> Optional[List[str]]:
+    def edit_resume_command(self, s: Session, redraw: bool = True) -> Optional[List[str]]:
         """Let the user edit the resume command line; return its argv, or None if cancelled.
 
         Args:
             s: The session whose resume command is edited.
-            redraw_screen: True (default) repaints the whole list each keystroke; the viewer passes
-                False.
+            redraw: True (default) repaints the whole list each keystroke (the footer prompt is
+                given App.draw as its redraw callback); the viewer passes False.
 
         Returns:
             The edited command as an argv list, or None if the user cancelled.
@@ -3576,7 +3671,8 @@ class App(object):
         """
         initial = " ".join(shell_quote(w) for w in s.resume_argv())
         while True:
-            buf, ok = self.prompt("resume: ", initial, redraw_screen=redraw_screen)
+            buf, ok = self.screen.prompt("resume: ", initial,
+                                          redraw=self.draw if redraw else None)
             if not ok:
                 self.status = " resume cancelled"
                 return None
@@ -3591,8 +3687,36 @@ class App(object):
                 return None
             return argv
 
+    def choose_resume(self, s: Session, edit: bool, redraw: bool = True) -> bool:
+        """Choose s for resuming (what r / e do in the list and the viewer), optionally after
+        letting the user edit the resume command.
+
+        Args:
+            s: The session to resume.
+            edit: True to let the user edit the command line first (e); False to use it as is (r).
+            redraw: Passed to edit_resume_command; the viewer passes False.
+
+        Returns:
+            True if s was chosen (self.resume is set, and self.resume_override if edited);
+            False if its cwd is gone or the edit was cancelled (status explains why).
+
+        Examples: edit=False, cwd exists -> resume == s, returns True;
+            edit=True, user enters "claude --resume a1 --model opus" -> resume == s,
+            resume_override == ["claude", "--resume", "a1", "--model", "opus"], returns True;
+            edit=True and Esc -> returns False, status == " resume cancelled"
+        """
+        if not self.can_resume(s):
+            return False
+        if edit:
+            argv = self.edit_resume_command(s, redraw)
+            if argv is None:
+                return False
+            self.resume_override = argv
+        self.resume = s
+        return True
+
     def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
-        """Key name (see App.key) -> handler for the session list.
+        """Key name (see Screen.key) -> handler for the session list.
 
         Returns:
             A dict mapping each key name to its handler method.
@@ -3637,57 +3761,13 @@ class App(object):
         """
         while True:
             self.draw()
-            k = self.key()
+            k = self.screen.key()
             self.status = ""  # status messages last for one keypress
             if k is None or k == "RESIZE":
                 continue
             handler = self.keymap.get(k)
             if handler is not None and handler():
                 return
-
-    def prompt(self, label: str, initial: str, live: Optional[Callable[[str], None]] = None,
-               redraw_screen: bool = True) -> Tuple[str, bool]:
-        """Footer line editor. Returns (text, accepted); Esc/^C cancel, ^U erases.
-
-        live(text) is called after each edit (the filter prompt re-filters as you type).
-        redraw_screen=True repaints the whole list view each keystroke (so live changes
-        show); the full-screen viewer passes False to keep its already-drawn frame and
-        only repaint the footer.
-
-        Args:
-            label: Text shown before the input, e.g. "/".
-            initial: Starting text of the input.
-            live: Optional callback called with the text after every edit.
-            redraw_screen: True (default) repaints the whole list each keystroke.
-
-        Returns:
-            A (text, accepted) tuple: the final text, and True for Enter or False if cancelled.
-
-        Examples: prompt("/", "fi") with keys "x", ENTER -> ("fix", True);
-                  prompt("/", "fi") with key ESC -> ("fi", False)
-        """
-        buf = initial
-        while True:
-            if redraw_screen:
-                self.draw()
-            h, w = self.scr.getmaxyx()
-            if h >= 2 and w > 2:
-                self.fill(h - 1, self.attrs["head"])
-                shown = label + buf
-                self.put(h - 1, 0, clip(" " + shown, w - 2), self.attrs["head"])
-                self.put(h - 1, min(w - 2, 1 + str_width(clip(shown, w - 3))), "_",
-                         self.attrs["head"])
-                self.scr.refresh()
-            k = self.key()
-            if k is None or k == "RESIZE":
-                continue
-            buf, done = self.edit(buf, k)
-            if done == "ok":
-                return buf, True
-            if done == "cancel":
-                return buf, False
-            if live is not None:
-                live(buf)
 
     def filter_mode(self) -> None:
         """Prompt for the list filter ("/"), refiltering live as you type. Enter keeps the text;
@@ -3699,50 +3779,9 @@ class App(object):
         def live(b: str) -> None:
             self.query = b
             self.refilter()
-        buf, ok = self.prompt("/", self.query, live)
+        buf, ok = self.screen.prompt("/", self.query, live, redraw=self.draw)
         self.query = buf if ok else ""  # Esc clears the filter rather than restoring it
         self.refilter()
-
-    def help(self) -> None:
-        """Show the key bindings full-screen and wait for a key. j/k, arrows and PgUp/PgDn scroll
-        when the help is taller than the screen; any other key closes it. Redraws on resize.
-
-        Example: help() draws HELP_TITLE (bold), a "Session list" heading, rows such as
-        "  /              filter (terms ANDed)", and returns when the user presses "x".
-        """
-        rows = help_lines()
-        top = 0
-        while True:
-            self.scr.erase()
-            h, w = self.scr.getmaxyx()
-            body = max(1, h - 1)  # last row is the footer
-            top = max(0, min(top, len(rows) - body))
-            for y, (kind, keys, text) in enumerate(rows[top:top + body]):
-                if kind == "title":
-                    self.put(y, 1, clip(text, w - 2), self.attrs["bold"])
-                elif kind == "section":
-                    self.put(y, 1, clip(text, w - 2), self.attrs["head"])
-                elif kind == "key":
-                    self.put(y, 3, clip(keys, w - 4), self.attrs["asst"])
-                    if w > 3 + HELP_KEY_WIDTH:
-                        self.put(y, 3 + HELP_KEY_WIDTH, clip(text, w - 4 - HELP_KEY_WIDTH))
-            more = len(rows) > body
-            footer = HELP_FOOTER + ("  j/k scroll" if more else "")
-            self.put(h - 1, 1, clip(footer, w - 2), self.attrs["dim"])
-            self.scr.refresh()
-            k = self.key()
-            if k in (None, "RESIZE", "MOUSE"):
-                continue
-            if more and k in ("j", "DOWN", "SDOWN"):
-                top += 1
-            elif more and k in ("k", "UP", "SUP"):
-                top -= 1
-            elif more and k in ("PGDN", " "):
-                top += body
-            elif more and k in ("PGUP", "b"):
-                top -= body
-            else:
-                return
 
     def viewer(self, s: Session) -> bool:
         """Open the full-screen viewer; True if a resume was chosen from it.
@@ -3780,6 +3819,7 @@ class Viewer(object):
         .hit_index == -1, .msgs == INDEX.transcript(s)
         """
         self.app = app
+        self.screen = app.screen
         self.session = s
         self.msgs = INDEX.transcript(s)
         self.query = app.query
@@ -3839,10 +3879,9 @@ class Viewer(object):
         Example: cwd exists -> app.resume == self.session and returns True; cwd gone -> returns
         False and the viewer footer shows " cwd no longer exists: /gone".
         """
-        if not self.app.can_resume(self.session):
+        if not self.app.choose_resume(self.session, edit=False):
             self.take_app_status()
             return False
-        self.app.resume = self.session
         return True
 
     def on_edit_resume(self) -> bool:
@@ -3855,16 +3894,9 @@ class Viewer(object):
         app.resume == self.session, app.resume_override == ["claude", "--resume", "a1",
         "--model", "opus"], returns True; Esc -> returns False with the status " resume cancelled".
         """
-        app = self.app
-        if not app.can_resume(self.session):
+        if not self.app.choose_resume(self.session, edit=True, redraw=False):
             self.take_app_status()
             return False
-        argv = app.edit_resume_command(self.session, redraw_screen=False)
-        if argv is None:
-            self.take_app_status()
-            return False
-        app.resume = self.session
-        app.resume_override = argv
         return True
 
     def on_copy(self) -> None:
@@ -3872,7 +3904,7 @@ class Viewer(object):
         self.take_app_status()
 
     def on_help(self) -> None:
-        self.app.help()
+        self.screen.show_help()
 
     def take_app_status(self) -> None:
         """Show a status message the App's shared helpers left, in the viewer's footer.
@@ -3909,14 +3941,14 @@ class Viewer(object):
         Example: query "fix", user types "ing" and presses Enter -> query == "fixing",
         hit_index == -1.
         """
-        buf, ok = self.app.prompt("/", self.query, redraw_screen=False)
+        buf, ok = self.screen.prompt("/", self.query)
         if ok:
             self.query = buf
             self.hit_index = -1
             self._render_key = None  # force a re-render with the new terms
 
     def build_keymap(self) -> Dict[str, Callable[[], Optional[bool]]]:
-        """Key name (see App.key) -> handler for the viewer.
+        """Key name (see Screen.key) -> handler for the viewer.
 
         Returns:
             A dict mapping each key name to its handler method.
@@ -3977,25 +4009,25 @@ class Viewer(object):
         bh = self.body_height = h - 2
         self.offset = max(0, min(self.offset, max(0, len(self.lines) - bh)))
         pat = term_regex(terms)
-        app.scr.erase()
-        app.fill(0, app.attrs["head"])
+        self.screen.scr.erase()
+        self.screen.fill(0, self.screen.attrs["head"])
         title = clip(("* " if self.session.starred else "") + self.session.title, max(0, w - 40))
         hit_text = ("hit %d/%d" % (self.hit_index + 1, len(self.hits))) if self.hits else \
             ("no hits" if terms else "")
-        app.put(0, 0, clip(" %s %s  %s" % (SOURCES[self.session.source].tag, title, hit_text), w - 1),
-                app.attrs["head"])
+        self.screen.put(0, 0, clip(" %s %s  %s" % (SOURCES[self.session.source].tag, title, hit_text), w - 1),
+                self.screen.attrs["head"])
         for i in range(bh):
             j = self.offset + i
             if j >= len(self.lines):
                 break
             t, kind, spans = self.lines[j]
-            app.draw_line(1 + i, 0, t, w - 1, kind, pat, spans)
-        app.fill(h - 1, app.attrs["head"])
+            self.screen.draw_line(1 + i, 0, t, w - 1, kind, pat, spans)
+        self.screen.fill(h - 1, self.screen.attrs["head"])
         pct = 100 if len(self.lines) <= bh else int(100 * (self.offset + bh) / len(self.lines))
         foot = self.status or (" j/k scroll  spc/b page  g/G ends  / search  n/N hit  "
                                "t results  u mine  * star  r/e resume  y copy  ? help  q back  [%d%%]" % min(pct, 100))
-        app.put(h - 1, 0, clip(foot, w - 1), app.attrs["head"])
-        app.scr.refresh()
+        self.screen.put(h - 1, 0, clip(foot, w - 1), self.screen.attrs["head"])
+        self.screen.scr.refresh()
         self.status = ""
 
     def run(self) -> None:
@@ -4007,16 +4039,16 @@ class Viewer(object):
         """
         app = self.app
         while True:
-            h, w = app.scr.getmaxyx()
+            h, w = self.screen.scr.getmaxyx()
             if h < 4 or w < 12:
-                app.scr.erase()
-                app.put(0, 0, "too small")
-                app.scr.refresh()
-                if app.key() in ("q", "ESC", "CTRL_C"):
+                self.screen.scr.erase()
+                self.screen.put(0, 0, "too small")
+                self.screen.scr.refresh()
+                if self.screen.key() in ("q", "ESC", "CTRL_C"):
                     return
                 continue
             self.draw(h, w)
-            k = app.key()
+            k = self.screen.key()
             if k is None or k == "RESIZE":
                 continue
             if self.handle_key(k):

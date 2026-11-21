@@ -1065,13 +1065,13 @@ class Tui(Env):
     def test_text_draws_spans_and_highlight(self) -> None:
         app = self.make([])
         drawn = []  # type: List[Tuple[int, str, int]]
-        app.put = lambda y, x, s, attr=0: drawn.append((x, s, attr))  # type: ignore
-        app.attrs.update({"bold": 1, "code": 2, "hl": 8})
-        app.text(0, 5, "ab cd ef", 20, 0, re.compile("ef"), ((0, 2, "bold"), (3, 5, "code")))
+        app.screen.put = lambda y, x, s, attr=0: drawn.append((x, s, attr))  # type: ignore
+        app.screen.attrs.update({"bold": 1, "code": 2, "hl": 8})
+        app.screen.text(0, 5, "ab cd ef", 20, 0, re.compile("ef"), ((0, 2, "bold"), (3, 5, "code")))
         self.assertEqual(drawn, [(5, "ab", 1), (7, " ", 0), (8, "cd", 2), (10, " ", 0),
                                  (11, "ef", 8)])
         del drawn[:]
-        app.text(0, 0, "abcdef", 3, 0, None, ((1, 99, "bold"),))   # spans beyond the clip are cut
+        app.screen.text(0, 0, "abcdef", 3, 0, None, ((1, 99, "bold"),))   # spans beyond the clip are cut
         self.assertEqual(drawn, [(0, "a", 0), (1, "bc", 1)])
 
     def test_viewer_shows_markdown(self) -> None:
@@ -1079,16 +1079,16 @@ class Tui(Env):
         # drive the real renderer for an assistant reply through draw_line
         lines = ai.markdown_lines("# Head\n**b** `c`", 40, "  ")
         for i, (t, kind, spans) in enumerate(lines):
-            app.draw_line(i, 0, t, 40, kind, None, spans)
+            app.screen.draw_line(i, 0, t, 40, kind, None, spans)
         self.assertIn("  Head", self.scr.screen())
         self.assertIn("  b c", self.scr.screen())
 
     def test_init_colors_without_terminal(self) -> None:
         app = self.make([])
-        self.assertIn("hl", getattr(app, "attrs", None) or app.A)  # swallowed curses.error
+        self.assertIn("hl", app.screen.attrs)  # swallowed curses.error
 
     def colored_attrs(self, ncolors: int, env: Dict[str, str]) -> Dict[str, int]:
-        """init_colors on a fake color terminal; returns app.attrs (color_pair(n) is n << 8)."""
+        """init_colors on a fake color terminal; returns app.screen.attrs (color_pair(n) is n << 8)."""
         app = self.make([])
         pairs: Dict[int, Any] = {}
         with mock.patch.object(curses, "has_colors", return_value=True), \
@@ -1103,7 +1103,7 @@ class Tui(Env):
             app.background = None
             app.init_colors()
         self.pairs = pairs
-        return app.attrs
+        return app.screen.attrs
 
     def test_init_colors_claude_theme(self) -> None:
         a = self.colored_attrs(256, {"AI_SESSIONS_THEME": "claude", "COLORFGBG": "15;0"})
@@ -1160,7 +1160,7 @@ class Tui(Env):
 
     def test_key_names(self) -> None:
         app = self.make([curses.KEY_UP, curses.KEY_BACKSPACE, "\n", "\x1b", "\t", "\x15", "x", 99999])
-        self.assertEqual([app.key() for _ in range(8)],
+        self.assertEqual([app.screen.key() for _ in range(8)],
                          ["UP", "BS", "ENTER", "ESC", "TAB", "CU", "x", "UNKNOWN"])
 
     def test_click_moves_selection_without_opening(self) -> None:
@@ -1189,7 +1189,7 @@ class Tui(Env):
         app = self.run_keys([curses.KEY_F1, "j", "q"])
         self.assertFalse(self.scr.any_frame("Press any key."))
         self.assertEqual(app.current().id, Y_ID)
-        buf, ok = self.make([curses.KEY_F1, "a", "\n"]).prompt("/", "")
+        buf, ok = self.make([curses.KEY_F1, "a", "\n"]).screen.prompt("/", "")
         self.assertEqual((buf, ok), ("a", True))
 
     def test_filter_enter_and_esc(self) -> None:
