@@ -21,6 +21,12 @@ ai-sessions --star-status [ID]   # print "starred ..." or "not starred ..."
 ai-sessions --list --starred     # only starred sessions
 ```
 
+Assistant replies are Markdown, and the browser (preview pane and full-screen
+viewer) and `--show` render it: headings, bullet and numbered lists, block quotes,
+horizontal rules, fenced code blocks (kept verbatim), box-drawn tables (wrapped to fit the
+width) and inline `code`, **bold**, *italic* and links. The browser draws the styles; `--show` prints the same
+layout as plain text with the markers removed. Your own prompts and tool output are shown as is.
+
 Install by symlinking it onto your `PATH`:
 
 ```sh

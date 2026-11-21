@@ -70,10 +70,16 @@ Msg = Dict[str, Any]
 # INDEX_VERSION must be bumped whenever these keys or their meaning change, so
 # stale caches are discarded instead of being misread.
 Summary = Dict[str, Any]
-# One rendered transcript row: (text, kind). kind picks the color/attribute:
-# title, meta, dim, text, prompt, user, asst, tool, result (see App.init_colors).
-# "prompt" is the body of your own messages (drawn on a grey band); "text" is everything else.
-Line = Tuple[str, str]
+# Inline style span: (start, end, style) character offsets into a row's text; style is one of
+# "bold", "italic", "code", "link", "dim". Several spans may cover the same characters.
+Span = Tuple[int, int, str]
+# A run of inline text sharing one set of styles, e.g. ("bold text", ("bold",)).
+Seg = Tuple[str, Tuple[str, ...]]
+# One rendered transcript row: (text, kind, spans). kind picks the color/attribute:
+# title, meta, dim, text, prompt, user, asst, tool, result, plus the Markdown body kinds
+# heading, code, quote, table (see App.init_colors). "prompt" is the body of your own messages
+# (drawn on a grey band); "text" is everything else. spans is () for unstyled rows.
+Line = Tuple[str, str, Tuple[Span, ...]]
 # curses window (curses._CursesWindow is not importable at runtime).
 Window = Any
 # (y, x, height, width) screen region.
@@ -1275,18 +1281,19 @@ def stripe_color(ncolors: int, env: Optional[Dict[str, str]] = None,
 # Keys: brand (Claude orange, assistant name / Claude Code tag), codex (Codex tag),
 # secondary (muted text: dates, metadata, tool results), tool (tool-call marker),
 # star (starred rows), select_fg / select_bg (selected row), prompt_bg (band behind your
-# messages), head_bg (header and footer bars), hl_fg / hl_bg (search-match highlight).
+# messages), head_bg (header and footer bars), hl_fg / hl_bg (search-match highlight),
+# code (inline code and fenced code blocks in assistant replies).
 CLAUDE_PALETTES: Dict[str, Dict[str, int]] = {
     # Source RGBs: brand 215,119,87; secondary 153,153,153; tool/success 78,186,101;
     # star/warning 255,193,7; select_fg 177,185,249; prompt_bg 55,55,55.
     "dark": {"brand": 173, "codex": 74, "secondary": 246, "tool": 71, "star": 214,
              "select_fg": 147, "select_bg": 239, "prompt_bg": 237, "head_bg": 237,
-             "hl_fg": 16, "hl_bg": 214},
+             "hl_fg": 16, "hl_bg": 214, "code": 153},
     # Source RGBs: brand 215,119,87; secondary 102,102,102; tool/success 44,122,57;
     # star/warning 150,108,30; select_fg 87,105,247; prompt_bg 240,240,240.
     "light": {"brand": 173, "codex": 31, "secondary": 242, "tool": 28, "star": 172,
               "select_fg": 63, "select_bg": 252, "prompt_bg": 254, "head_bg": 254,
-              "hl_fg": 16, "hl_bg": 214},
+              "hl_fg": 16, "hl_bg": 214, "code": 25},
 }
 
 
@@ -1721,6 +1728,603 @@ def get_transcript(s: Session) -> List[Msg]:
     return msgs
 
 
+# ---------------------------------------------------------------- markdown
+
+# Characters a backslash can escape in inline text.
+MD_ESCAPABLE = "\\`*_[]()#|<>"
+MD_AUTOLINK = re.compile(r"<(https?://[^\s<>]+)>")
+MD_FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
+MD_HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$")
+MD_HRULE = re.compile(r"^ {0,3}([-*_])(\s*\1){2,}\s*$")
+MD_BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+MD_ORDERED = re.compile(r"^(\s*)(\d{1,9}[.)])\s+(.*)$")
+MD_QUOTE = re.compile(r"^ {0,3}> ?")
+MD_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+
+
+def utf8_locale() -> bool:
+    """True when the locale encodes UTF-8 (so box-drawing and bullet glyphs can be printed).
+
+    Example: with a UTF-8 locale -> True; with an ASCII ("C") locale -> False
+    """
+    enc = (locale.getpreferredencoding(False) or "").lower().replace("-", "").replace("_", "")
+    return enc == "utf8"
+
+
+def markdown_glyphs() -> Tuple[str, str]:
+    """(bullet, quote bar) used when rendering Markdown: UTF-8 glyphs, else ASCII.
+
+    Returns:
+        A (bullet, quote_bar) pair of one-character strings.
+
+    Examples: with a UTF-8 locale -> ("•", "▎"); with an ASCII locale -> ("-", "|")
+    """
+    return ("•", "▎") if utf8_locale() else ("-", "|")
+
+
+def _code_run_end(text: str, start: int, n: int) -> int:
+    """Index of the first run of exactly n backticks at or after start, or -1.
+
+    Example: _code_run_end("a `b` c", 3, 1) -> 4
+    """
+    j = start
+    while True:
+        j = text.find("`" * n, j)
+        if j < 0:
+            return -1
+        k = j
+        while k < len(text) and text[k] == "`":
+            k += 1
+        if k - j == n:
+            return j
+        j = k
+
+
+def _run_end(text: str, start: int) -> int:
+    """Index just past the run of identical characters beginning at start.
+
+    Example: _run_end("a**b", 1) -> 3
+    """
+    k = start
+    while k < len(text) and text[k] == text[start]:
+        k += 1
+    return k
+
+
+def _find_closer(text: str, start: int, ch: str, n: int) -> int:
+    """Find the closing emphasis delimiter (a run of exactly n `ch`) at or after start.
+
+    Skips code spans and backslash escapes. A closer must follow non-space text and, for "_",
+    must not be followed by a letter or digit (so snake_case_names stay literal).
+
+    Args:
+        text: The inline text.
+        start: Index just after the opening delimiter.
+        ch: "*" or "_".
+        n: Length of the opening delimiter run (1, 2 or 3).
+
+    Returns:
+        The index of the closing run, or -1 if there is none.
+
+    Example: _find_closer("a b* c", 0, "*", 1) -> 3; _find_closer("a * b", 0, "*", 1) -> -1
+    """
+    j, size = start, len(text)
+    while j < size:
+        c = text[j]
+        if c == "\\":
+            j += 2
+        elif c == "`":
+            k = _run_end(text, j)
+            e = _code_run_end(text, k, k - j)
+            j = k if e < 0 else e + (k - j)
+        elif c == ch:
+            k = _run_end(text, j)
+            if (k - j == n and j > start and not text[j - 1].isspace()
+                    and (ch == "*" or k >= size or not text[k].isalnum())):
+                return j
+            j = k
+        else:
+            j += 1
+    return -1
+
+
+def _match_link(text: str, i: int) -> Optional[Tuple[str, str, int]]:
+    """Match an inline link "[label](url)" starting at text[i] == "[".
+
+    Returns:
+        (label, url, end_index) or None when text[i:] is not a link. A title after the url
+        ("[a](u "t")") is dropped.
+
+    Example: _match_link("[a](http://x) y", 0) -> ("a", "http://x", 13)
+    """
+    size, depth, j = len(text), 0, i
+    while j < size:
+        c = text[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    if j >= size or j + 1 >= size or text[j + 1] != "(":
+        return None
+    depth, k = 1, j + 2
+    while k < size:
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    if k >= size:
+        return None
+    inner = text[j + 2:k].strip()
+    return text[i + 1:j], (inner.split(" ")[0] if inner else ""), k + 1
+
+
+def _merge_segs(segs: List[Seg]) -> List[Seg]:
+    """Drop empty segments and join neighbours that have the same styles.
+
+    Example: [("a", ()), ("b", ()), ("", ("bold",))] -> [("ab", ())]
+    """
+    out: List[Seg] = []
+    for t, st in segs:
+        if not t:
+            continue
+        if out and out[-1][1] == st:
+            out[-1] = (out[-1][0] + t, st)
+        else:
+            out.append((t, st))
+    return out
+
+
+def parse_inline(text: str, styles: Tuple[str, ...] = ()) -> List[Seg]:
+    """Parse inline Markdown into styled segments with the markers removed.
+
+    Handles `code` (any backtick run length, literal content), **bold** / __bold__,
+    *italic* / _italic_ (underscores only at word boundaries), ***both***, [text](url)
+    (text styled "link" then " (url)" styled "dim" unless url == text), <https://autolinks>
+    and backslash escapes. Unmatched markers stay literal. Styles may nest.
+
+    Args:
+        text: One line of text (no newlines needed).
+        styles: Styles applied to everything in text (used for recursion).
+
+    Returns:
+        A list of (text, styles) segments with no empty or mergeable neighbours.
+
+    Examples:
+        parse_inline("a **b** c") -> [("a ", ()), ("b", ("bold",)), (" c", ())]
+        parse_inline("snake_case_name and 2 * 3") -> [("snake_case_name and 2 * 3", ())]
+        parse_inline("[x](http://u)") -> [("x", ("link",)), (" (http://u)", ("dim",))]
+    """
+    segs: List[Seg] = []
+    buf: List[str] = []
+
+    def flush() -> None:
+        if buf:
+            segs.append(("".join(buf), styles))
+            del buf[:]
+
+    i, size = 0, len(text)
+    while i < size:
+        c = text[i]
+        if c == "\\" and i + 1 < size and text[i + 1] in MD_ESCAPABLE:
+            buf.append(text[i + 1])
+            i += 2
+        elif c == "`":
+            k = _run_end(text, i)
+            e = _code_run_end(text, k, k - i)
+            if e < 0:
+                buf.append(text[i:k])
+                i = k
+                continue
+            inner = text[k:e]
+            if len(inner) > 2 and inner[0] == " " and inner[-1] == " " and inner.strip():
+                inner = inner[1:-1]
+            flush()
+            segs.append((inner, styles + ("code",)))
+            i = e + (k - i)
+        elif c == "[":
+            link = _match_link(text, i)
+            if link is None:
+                buf.append(c)
+                i += 1
+                continue
+            label, url, end = link
+            flush()
+            segs.extend(parse_inline(label, styles + ("link",)))
+            if url and url != label:
+                segs.append((" (%s)" % url, styles + ("dim",)))
+            i = end
+        elif c == "<" and MD_AUTOLINK.match(text, i):
+            m = MD_AUTOLINK.match(text, i)
+            assert m is not None
+            flush()
+            segs.append((m.group(1), styles + ("link",)))
+            i = m.end()
+        elif c in "*_":
+            k = _run_end(text, i)
+            n = k - i
+            if (n <= 3 and k < size and not text[k].isspace()
+                    and (c == "*" or i == 0 or not text[i - 1].isalnum())):
+                e = _find_closer(text, k, c, n)
+                if e >= 0:
+                    flush()
+                    added = {1: ("italic",), 2: ("bold",), 3: ("bold", "italic")}[n]
+                    segs.extend(parse_inline(text[k:e], styles + added))
+                    i = e + n
+                    continue
+            buf.append(text[i:k])
+            i = k
+        else:
+            buf.append(c)
+            i += 1
+    flush()
+    return _merge_segs(segs)
+
+
+def segs_text(segs: List[Seg]) -> str:
+    """The plain text of styled segments.
+
+    Example: segs_text([("a ", ()), ("b", ("bold",))]) -> "a b"
+    """
+    return "".join(t for t, _ in segs)
+
+
+Pairs = List[Tuple[str, Tuple[str, ...]]]
+
+
+def _pairs_to_row(pairs: Pairs) -> Tuple[str, Tuple[Span, ...]]:
+    """Turn (char, styles) pairs into row text plus spans (one span per style run).
+
+    Example: [("a", ()), ("b", ("bold",)), ("c", ("bold",))] -> ("abc", ((1, 3, "bold"),))
+    """
+    spans: List[Span] = []
+    opened: Dict[str, int] = {}
+    for i, (_, st) in enumerate(pairs):
+        for name in list(opened):
+            if name not in st:
+                spans.append((opened.pop(name), i, name))
+        for name in st:
+            if name not in opened:
+                opened[name] = i
+    for name, start in opened.items():
+        spans.append((start, len(pairs), name))
+    spans.sort()
+    return "".join(c for c, _ in pairs), tuple(spans)
+
+
+def wrap_segments(segs: List[Seg], width: int) -> List[Tuple[str, Tuple[Span, ...]]]:
+    """Word-wrap styled text to a display width, keeping each character's styles.
+
+    Like wrap() for a single line: a line that fits is kept as is (minus trailing spaces);
+    otherwise runs of spaces collapse to one, continuation lines keep the leading indent (up to
+    half the width) and over-long words are split by display width (wide chars count 2).
+
+    Args:
+        segs: The styled text, as from parse_inline (no newlines).
+        width: Display width in columns (at least 1).
+
+    Returns:
+        A list of (row text, spans) pairs; never empty ([("", ())] for empty input).
+
+    Example: wrap_segments([("aa ", ()), ("bb", ("bold",))], 2) -> [("aa", ()), ("bb", ((0, 2, "bold"),))]
+    """
+    width = max(width, 1)
+    pairs: Pairs = [(ch, st) for t, st in segs for ch in t]
+    while pairs and pairs[-1][0] == " ":
+        pairs.pop()
+    if not pairs:
+        return [("", ())]
+    if sum(char_width(c) for c, _ in pairs) <= width:
+        return [_pairs_to_row(pairs)]
+    lead = 0
+    while lead < len(pairs) and pairs[lead][0] == " ":
+        lead += 1
+    indent = min(lead, width // 2)
+    # Split into (gap space, word) items.
+    items: List[Tuple[Optional[Tuple[str, Tuple[str, ...]]], Pairs]] = []
+    gap: Optional[Tuple[str, Tuple[str, ...]]] = None
+    word: Pairs = []
+    for p in pairs[lead:] + [(" ", ())]:
+        if p[0] == " ":
+            if word:
+                items.append((gap, word))
+                word = []
+                gap = None
+            if gap is None:
+                gap = p
+        else:
+            word.append(p)
+    pad: Pairs = [(" ", ())] * indent
+    rows: List[Pairs] = []
+    cur: Pairs = list(pad)
+    curw = indent
+    has_word = False
+    for gap_p, word in items:
+        ww = sum(char_width(c) for c, _ in word)
+        if has_word and gap_p is not None and curw + 1 + ww <= width:
+            cur += [gap_p] + word
+            curw += 1 + ww
+            continue
+        if not has_word and curw + ww <= width:
+            cur += word
+            curw += ww
+            has_word = True
+            continue
+        if has_word:
+            rows.append(cur)
+            cur, curw, has_word = list(pad), indent, False
+        for p in word:   # a word that does not fit on a line of its own is split
+            cw = char_width(p[0])
+            if has_word and curw + cw > width:
+                rows.append(cur)
+                cur, curw, has_word = list(pad), indent, False
+            cur.append(p)
+            curw += cw
+            has_word = True
+    if has_word:
+        rows.append(cur)
+    return [_pairs_to_row(r) for r in rows]
+
+
+def _hard_wrap(s: str, width: int) -> List[str]:
+    """Split s into chunks of at most width display columns (no word handling).
+
+    Example: _hard_wrap("abcdef", 4) -> ["abcd", "ef"]; _hard_wrap("", 4) -> [""]
+    """
+    width = max(width, 1)
+    chunks: List[str] = []
+    while str_width(s) > width:
+        piece = clip(s, width) or s[:1]
+        chunks.append(piece)
+        s = s[len(piece):]
+    chunks.append(s)
+    return chunks
+
+
+def _split_table_row(line: str) -> List[str]:
+    """Split a table row into stripped cell strings; leading/trailing pipes are optional and
+    "\\|" does not split.
+
+    Example: _split_table_row("| a | b \\| c |") -> ["a", "b \\| c"]
+    """
+    s = line.strip()
+    cells: List[str] = []
+    cur: List[str] = []
+    j = 0
+    while j < len(s):
+        if s[j] == "\\" and j + 1 < len(s):
+            cur.append(s[j:j + 2])
+            j += 2
+            continue
+        if s[j] == "|":
+            cells.append("".join(cur))
+            cur = []
+        else:
+            cur.append(s[j])
+        j += 1
+    cells.append("".join(cur))
+    if s.startswith("|"):
+        cells = cells[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        cells = cells[:-1]
+    return [c.strip() for c in cells]
+
+
+def _table_lines(header: List[str], aligns: List[str], body: List[List[str]],
+                 width: int) -> List[Line]:
+    """Lay out a table as box-drawn "table" rows, all the same display width.
+
+    Column widths come from the rendered (marker-stripped) cell text. When the table is wider
+    than `width`, the widest columns shrink (to at least 3, then 1 columns) and cell text wraps
+    onto several rows inside its cell. Header cells are bold, borders are "dim" spans and
+    columns honour the alignment ("left", "center" or "right").
+
+    Args:
+        header: Header cell source strings.
+        aligns: One alignment per column.
+        body: Body rows of cell source strings (padded or cut to the header's length).
+        width: Available display width.
+
+    Returns:
+        The rows: top border, header, rule, body rows, bottom border.
+
+    Example: _table_lines(["a", "b"], ["left", "left"], [["1", "2"]], 40) ->
+        "┌───┬───┐", "│ a │ b │", "├───┼───┤", "│ 1 │ 2 │", "└───┴───┘"
+    """
+    ncols = len(header)
+    utf8 = utf8_locale()
+    h, v = ("─", "│") if utf8 else ("-", "|")
+    corners = ("┌┬┐", "├┼┤", "└┴┘") if utf8 else ("+++", "+++", "+++")
+
+    def cells_of(row: List[str], bold: bool) -> List[List[Seg]]:
+        row = (row + [""] * ncols)[:ncols]
+        return [[(t, st + ("bold",)) if bold else (t, st) for t, st in parse_inline(c)]
+                for c in row]
+
+    grid = [cells_of(header, True)] + [cells_of(r, False) for r in body]
+    colw = [max(1, max(str_width(segs_text(r[c])) for r in grid)) for c in range(ncols)]
+    minw = 3
+    while sum(colw) + 3 * ncols + 1 > width:
+        widest = max(range(ncols), key=lambda c: colw[c])
+        if colw[widest] > minw:
+            colw[widest] -= 1
+        elif minw > 1:
+            minw = 1
+        else:
+            break
+
+    def border(kind: Tuple[str, str, str]) -> Line:
+        text = kind[0] + kind[1].join(h * (w + 2) for w in colw) + kind[2]
+        return (text, "table", ((0, len(text), "dim"),))
+
+    def row_lines(row: List[List[Seg]]) -> List[Line]:
+        wrapped = [wrap_segments(row[c], colw[c]) for c in range(ncols)]
+        out: List[Line] = []
+        for k in range(max(len(w) for w in wrapped)):
+            text = v
+            spans: List[Span] = [(0, 1, "dim")]
+            for c in range(ncols):
+                ct, cs = wrapped[c][k] if k < len(wrapped[c]) else ("", ())
+                gap = max(colw[c] - str_width(ct), 0)
+                left = {"right": gap, "center": gap // 2}.get(aligns[c], 0)
+                text += " " + " " * left
+                spans.extend((a + len(text), b + len(text), s) for a, b, s in cs)
+                text += ct + " " * (gap - left) + " "
+                spans.append((len(text), len(text) + 1, "dim"))
+                text += v
+            out.append((text, "table", tuple(spans)))
+        return out
+
+    out = [border(corners[0])]
+    out.extend(row_lines(grid[0]))
+    out.append(border(corners[1]))
+    for r in grid[1:]:
+        out.extend(row_lines(r))
+    out.append(border(corners[2]))
+    return out
+
+
+def _markdown_blocks(lines: List[str], width: int) -> List[Line]:
+    """Render Markdown source lines into rows (no outer prefix), `width` columns wide.
+
+    Blocks: fenced code, ATX headings, tables, horizontal rules, block quotes, bullet and
+    ordered lists, and paragraphs (each source line stays its own line). Blank-line runs
+    collapse to one and leading/trailing blanks are dropped. See markdown_lines.
+
+    Args:
+        lines: Source lines (already sanitized with clean()).
+        width: Display width for the rows (at least 4).
+
+    Returns:
+        The rows as Line tuples.
+
+    Example: _markdown_blocks(["# Hi", "- a"], 20) -> [("Hi", "heading", ()), ("• a", "text", ())]
+    """
+    width = max(width, 4)
+    bullet, bar = markdown_glyphs()
+    out: List[Line] = []
+    levels: List[int] = []   # source indents of the open list nesting levels
+    i, n = 0, len(lines)
+
+    def add_wrapped(segs: List[Seg], kind: str, first: str, rest: str) -> None:
+        for k, (t, sp) in enumerate(wrap_segments(segs, width - len(rest))):
+            lead = first if k == 0 else rest
+            out.append((lead + t, kind, tuple((a + len(lead), b + len(lead), s) for a, b, s in sp)))
+
+    while i < n:
+        raw = lines[i].rstrip()
+        if not raw.strip():
+            if out and out[-1][0] != "":
+                out.append(("", "text", ()))
+            i += 1
+            continue
+        fence = MD_FENCE.match(raw)
+        heading = MD_HEADING.match(raw)
+        if fence and not (fence.group(2)[0] == "`" and "`" in fence.group(3)):
+            levels = []
+            indent, mark = len(fence.group(1)), fence.group(2)
+            i += 1
+            while i < n:
+                st = lines[i].strip()
+                if st and set(st) == {mark[0]} and len(st) >= len(mark):
+                    i += 1
+                    break
+                body = lines[i].rstrip()
+                lead = len(body) - len(body.lstrip(" "))
+                for chunk in _hard_wrap(body[min(lead, indent):], width - 2):
+                    out.append(("  " + chunk if chunk else "", "code", ()))
+                i += 1
+        elif heading:
+            levels = []
+            if out and out[-1][0] != "":
+                out.append(("", "text", ()))
+            add_wrapped(parse_inline(heading.group(2)), "heading", "", "")
+            i += 1
+        elif ("|" in raw and i + 1 < n and "|" in lines[i + 1]
+              and MD_TABLE_SEP.match(lines[i + 1].rstrip())
+              and len(_split_table_row(raw)) == len(_split_table_row(lines[i + 1]))):
+            levels = []
+            seps = _split_table_row(lines[i + 1])
+            aligns = ["center" if s.startswith(":") and s.endswith(":") else
+                      "right" if s.endswith(":") else "left" for s in seps]
+            header = _split_table_row(raw)
+            rows: List[List[str]] = []
+            i += 2
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                rows.append(_split_table_row(lines[i]))
+                i += 1
+            out.extend(_table_lines(header, aligns, rows, width))
+        elif MD_HRULE.match(raw):
+            levels = []
+            out.append((rule_chars()[0] * width, "dim", ()))
+            i += 1
+        elif MD_QUOTE.match(raw):
+            levels = []
+            inner: List[str] = []
+            while i < n and MD_QUOTE.match(lines[i]):
+                inner.append(MD_QUOTE.sub("", lines[i], count=1))
+                i += 1
+            for t, kind, sp in _markdown_blocks(inner, width - 2):
+                lead = bar + " " if t else bar
+                if kind == "text":
+                    kind = "quote"
+                out.append((lead + t, kind, tuple((a + len(lead), b + len(lead), s)
+                                                  for a, b, s in sp)))
+        elif MD_BULLET.match(raw) or MD_ORDERED.match(raw):
+            mb, mo = MD_BULLET.match(raw), MD_ORDERED.match(raw)
+            src_indent = len((mb or mo).group(1))  # type: ignore
+            while levels and levels[-1] > src_indent:
+                levels.pop()
+            if not levels or levels[-1] < src_indent:
+                levels.append(src_indent)
+            marker = (bullet if mb else mo.group(2)) + " "  # type: ignore
+            content = (mb.group(2) if mb else mo.group(3))  # type: ignore
+            pad = "  " * (len(levels) - 1)
+            add_wrapped(parse_inline(content), "text", pad + marker, pad + " " * len(marker))
+            i += 1
+        else:
+            levels = []
+            add_wrapped(parse_inline(raw), "text", "", "")
+            i += 1
+    while out and out[-1][0] == "":
+        out.pop()
+    return out
+
+
+def markdown_lines(text: str, width: int, prefix: str = "") -> List[Line]:
+    """Render Markdown text (an assistant reply) into transcript rows with inline spans.
+
+    Markers are removed and the layout kept: headings ("heading"), fenced code ("code", verbatim,
+    hard-wrapped, indented 2 more), bullet / ordered lists with hanging indents, block quotes
+    ("quote", marked with a bar), horizontal rules ("dim"), box-drawn tables ("table") and
+    paragraphs ("text") whose **bold**, *italic*, `code` and [link](url) markup becomes spans.
+    Single newlines stay line breaks and blank-line runs collapse to one.
+
+    Args:
+        text: The Markdown source.
+        width: Total display width in columns, including prefix (at least len(prefix) + 4).
+        prefix: Plain text put before every non-blank row (the body indent), e.g. "  ".
+
+    Returns:
+        Line tuples (row text, kind, spans); spans are character offsets into the row text.
+
+    Examples:
+        markdown_lines("hi **there**", 40, "  ") -> [("  hi there", "text", ((5, 10, "bold"),))]
+        markdown_lines("# T\\n- a", 40, "  ") -> [("  T", "heading", ()), ("  • a", "text", ())]
+    """
+    rows = _markdown_blocks(clean(text).split("\n"), max(width - len(prefix), 4))
+    return [((prefix + t, k, tuple((a + len(prefix), b + len(prefix), s) for a, b, s in sp))
+             if t else ("", k, ())) for t, k, sp in rows]
+
+
 def result_preview_lines(text: str, width: int) -> List[Line]:
     """Render a tool result as at most RESULT_PREVIEW_LINES "result" rows plus a "more" note,
     Claude Code style: an elbow before the first row, the rest indented to the same column.
@@ -1730,13 +2334,13 @@ def result_preview_lines(text: str, width: int) -> List[Line]:
         width: Display width in terminal columns.
 
     Returns:
-        (row, "result") pairs: the first non-blank lines of text (or "(empty)"), each clipped
+        (row, "result", ()) tuples: the first non-blank lines of text (or "(empty)"), each clipped
         to fit, and a final "... (N more lines)" row when some were cut. The first row starts
         with "    ⎿  " (see transcript_glyphs); later rows are indented with spaces.
 
     Examples:
-        result_preview_lines("", 40) -> [("    ⎿  (empty)", "result")]
-        result_preview_lines("a\\n\\nb", 40) -> [("    ⎿  a", "result"), ("       b", "result")]
+        result_preview_lines("", 40) -> [("    ⎿  (empty)", "result", ())]
+        result_preview_lines("a\\n\\nb", 40) -> [("    ⎿  a", "result", ()), ("       b", "result", ())]
     """
     first = "    %s  " % transcript_glyphs()[1]
     rest = " " * len(first)
@@ -1744,19 +2348,21 @@ def result_preview_lines(text: str, width: int) -> List[Line]:
     shown = [clip(x.rstrip(), width - len(first)) for x in body[:RESULT_PREVIEW_LINES]]
     if len(body) > RESULT_PREVIEW_LINES:
         shown.append("... (%d more lines)" % (len(body) - RESULT_PREVIEW_LINES))
-    return [((first if i == 0 else rest) + x, "result") for i, x in enumerate(shown)]
+    return [((first if i == 0 else rest) + x, "result", ()) for i, x in enumerate(shown)]
 
 
 def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
            mine_only: bool = False) -> Tuple[List[Line], int]:
     """Return (lines, body_start) for a session at the given display width.
 
-    lines are (text, kind) pairs, already wrapped/clipped to width. The first
+    lines are (text, kind, spans) tuples, already wrapped/clipped to width. The first
     body_start lines are the header (title, id, dir, branch, dates, counts, rule);
     the transcript body follows. Kinds: title, meta, dim (header); user / asst (speaker
     labels); prompt (body of your own messages); text (other message bodies and blank
-    separators); tool (calls and slash commands); result (tool output).
-    show_results includes tool results; mine_only keeps only your own input (prompts
+    separators and paragraphs); heading, code, quote, table (Markdown blocks in assistant
+    replies); tool (calls and slash commands); result (tool output). Assistant replies are
+    rendered as Markdown (see markdown_lines) and carry inline style spans; everything else
+    has spans (). show_results includes tool results; mine_only keeps only your own input (prompts
     and slash commands).
 
     Args:
@@ -1767,33 +2373,34 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
         mine_only: Keep only your own prompts and slash commands (default False).
 
     Returns:
-        A (lines, body_start) tuple: lines is a list of (text, kind) rows; body_start is the index
+        A (lines, body_start) tuple: lines is a list of (text, kind, spans) rows; body_start is the index
         of the first row after the header.
 
     Example: for a claude session "Fix bug" (id a1, cwd /work/proj, no branch) with messages
     [user "fix the bug", assistant "ok", tool "Read: /x"], width 40, show_results False ->
     lines (body_start == 6):
-        ("Fix bug", "title"), ("Claude Code   a1", "meta"), ("Dir:     /work/proj", "meta"),
-        ("Started: ...   Updated: ...", "meta"), ("Messages: 1 you, 1 claude", "meta"),
-        ("────...", "dim"), ("", "text"), ("You:  10:00", "user"), ("  fix the bug", "prompt"),
-        ("", "text"), ("Claude:", "asst"), ("  ok", "text"), ("  ⏺ Read: /x", "tool")
+        ("Fix bug", "title", ()), ("Claude Code   a1", "meta", ()), ("Dir:     /work/proj", "meta", ()),
+        ("Started: ...   Updated: ...", "meta", ()), ("Messages: 1 you, 1 claude", "meta", ()),
+        ("────...", "dim", ()), ("", "text", ()), ("You:  10:00", "user", ()),
+        ("  fix the bug", "prompt", ()), ("", "text", ()), ("Claude:", "asst", ()),
+        ("  ok", "text", ()), ("  ⏺ Read: /x", "tool", ())
     """
     width = max(width, 10)
     lines: List[Line] = []
 
     def add_wrapped(text: str, kind: str, prefix: str = "") -> None:
         for ln in wrap(text, width - len(prefix)):
-            lines.append(((prefix + ln) if ln else "", kind))
+            lines.append(((prefix + ln) if ln else "", kind, ()))
 
     add_wrapped(s.title, "title")
-    lines.append(("%s   %s" % (LABEL[s.source], s.id), "meta"))
+    lines.append(("%s   %s" % (LABEL[s.source], s.id), "meta", ()))
     add_wrapped("Dir:     " + (s.cwd or "-"), "meta")
     if s.branch:
         add_wrapped("Branch:  " + s.branch, "meta")
-    lines.append(("Started: %s   Updated: %s" % (fmt_ts(s.first_ts), fmt_ts(s.last_ts)), "meta"))
+    lines.append(("Started: %s   Updated: %s" % (fmt_ts(s.first_ts), fmt_ts(s.last_ts)), "meta", ()))
     lines.append(("Messages: %d you, %d %s" % (s.n_user, s.n_asst, ASSISTANT_NAME[s.source].lower()),
-                  "meta"))
-    lines.append((rule_chars()[0] * min(width, 200), "dim"))
+                  "meta", ()))
+    lines.append((rule_chars()[0] * min(width, 200), "dim", ()))
     body_start = len(lines)
     for msg in msgs:
         role = msg["role"]
@@ -1803,15 +2410,18 @@ def render(s: Session, msgs: List[Msg], width: int, show_results: bool,
             continue
         if role in ("user", "assistant"):
             if lines and lines[-1][0] != "":
-                lines.append(("", "text"))
+                lines.append(("", "text", ()))
             who = "You:" if role == "user" else ASSISTANT_NAME[s.source] + ":"
             lines.append((who + ("  " + fmt_ts(msg["ts"], False) if msg.get("ts") else ""),
-                          "user" if role == "user" else "asst"))
-            add_wrapped(msg["text"], "prompt" if role == "user" else "text", "  ")
+                          "user" if role == "user" else "asst", ()))
+            if role == "user":
+                add_wrapped(msg["text"], "prompt", "  ")
+            else:
+                lines.extend(markdown_lines(msg["text"], width, "  "))
         elif role == "cmd":
-            lines.append(("  > " + clip(clean(msg["text"]), width - 4), "tool"))
+            lines.append(("  > " + clip(clean(msg["text"]), width - 4), "tool", ()))
         elif role == "tool":
-            lines.append(("  %s " % transcript_glyphs()[0] + clip(clean(msg["text"]), width - 4), "tool"))
+            lines.append(("  %s " % transcript_glyphs()[0] + clip(clean(msg["text"]), width - 4), "tool", ()))
         elif role == "result":
             lines.extend(result_preview_lines(msg["text"], width))
     return lines, body_start
@@ -1821,20 +2431,21 @@ def hit_lines(lines: List[Line], start: int, terms: List[str]) -> List[int]:
     """Indexes of body lines (from `start`, so never the header) containing any term.
 
     Args:
-        lines: Rendered (text, kind) rows.
+        lines: Rendered (text, kind, spans) rows.
         start: Index of the first body row; header rows before it never count.
         terms: Lowercase search terms; a row matches if it contains any of them.
 
     Returns:
         The indexes of matching rows, in order; [] when terms is empty.
 
-    Example: lines [("Fix bug", "title"), ..., ("  fix the bug", "prompt")] with start=6 and
+    Example: lines [("Fix bug", "title", ()), ..., ("  fix the bug", "prompt", ())] with start=6 and
     terms ["bug"] -> [8] (the title at index 0 is in the header, so it is not a hit).
     """
     if not terms:
         return []
     return [i for i in range(start, len(lines))
-            if lines[i][1] in ("text", "prompt", "tool", "result", "user", "asst")
+            if lines[i][1] in ("text", "prompt", "tool", "result", "user", "asst",
+                               "heading", "code", "quote", "table")
             and any(t in lines[i][0].lower() for t in terms)]
 
 
@@ -1992,8 +2603,11 @@ class App(object):
         With the "claude" theme on a 256-color terminal (see pick_palette) the colors come from
         Claude Code's palette; otherwise the original 8-color look is used. Besides the kind
         names (title, meta, dim, user, asst, tool, result, hl, head, and "prompt" in the claude
-        theme only) it holds the session-list row variants: cc, cx, star, dim for plain rows and
-        the same with a "stripe_" or "sel_" prefix (plus bare "stripe" / "sel" for the row's
+        theme only) it holds the Markdown row kinds heading, code, quote and table and the inline
+        style attributes bold, italic (underline where curses has no A_ITALIC), code and link
+        (dim is shared); "code" is cyan in the basic theme and the palette's code color in the
+        claude theme, and monochrome terminals fall back to bold, dim and underline. It also holds the session-list row variants: cc, cx, star,
+        dim for plain rows and the same with a "stripe_" or "sel_" prefix (plus bare "stripe" / "sel" for the row's
         own background) for every other row and the selected row.
 
         Example: on a basic color terminal -> self.attrs["cc"] == color_pair(1) | A_BOLD and
@@ -2001,11 +2615,18 @@ class App(object):
         color on the select_bg color and "prompt" is the grey band behind your messages;
         on a monochrome one -> self.attrs["cc"] == A_BOLD and self.attrs["hl"] == A_REVERSE | A_BOLD
         """
+        has_italic = hasattr(curses, "A_ITALIC")  # Python 3.7+ only
+        italic = getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
         attrs: Dict[str, int] = {"plain": 0, "dim": curses.A_DIM, "bold": curses.A_BOLD, "rev": curses.A_REVERSE,
              "cc": curses.A_BOLD, "cx": curses.A_UNDERLINE, "user": curses.A_BOLD,
              "asst": curses.A_BOLD, "hl": curses.A_REVERSE | curses.A_BOLD,
              "title": curses.A_BOLD, "tool": curses.A_DIM, "result": curses.A_DIM,
-             "meta": 0, "head": curses.A_REVERSE, "star": curses.A_BOLD}
+             "meta": 0, "head": curses.A_REVERSE, "star": curses.A_BOLD,
+             # Markdown: row kinds (heading, code, quote, table) and inline span styles
+             # (bold, italic, code, link; dim is shared with the kind above).
+             "italic": italic, "code": curses.A_BOLD, "link": curses.A_UNDERLINE,
+             "heading": curses.A_BOLD, "quote": curses.A_DIM | (italic if has_italic else 0),
+             "table": 0}
         try:
             if curses.has_colors():
                 curses.start_color()
@@ -2046,6 +2667,7 @@ class App(object):
                     attrs["hl"] = pair(curses.COLOR_BLACK, curses.COLOR_YELLOW)
                     attrs["tool"] = pair(curses.COLOR_YELLOW, bg)
                     attrs["head"] = pair(curses.COLOR_WHITE, curses.COLOR_BLUE) | curses.A_BOLD
+                    attrs["code"] = pair(curses.COLOR_CYAN, bg)
                     attrs["star"] = pair(curses.COLOR_YELLOW, bg) | curses.A_BOLD
                     # Shaded variants for every other session-list row, so long rows are easy
                     # to follow across a wide screen.
@@ -2067,6 +2689,8 @@ class App(object):
                     attrs["hl"] = pair(p["hl_fg"], p["hl_bg"])
                     attrs["head"] = pair(fg, p["head_bg"]) | curses.A_BOLD
                     attrs["prompt"] = pair(fg, p["prompt_bg"])
+                    attrs["code"] = pair(p["code"], bg)
+                    attrs["quote"] = secondary | (italic if has_italic else 0)
                     if stripe is not None:
                         row_set("stripe", stripe, fg, p["brand"], p["codex"], p["star"], p["secondary"])
                     row_set("sel", p["select_bg"], p["select_fg"], p["brand"], p["codex"],
@@ -2107,9 +2731,15 @@ class App(object):
             pass
 
     def text(self, y: int, x: int, s: str, maxw: int, attr: int,
-             pat: Optional[Pattern[str]] = None) -> None:
-        """Draw s at (y, x): sanitized, newlines flattened, clipped to maxw columns, with matches of
-        pat drawn in the highlight attribute.
+             pat: Optional[Pattern[str]] = None, spans: Tuple[Span, ...] = ()) -> None:
+        """Draw s at (y, x): sanitized, newlines flattened, clipped to maxw columns, with inline
+        styles from spans and matches of pat drawn in the highlight attribute.
+
+        Each character gets attr combined with the attributes of the spans covering it (a style
+        attribute with a color replaces attr's color; others are OR'ed in); search matches then
+        override that with the highlight. Runs of equal attributes are drawn in one call. Span
+        offsets are character offsets into s; clean() leaves render()'s text unchanged, so they
+        stay valid.
 
         Args:
             y: Row.
@@ -2118,27 +2748,41 @@ class App(object):
             maxw: Maximum width in columns; nothing is drawn if <= 0.
             attr: curses attribute for the normal text.
             pat: Compiled regex whose matches are highlighted, or None for no highlighting.
+            spans: (start, end, style) inline styles, style a key of self.attrs (default none).
 
         Example: text(3, 0, "fix the bug", 20, 0, re.compile("bug", re.I)) draws "fix the " plain
         at column 0 and "bug" highlighted at column 8; with maxw=5 it draws only "fix t".
+        With spans ((4, 7, "bold"),) the "the" is drawn bold.
         """
         s = clip(clean(s).replace("\n", " "), maxw)
         if not s or maxw <= 0:
             return
-        if pat is None:
+        if pat is None and not spans:
             self.put(y, x, s, attr)
             return
-        pos = 0
-        for m in pat.finditer(s):
-            if m.start() > pos:
-                self.put(y, x + str_width(s[:pos]), s[pos:m.start()], attr)
-            self.put(y, x + str_width(s[:m.start()]), m.group(0), self.attrs["hl"])
-            pos = m.end()
-        if pos < len(s):
-            self.put(y, x + str_width(s[:pos]), s[pos:], attr)
+        color_mask = getattr(curses, "A_COLOR", 0xff00)
+        attr_of = [attr] * len(s)
+        for start, end, style in spans:
+            extra = self.attrs.get(style, 0)
+            for k in range(max(start, 0), min(end, len(s))):
+                base = attr_of[k]
+                attr_of[k] = ((base & ~color_mask) | extra) if extra & color_mask else (base | extra)
+        if pat is not None:
+            for m in pat.finditer(s):
+                for k in range(m.start(), m.end()):
+                    attr_of[k] = self.attrs["hl"]
+        start = 0
+        col = x
+        while start < len(s):
+            end = start + 1
+            while end < len(s) and attr_of[end] == attr_of[start]:
+                end += 1
+            self.put(y, col, s[start:end], attr_of[start])
+            col += str_width(s[start:end])
+            start = end
 
     def draw_line(self, y: int, x: int, s: str, maxw: int, kind: str,
-                  pat: Optional[Pattern[str]] = None) -> None:
+                  pat: Optional[Pattern[str]] = None, spans: Tuple[Span, ...] = ()) -> None:
         """Draw one rendered transcript row in the attribute for its kind. "prompt" rows first
         get the whole width painted with the prompt attribute so the band spans the row.
 
@@ -2149,13 +2793,15 @@ class App(object):
             maxw: Width in columns available to the row.
             kind: The row's kind (see Line); unknown kinds draw plain.
             pat: Regex whose matches are highlighted, or None.
+            spans: The row's inline style spans (see Line), default none.
 
         Example: draw_line(3, 0, "  fix it", 40, "prompt") paints 40 grey cells on row 3, then
         writes "  fix it" over them; in the basic theme (no "prompt" attribute) it is just text().
+        draw_line(3, 0, "  a b", 40, "text", None, ((4, 5, "bold"),)) draws the "b" bold.
         """
         if kind == "prompt" and "prompt" in self.attrs and maxw > 0:
             self.put(y, x, " " * maxw, self.attrs["prompt"])
-        self.text(y, x, s, maxw, self.attrs.get(kind, 0), pat)
+        self.text(y, x, s, maxw, self.attrs.get(kind, 0), pat, spans)
 
     def fill(self, y: int, attr: int) -> None:
         """Paint row y with attr across the full width (for the header/footer bars).
@@ -2465,8 +3111,8 @@ class App(object):
             j = self.preview_offset + i
             if j >= len(lines):
                 break
-            t, kind = lines[j]
-            self.draw_line(y0 + i, x0, t, bw - 1, kind, pat)
+            t, kind, spans = lines[j]
+            self.draw_line(y0 + i, x0, t, bw - 1, kind, pat, spans)
 
     # -- actions
     def move(self, d: int) -> None:
@@ -3169,8 +3815,8 @@ class Viewer(object):
             j = self.offset + i
             if j >= len(self.lines):
                 break
-            t, kind = self.lines[j]
-            app.draw_line(1 + i, 0, t, w - 1, kind, pat)
+            t, kind, spans = self.lines[j]
+            app.draw_line(1 + i, 0, t, w - 1, kind, pat, spans)
         app.fill(h - 1, app.attrs["head"])
         pct = 100 if len(self.lines) <= bh else int(100 * (self.offset + bh) / len(self.lines))
         foot = self.status or (" j/k scroll  spc/b page  g/G ends  / search  n/N hit  "
@@ -3414,8 +4060,9 @@ def cmd_star(sessions: List[Session], ident: Optional[str], on: Optional[bool],
 
 
 def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool = False) -> int:
-    """Print the transcript of the session whose id equals ident or starts with it.
-    Returns 0; 1 (with a message on stderr) if nothing matches or the prefix is ambiguous.
+    """Print the transcript of the session whose id equals ident or starts with it, as plain text:
+    the same rows the browser shows (assistant replies as laid-out Markdown with the markers
+    removed, tables box-drawn), with the inline styles dropped. Returns 0; 1 (with a message on stderr) if nothing matches or the prefix is ambiguous.
 
     Args:
         sessions: All sessions.
@@ -3435,7 +4082,7 @@ def cmd_show(sessions: List[Session], ident: str, tools: bool, mine_only: bool =
         sys.stderr.write(err or "")
         return 1
     lines, _ = render(s, get_transcript(s), 100, tools, mine_only)
-    sys.stdout.write("\n".join(t for t, _ in lines) + "\n")
+    sys.stdout.write("\n".join(t for t, _, _ in lines) + "\n")
     return 0
 
 

@@ -33,7 +33,11 @@ One executable script (no `.py` suffix), in layers:
    `skills/star-session` skill (Claude Code and Codex) calls `ai-sessions --star` /
    `--unstar` / `--star-status`, which find the current session via `CODEX_THREAD_ID` / `CLAUDE_CODE_SESSION_ID`.
 3. **Output**: `cmd_list` / `cmd_show` for plain text; `render` builds the transcript
-   lines that `--show` and the TUI both use.
+   lines that `--show` and the TUI both use. A `Line` is `(text, kind, spans)`, where `spans`
+   are `(start, end, style)` character offsets for inline styles (`App.text` draws them).
+   Assistant replies go through the markdown layer (`markdown_lines`, `parse_inline`,
+   `wrap_segments`, `_table_lines`), which strips the markup and emits the `heading`, `code`,
+   `quote` and `table` kinds; user prompts, tool rows and results are not parsed.
 4. **TUI**: `App` (session list plus preview) and `Viewer` (full-screen transcript) share
    one curses window. Resuming goes through `build_resume_argv`, configured by
    `AI_SESSIONS_*_CMD`.

@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -752,7 +752,7 @@ class Units(unittest.TestCase):
                 not isinstance(getattr(ai, "Msg"), type(Dict)) and hasattr(ai.Msg, "_fields"):
             msgs = [ai.Msg(*[m.get(f) for f in ai.Msg._fields]) for m in msgs]  # type: ignore
         lines, start = ai.render(s, msgs, 40, True)
-        texts = [t for t, _ in lines]
+        texts = [t for t, _, _ in lines]
         self.assertEqual(texts[0], "T")
         self.assertTrue(start > 0 and texts[start - 1].startswith(ai.rule_chars()[0] * 3))
         elbow = ai.transcript_glyphs()[1]
@@ -762,9 +762,9 @@ class Units(unittest.TestCase):
         self.assertNotIn("       r6", texts)
         self.assertEqual(texts.count("    %s  r0" % elbow), 1)
         self.assertFalse(any(elbow in t for t in texts if t.startswith("       ")))
-        hidden = [t for t, _ in ai.render(s, msgs, 40, False)[0]]
+        hidden = [t for t, _, _ in ai.render(s, msgs, 40, False)[0]]
         self.assertFalse(any(elbow in t for t in hidden))
-        kinds = dict((t, k) for t, k in lines)
+        kinds = dict((t, k) for t, k, _ in lines)
         self.assertEqual(kinds["  hello world"], "prompt")  # your message body
         self.assertEqual(kinds["  bye"], "text")             # assistant body
         self.assertEqual(kinds["  %s Read: /x" % ai.transcript_glyphs()[0]], "tool")
@@ -775,6 +775,174 @@ class Units(unittest.TestCase):
         self.assertEqual(ai.hit_lines(lines, start, []), [])
         # header lines (meta) are never hits
         self.assertEqual(ai.hit_lines(lines, start, ["claude code"]), [])
+
+
+class MarkdownRendering(unittest.TestCase):
+    """markdown_lines / parse_inline / render for assistant replies."""
+
+    def rows(self, text: str, width: int = 60) -> List[Any]:
+        return ai.markdown_lines(text, width, "  ")
+
+    def texts(self, text: str, width: int = 60) -> List[str]:
+        return [t for t, _, _ in self.rows(text, width)]
+
+    def spans_of(self, row: Any) -> List[Tuple[str, str]]:
+        t, _, spans = row
+        return [(t[a:b], style) for a, b, style in spans]
+
+    def test_heading(self) -> None:
+        rows = self.rows("intro\n## The *title*\nbody")
+        self.assertEqual([(t, k) for t, k, _ in rows],
+                         [("  intro", "text"), ("", "text"), ("  The title", "heading"),
+                          ("  body", "text")])
+        self.assertEqual(self.spans_of(rows[2]), [("title", "italic")])
+        self.assertEqual(self.rows("# First")[0][:2], ("  First", "heading"))
+        self.assertEqual(self.texts("#nospace"), ["  #nospace"])
+
+    def test_inline_spans(self) -> None:
+        row = self.rows("a **bold** b *it* c `co*de` d ***both***")[0]
+        self.assertEqual(row[0], "  a bold b it c co*de d both")
+        self.assertEqual(self.spans_of(row), [("bold", "bold"), ("it", "italic"),
+                                              ("co*de", "code"), ("both", "bold"),
+                                              ("both", "italic")])
+        self.assertEqual(self.spans_of(self.rows("__b__ and _i_")[0]),
+                         [("b", "bold"), ("i", "italic")])
+        self.assertEqual(self.spans_of(self.rows("``a ` b``")[0]), [("a ` b", "code")])
+
+    def test_literal_markers(self) -> None:
+        for text in ("snake_case_name and file_path.py", "2 * 3 = 6", "a *b", "lone ** x",
+                     "my_var_ and _x"):
+            row = self.rows(text)[0]
+            self.assertEqual(row[0], "  " + text)
+            self.assertEqual(row[2], ())
+        self.assertEqual(self.texts(r"\*not\* \_x\_ \` \[a\] \# \| \\"),
+                         ["  *not* _x_ ` [a] # | \\"])
+        self.assertEqual(self.rows(r"\*not\*")[0][2], ())
+
+    def test_links(self) -> None:
+        row = self.rows("see [docs](http://x.io/a) and [http://u](http://u) and <https://z.io>")[0]
+        self.assertEqual(row[0], "  see docs (http://x.io/a) and http://u and https://z.io")
+        self.assertEqual(self.spans_of(row), [("docs", "link"), (" (http://x.io/a)", "dim"),
+                                              ("http://u", "link"), ("https://z.io", "link")])
+
+    def test_fenced_code(self) -> None:
+        text = "before\n```python\n  indented = **not bold**\n\nlong line " + "word " * 20 + \
+               "\n```\nafter"
+        rows = self.rows(text, 40)
+        self.assertNotIn("```", "".join(t for t, _, _ in rows))
+        code = [r for r in rows if r[1] == "code"]
+        self.assertEqual(code[0][0], "    " + "  indented = **not bold**")
+        self.assertEqual(code[0][2], ())
+        self.assertTrue(all(ai.str_width(r[0]) <= 40 for r in rows))
+        self.assertEqual(rows[0][0], "  before")
+        self.assertEqual(rows[-1][:2], ("  after", "text"))
+        # hard wrapped by characters, not words: the pieces re-join into the original
+        joined = "".join(r[0][4:] for r in code[2:])
+        self.assertEqual(joined, ("long line " + "word " * 20).rstrip())
+        # a tilde fence, and an unclosed fence runs to the end
+        rows = self.rows("~~~\nx\ny")
+        self.assertEqual([(t, k) for t, k, _ in rows], [("    x", "code"), ("    y", "code")])
+
+    def test_bullets_and_numbers(self) -> None:
+        bullet = ai.markdown_glyphs()[0]
+        rows = self.rows("- one two three four five six seven\n  - nested\n* star\n+ plus", 20)
+        self.assertEqual([t for t, _, _ in rows],
+                         ["  %s one two three" % bullet, "    four five six", "    seven",
+                          "    %s nested" % bullet, "  %s star" % bullet, "  %s plus" % bullet])
+        rows = self.rows("1. alpha beta gamma delta\n2) second\n10. ten", 18)
+        self.assertEqual([t for t, _, _ in rows],
+                         ["  1. alpha beta", "     gamma delta", "  2) second", "  10. ten"])
+        self.assertEqual(self.spans_of(self.rows("- a **b**")[0]), [("b", "bold")])
+
+    def test_quote_and_rule(self) -> None:
+        bar = ai.markdown_glyphs()[1]
+        rows = self.rows("> hello *there*\n> more\n\n---\n***\ntext", 20)
+        self.assertEqual([(t, k) for t, k, _ in rows],
+                         [("  %s hello there" % bar, "quote"), ("  %s more" % bar, "quote"),
+                          ("", "text"), ("  " + ai.rule_chars()[0] * 18, "dim"),
+                          ("  " + ai.rule_chars()[0] * 18, "dim"), ("  text", "text")])
+        self.assertEqual(self.spans_of(rows[0]), [("there", "italic")])
+
+    def table_rows(self, width: int) -> List[Any]:
+        text = ("| Name | Qty | Note |\n|:--|--:|:-:|\n| apple | 3 | a fairly long **note** here |\n"
+                "| \u65e5\u672c\u8a9e | 12 | ok |\n")
+        return [r for r in self.rows(text, width) if r[1] == "table"]
+
+    def test_table(self) -> None:
+        h, v = ai.rule_chars()
+        rows = self.table_rows(80)
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(len(set(ai.str_width(r[0]) for r in rows)), 1)
+        self.assertTrue(rows[0][0].startswith("  " + ("\u250c" if h == "\u2500" else "+")))
+        self.assertIn("Name", rows[1][0])
+        self.assertIn(("Name", "bold"), self.spans_of(rows[1]))
+        self.assertNotIn("---", rows[2][0])
+        self.assertIn("apple", rows[3][0])
+        self.assertNotIn("**", rows[3][0])
+        self.assertIn(("note", "bold"), self.spans_of(rows[3]))
+        self.assertIn(v + "   3 " + v, rows[3][0])        # right aligned
+        self.assertIn("  ok  ", rows[4][0])                # centered
+        for r in rows[1:3] + rows[3:]:
+            self.assertTrue(any(s == "dim" for _, s in self.spans_of(r)))
+
+    def test_table_narrow_wraps_cells(self) -> None:
+        wide = self.table_rows(80)
+        narrow = self.table_rows(32)
+        self.assertGreater(len(narrow), len(wide))
+        self.assertEqual(len(set(ai.str_width(r[0]) for r in narrow)), 1)
+        self.assertLessEqual(ai.str_width(narrow[0][0]), 32)
+        body = " ".join(r[0] for r in narrow)
+        for word in ("fairly", "long", "here", "apple"):
+            self.assertIn(word, body)
+        # spans stay on the right characters after wrapping inside cells
+        for r in narrow:
+            for frag, style in self.spans_of(r):
+                if style == "bold":
+                    self.assertIn(frag.strip(), ("Name", "Qty", "Note", "note"))
+
+    def test_table_needs_separator(self) -> None:
+        self.assertEqual(self.texts("a | b\nc | d"), ["  a | b", "  c | d"])
+
+    def test_wrapping_keeps_spans(self) -> None:
+        rows = self.rows("alpha **bold words here** omega", 18)
+        self.assertEqual([t for t, _, _ in rows], ["  alpha bold words", "  here omega"])
+        self.assertEqual(self.spans_of(rows[0]), [("bold words", "bold")])
+        self.assertEqual(self.spans_of(rows[1]), [("here", "bold")])
+        rows = self.rows("x `a_very_long_inline_code_span` y", 14)
+        for r in rows:
+            self.assertLessEqual(ai.str_width(r[0]), 14)
+        self.assertEqual("".join(f for r in rows for f, st in self.spans_of(r) if st == "code"),
+                         "a_very_long_inline_code_span")
+
+    def test_wide_chars(self) -> None:
+        rows = self.rows("\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8 **\u592a\u5b57\u3067\u3059** end", 12)
+        for r in rows:
+            self.assertLessEqual(ai.str_width(r[0]), 12)
+        flat = "".join(t[2:] for t, _, _ in rows).replace(" ", "")
+        self.assertEqual(flat, "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8\u592a\u5b57\u3067\u3059end")
+        self.assertEqual("".join(f for r in rows for f, st in self.spans_of(r) if st == "bold"),
+                         "\u592a\u5b57\u3067\u3059")
+
+    def test_blank_runs_collapse(self) -> None:
+        self.assertEqual(self.texts("\n\na\n\n\n\nb\n\n"), ["  a", "", "  b"])
+        self.assertEqual(self.rows(""), [])
+
+    def test_render_uses_markdown_for_assistant_only(self) -> None:
+        s = ai.Session({"source": "claude", "id": "i", "path": "p", "cwd": "/w", "branch": "",
+                        "title": "T", "first_ts": 0, "last_ts": 0, "n_user": 1, "n_asst": 1,
+                        "blob": ""})
+        msgs = [{"role": "user", "text": "# keep **raw**", "ts": None},
+                {"role": "assistant", "text": "# Head\nsome **bold**", "ts": None}]
+        lines, start = ai.render(s, msgs, 40, False)
+        body = lines[start:]
+        by_text = dict((t, (k, sp)) for t, k, sp in body)
+        self.assertEqual(by_text["  # keep **raw**"], ("prompt", ()))
+        self.assertEqual(by_text["  Head"], ("heading", ()))
+        self.assertEqual(by_text["  some bold"], ("text", ((7, 11, "bold"),)))
+        hits = ai.hit_lines(lines, start, ["head"])
+        self.assertEqual([lines[i][0] for i in hits], ["  Head"])
+        shown = ai.hit_lines(ai.markdown_lines("```\ncode here\n```", 40, "  "), 0, ["code"])
+        self.assertEqual(shown, [0])
 
 
 class ResumeArgv(Env):
@@ -893,6 +1061,27 @@ class Tui(Env):
         app.run()
         self.assertEqual(self.scr.keys, [], "unconsumed keys")
         return app
+
+    def test_text_draws_spans_and_highlight(self) -> None:
+        app = self.make([])
+        drawn = []  # type: List[Tuple[int, str, int]]
+        app.put = lambda y, x, s, attr=0: drawn.append((x, s, attr))  # type: ignore
+        app.attrs.update({"bold": 1, "code": 2, "hl": 8})
+        app.text(0, 5, "ab cd ef", 20, 0, re.compile("ef"), ((0, 2, "bold"), (3, 5, "code")))
+        self.assertEqual(drawn, [(5, "ab", 1), (7, " ", 0), (8, "cd", 2), (10, " ", 0),
+                                 (11, "ef", 8)])
+        del drawn[:]
+        app.text(0, 0, "abcdef", 3, 0, None, ((1, 99, "bold"),))   # spans beyond the clip are cut
+        self.assertEqual(drawn, [(0, "a", 0), (1, "bc", 1)])
+
+    def test_viewer_shows_markdown(self) -> None:
+        app = self.make(["\n", "q", "q"], query="")
+        # drive the real renderer for an assistant reply through draw_line
+        lines = ai.markdown_lines("# Head\n**b** `c`", 40, "  ")
+        for i, (t, kind, spans) in enumerate(lines):
+            app.draw_line(i, 0, t, 40, kind, None, spans)
+        self.assertIn("  Head", self.scr.screen())
+        self.assertIn("  b c", self.scr.screen())
 
     def test_init_colors_without_terminal(self) -> None:
         app = self.make([])
