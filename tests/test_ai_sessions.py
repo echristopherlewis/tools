@@ -252,7 +252,7 @@ class CodexParsing(Env):
         self.assertEqual(mtext(msgs[0]), "plain str")
 
     def test_user_noise_detection(self) -> None:
-        noise = ai.SOURCES["codex"].user_noise
+        noise = ai.SOURCES["codex"]._user_noise
         self.assertTrue(noise("# AGENTS.md instructions for /x"))
         self.assertTrue(noise("<environment_context>\n</environment_context>"))
         self.assertTrue(noise("<turn_aborted>\n</turn_aborted>"))
@@ -365,7 +365,7 @@ class LoadSessions(Env):
         self.assertEqual(ids(ai.SessionFilter("", "all", "/work/beta").select(ss)), sorted([C_ID, D_ID]))
         self.assertEqual(ai.SessionFilter("zzzz-nothing").select(ss), [])
         self.assertEqual(ids(ai.SessionFilter("zebra").select(ss)), [A_ID])  # transcript text
-        self.assertEqual([s.id for s in ai.SessionFilter().sorted(ss)],
+        self.assertEqual([s.id for s in ai.SessionFilter()._sorted(ss)],
                          [D_ID, Y_ID, C_ID, X_ID, B_ID, A_ID])
 
 
@@ -465,7 +465,7 @@ class Cli(Env):
 class Stars(Env):
     def test_roundtrip_and_set_star(self) -> None:
         self.assertEqual(ai.STARS.read(), {})
-        ai.STARS.write({"a": 1.5})
+        ai.STARS._write({"a": 1.5})
         self.assertEqual(ai.STARS.read(), {"a": 1.5})
         self.assertEqual(ai.STARS.path(), self.stars_file())
         ai.STARS.set("b", True)
@@ -629,7 +629,7 @@ class Units(unittest.TestCase):
             self.assertIsNone(p(bad), bad)
 
     def test_stripe_color(self) -> None:
-        sc = lambda n, env, bg=None: ai.Theme(bg, env).stripe(n)
+        sc = lambda n, env, bg=None: ai.Theme(bg, env)._stripe(n)
         self.assertEqual(sc(256, {}), 236)
         self.assertEqual(sc(256, {"COLORFGBG": "0;15"}), 255)
         self.assertEqual(sc(256, {"COLORFGBG": "0;default;7"}), 255)
@@ -646,7 +646,7 @@ class Units(unittest.TestCase):
         self.assertIsNone(sc(8, {}, (255, 255, 255)))
 
     def test_background_is_light(self) -> None:
-        f = lambda env, bg=None: ai.Theme(bg, env).is_light()
+        f = lambda env, bg=None: ai.Theme(bg, env)._is_light()
         self.assertFalse(f({}))
         self.assertTrue(f({}, (255, 255, 255)))
         self.assertFalse(f({}, (30, 30, 30)))
@@ -657,7 +657,7 @@ class Units(unittest.TestCase):
         self.assertTrue(f({"COLORFGBG": "15;0"}, (250, 250, 250)))
 
     def test_pick_palette(self) -> None:
-        pp = lambda n, env, bg=None: ai.Theme(bg, env).palette(n)
+        pp = lambda n, env, bg=None: ai.Theme(bg, env)._palette(n)
         dark, light = ai.Theme.PALETTES["dark"], ai.Theme.PALETTES["light"]
         self.assertEqual(set(dark), set(light))
         self.assertIs(pp(256, {}), dark)
@@ -678,14 +678,14 @@ class Units(unittest.TestCase):
             self.assertEqual(ai.transcript_glyphs(), ("*", "|"))
 
     def test_stripe_for_background(self) -> None:
-        f = ai.Theme.stripe_for_background
+        f = ai.Theme._stripe_for_background
         self.assertEqual(f((0, 0, 0)), 236)
         self.assertEqual(f((255, 255, 255)), 255)
         self.assertEqual(f((30, 30, 30)), 239)
         self.assertIn(f((253, 246, 227)), range(252, 256))
 
     def test_parse_osc11_reply(self) -> None:
-        p = ai.Theme.parse_osc11_reply
+        p = ai.Theme._parse_osc11_reply
         self.assertEqual(p("\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), (255, 255, 255))
         self.assertEqual(p("\x1b]11;rgb:1e/1e/1e\x07"), (30, 30, 30))
         self.assertEqual(p("\x1b]11;rgb:0000/8080/ffff\x07\x1b[?62;22c"), (0, 128, 255))
@@ -725,14 +725,14 @@ class Units(unittest.TestCase):
 
     def test_summarize_tool_and_content_text(self) -> None:
         # TOOL_KEYS order decides which argument is shown ("path" before "pattern")
-        self.assertEqual(ai.Source.summarize_tool("Grep", {"pattern": "foo", "path": "/x"}), "Grep: /x")
-        self.assertEqual(ai.Source.summarize_tool("Bash", {"command": "echo hi"}), "Bash: echo hi")
-        self.assertEqual(ai.Source.summarize_tool("sh", '{"cmd": ["ls", "-l"]}'), "sh: ls -l")
-        self.assertEqual(ai.Source.summarize_tool("raw", "just text\nsecond"), "raw: just text")
-        self.assertEqual(ai.Source.summarize_tool(None, None), "tool")
-        self.assertEqual(ai.Source.content_text("s"), "s")
-        self.assertEqual(ai.Source.content_text([{"type": "text", "text": "a"}, "b", {"x": 1}]), "a\nb")
-        self.assertEqual(ai.Source.content_text(None), "")
+        self.assertEqual(ai.Source._summarize_tool("Grep", {"pattern": "foo", "path": "/x"}), "Grep: /x")
+        self.assertEqual(ai.Source._summarize_tool("Bash", {"command": "echo hi"}), "Bash: echo hi")
+        self.assertEqual(ai.Source._summarize_tool("sh", '{"cmd": ["ls", "-l"]}'), "sh: ls -l")
+        self.assertEqual(ai.Source._summarize_tool("raw", "just text\nsecond"), "raw: just text")
+        self.assertEqual(ai.Source._summarize_tool(None, None), "tool")
+        self.assertEqual(ai.Source._content_text("s"), "s")
+        self.assertEqual(ai.Source._content_text([{"type": "text", "text": "a"}, "b", {"x": 1}]), "a\nb")
+        self.assertEqual(ai.Source._content_text(None), "")
 
     def test_shell_quote(self) -> None:
         self.assertEqual(ai.shell_quote("abc-1/x.y"), "abc-1/x.y")
@@ -778,7 +778,7 @@ class Units(unittest.TestCase):
 
 
 class MarkdownRendering(unittest.TestCase):
-    """MarkdownRenderer.lines / parse_inline / render for assistant replies."""
+    """MarkdownRenderer.lines / _parse_inline / render for assistant replies."""
 
     def rows(self, text: str, width: int = 60) -> List[Any]:
         return ai.MarkdownRenderer.lines(text, width, "  ")
@@ -1088,7 +1088,7 @@ class Tui(Env):
         self.assertIn("hl", app.screen.attrs)  # swallowed curses.error
 
     def colored_attrs(self, ncolors: int, env: Dict[str, str]) -> Dict[str, int]:
-        """init_colors on a fake color terminal; returns app.screen.attrs (color_pair(n) is n << 8)."""
+        """_init_colors on a fake color terminal; returns app.screen.attrs (color_pair(n) is n << 8)."""
         app = self.make([])
         pairs: Dict[int, Any] = {}
         with mock.patch.object(curses, "has_colors", return_value=True), \
@@ -1101,7 +1101,7 @@ class Tui(Env):
                 mock.patch.object(curses, "color_pair", side_effect=lambda n: n << 8), \
                 mock.patch.dict(os.environ, env):
             app.background = None
-            app.init_colors()
+            app._init_colors()
         self.pairs = pairs
         return app.screen.attrs
 
@@ -1128,7 +1128,7 @@ class Tui(Env):
     def test_initial_view_and_draw(self) -> None:
         app = self.make(["q"])
         app.run()
-        self.assertEqual([s.id for s in app.view], [D_ID, Y_ID, C_ID, X_ID, B_ID, A_ID])
+        self.assertEqual([s.id for s in app._view], [D_ID, Y_ID, C_ID, X_ID, B_ID, A_ID])
         scr = self.scr.frames[0]
         self.assertIn("ai-sessions  6/6 sessions  filter: none  sort: last activity", scr)
         self.assertIn("First prompt becomes the title", scr)
@@ -1140,23 +1140,23 @@ class Tui(Env):
 
     def test_move_keys(self) -> None:
         app = self.run_keys(["j", "j", "q"])
-        self.assertEqual(app.current().id, C_ID)
+        self.assertEqual(app._current().id, C_ID)
         app = self.run_keys(["j", "j", "j", "k", "q"])
-        self.assertEqual(app.current().id, C_ID)
+        self.assertEqual(app._current().id, C_ID)
         app = self.run_keys([curses.KEY_DOWN, curses.KEY_UP, curses.KEY_UP, "q"])
-        self.assertEqual(app.current().id, D_ID)
+        self.assertEqual(app._current().id, D_ID)
         app = self.run_keys(["G", "q"])
-        self.assertEqual(app.current().id, A_ID)
+        self.assertEqual(app._current().id, A_ID)
         app = self.run_keys([curses.KEY_END, "g", "q"])
-        self.assertEqual(app.current().id, D_ID)
+        self.assertEqual(app._current().id, D_ID)
         app = self.run_keys([curses.KEY_NPAGE, "q"])
-        self.assertEqual(app.current().id, A_ID)  # page larger than the list
+        self.assertEqual(app._current().id, A_ID)  # page larger than the list
         app = self.run_keys([curses.KEY_NPAGE, curses.KEY_PPAGE, "q"])
-        self.assertEqual(app.current().id, D_ID)
+        self.assertEqual(app._current().id, D_ID)
 
     def test_resize_ignored(self) -> None:
         app = self.run_keys([curses.KEY_RESIZE, "j", "q"])
-        self.assertEqual(app.current().id, Y_ID)
+        self.assertEqual(app._current().id, Y_ID)
 
     def test_key_names(self) -> None:
         app = self.make([curses.KEY_UP, curses.KEY_BACKSPACE, "\n", "\x1b", "\t", "\x15", "x", 99999])
@@ -1169,78 +1169,78 @@ class Tui(Env):
         events = [(5, 3, curses.BUTTON1_PRESSED),    # third row -> C_ID
                   (80, 1, curses.BUTTON1_PRESSED),   # preview pane: ignored
                   (5, 20, curses.BUTTON1_PRESSED)]   # below the last session: ignored
-        app.mouse_event = lambda: events.pop(0)
+        app._mouse_event = lambda: events.pop(0)
         app.run()
         self.assertEqual(self.scr.keys, [])
-        self.assertEqual(app.current().id, C_ID)
+        self.assertEqual(app._current().id, C_ID)
         self.assertFalse(self.scr.any_frame("Press any key."))
         self.assertIsNone(app.resume)
 
     def test_click_respects_scroll_offset(self) -> None:
         # 80x8 stacked: the list shows 3 rows; after G it is scrolled to the last three.
         app = self.make(["G", curses.KEY_MOUSE, "q"], h=8, w=80)
-        app.mouse_event = lambda: (2, 1, curses.BUTTON1_PRESSED)
+        app._mouse_event = lambda: (2, 1, curses.BUTTON1_PRESSED)
         app.run()
-        self.assertEqual(app.top, 3)
-        self.assertEqual(app.current().id, app.view[3].id)
+        self.assertEqual(app._top, 3)
+        self.assertEqual(app._current().id, app._view[3].id)
 
     def test_unknown_special_key_is_ignored(self) -> None:
         # Regression: unmapped keys (e.g. F1) used to be named "?" and opened help.
         app = self.run_keys([curses.KEY_F1, "j", "q"])
         self.assertFalse(self.scr.any_frame("Press any key."))
-        self.assertEqual(app.current().id, Y_ID)
+        self.assertEqual(app._current().id, Y_ID)
         buf, ok = self.make([curses.KEY_F1, "a", "\n"]).screen.prompt("/", "")
         self.assertEqual((buf, ok), ("a", True))
 
     def test_filter_enter_and_esc(self) -> None:
         app = self.run_keys(["/"] + list("quokka") + ["\n", "q"])
         self.assertEqual(app.filter.query, "quokka")
-        self.assertEqual([s.id for s in app.view], [X_ID])
+        self.assertEqual([s.id for s in app._view], [X_ID])
         self.assertTrue(self.scr.any_frame("filter: /quokka"))
         app = self.run_keys(["/"] + list("quokka") + ["\n", "\x1b", "q"])
         self.assertEqual(app.filter.query, "")
-        self.assertEqual(len(app.view), 6)
+        self.assertEqual(len(app._view), 6)
 
     def test_filter_live_and_edit_keys(self) -> None:
         app = self.make(["/", "w", "a", "l", "x", "\x7f", "r", "\n", "q"])
         app.run()
         self.assertEqual(app.filter.query, "walr")
-        self.assertEqual([s.id for s in app.view], [Y_ID])
+        self.assertEqual([s.id for s in app._view], [Y_ID])
         app = self.run_keys(["/", "z", "z", "\x15", "b", "r", "a", "v", "o", "\n", "q"])
         self.assertEqual(app.filter.query, "bravo")
-        self.assertEqual([s.id for s in app.view], [B_ID])
+        self.assertEqual([s.id for s in app._view], [B_ID])
 
     def test_filter_cancel_with_esc_clears(self) -> None:
         app = self.run_keys(["/"] + list("beta") + ["\x1b", "q"])
         self.assertEqual(app.filter.query, "")
-        self.assertEqual(len(app.view), 6)
+        self.assertEqual(len(app._view), 6)
 
     def test_filter_terms_anded(self) -> None:
         app = self.run_keys(["/"] + list("beta charlie") + ["\n", "q"])
-        self.assertEqual([s.id for s in app.view], [C_ID])
+        self.assertEqual([s.id for s in app._view], [C_ID])
 
     def test_tab_cycles_source(self) -> None:
         app = self.run_keys(["\t", "q"])
-        self.assertEqual((app.filter.source, len(app.view)), ("claude", 4))
+        self.assertEqual((app.filter.source, len(app._view)), ("claude", 4))
         app = self.run_keys(["\t", "\t", "q"])
-        self.assertEqual((app.filter.source, len(app.view)), ("codex", 2))
+        self.assertEqual((app.filter.source, len(app._view)), ("codex", 2))
         app = self.run_keys(["\t", "\t", "\t", "q"])
-        self.assertEqual((app.filter.source, len(app.view)), ("all", 6))
+        self.assertEqual((app.filter.source, len(app._view)), ("all", 6))
         self.assertTrue(self.scr.any_frame("filter: none"))
 
     def test_project_toggle(self) -> None:
         app = self.run_keys(["p", "q"])
         self.assertEqual(app.filter.project, "/work/beta")
-        self.assertEqual([s.id for s in app.view], [D_ID, C_ID])
+        self.assertEqual([s.id for s in app._view], [D_ID, C_ID])
         self.assertTrue(self.scr.any_frame("project=beta"))
         app = self.run_keys(["p", "p", "q"])
         self.assertIsNone(app.filter.project)
-        self.assertEqual(len(app.view), 6)
+        self.assertEqual(len(app._view), 6)
 
     def test_sort_toggle_keeps_selection(self) -> None:
         app = self.run_keys(["j", "j", "j", "s", "q"])
         self.assertEqual(app.filter.sort, "start")
-        self.assertEqual(app.current().id, X_ID)  # selection follows the session
+        self.assertEqual(app._current().id, X_ID)  # selection follows the session
         self.assertTrue(self.scr.any_frame("sort: start time"))
         app = self.run_keys(["s", "s", "q"])
         self.assertEqual(app.filter.sort, "last")
@@ -1304,7 +1304,7 @@ class Tui(Env):
         app = self.make(["R", "q"])
         os.remove(self.fx("claude", "-work-beta", D_ID + ".jsonl"))
         app.run()
-        self.assertEqual(len(app.view), 5)
+        self.assertEqual(len(app._view), 5)
         self.assertTrue(self.scr.any_frame("rescanned: 5 sessions"))
 
     def test_help(self) -> None:
@@ -1424,26 +1424,26 @@ class Tui(Env):
     def test_split_toggle(self) -> None:
         hz, vt = ai.rule_chars()
         app = self.run_keys(["l", "q"], w=80)  # auto-stacked at 80 cols -> list only
-        self.assertEqual(app.split, "list")
+        self.assertEqual(app._split, "list")
         self.assertNotIn(vt, self.scr.frames[-1])
         self.assertNotIn(hz * 20, self.scr.frames[-1])
         self.assertTrue(self.scr.any_frame("layout: list only"))
         app = self.run_keys(["l", "l", "q"], w=80)  # list only -> side
-        self.assertEqual(app.split, "side")
+        self.assertEqual(app._split, "side")
         self.assertIn(vt, self.scr.frames[-1])
         self.assertTrue(self.scr.any_frame("layout: list beside preview"))
         app = self.run_keys(["l", "q"], w=120)  # auto side at 120 cols -> stacked
-        self.assertEqual(app.split, "stack")
+        self.assertEqual(app._split, "stack")
         self.assertIn(hz * 20, self.scr.frames[-1])
         self.assertNotIn(vt, self.scr.frames[-1])
         app = self.run_keys(["l", "l", "l", "q"], w=120)  # full cycle back to side
-        self.assertEqual(app.split, "side")
+        self.assertEqual(app._split, "side")
 
     def test_star_key_toggles_and_persists(self) -> None:
         app = self.run_keys(["*", "j", "*", "*", "q"])
         self.assertEqual(sorted(ai.STARS.read()), [D_ID])
-        self.assertTrue(app.view[0].starred)
-        self.assertFalse(app.view[1].starred)
+        self.assertTrue(app._view[0].starred)
+        self.assertFalse(app._view[1].starred)
         self.assertTrue(self.scr.any_frame(" starred: First prompt becomes the title"))
         self.assertTrue(self.scr.any_frame(" unstarred: Second codex prompt about walruses"))
         row = [ln for ln in self.scr.frames[1].splitlines() if "2025-03-04 08:01" in ln][0]
@@ -1452,27 +1452,27 @@ class Tui(Env):
     def test_star_key_write_failure_shows_status(self) -> None:
         with mock.patch.object(ai.STARS, "set", side_effect=OSError("disk full")):
             app = self.run_keys(["*", "q"])
-        self.assertFalse(app.view[0].starred)
+        self.assertFalse(app._view[0].starred)
         self.assertTrue(self.scr.any_frame("could not save stars: disk full"))
 
     def test_starred_only_filter(self) -> None:
         ai.STARS.set(B_ID, True)
         ai.STARS.set(X_ID, True)
         app = self.run_keys(["S", "q"])
-        self.assertEqual(sorted(s.id for s in app.view), [X_ID, B_ID])
+        self.assertEqual(sorted(s.id for s in app._view), [X_ID, B_ID])
         self.assertTrue(self.scr.any_frame("filter: starred"))
         app = self.run_keys(["S", "S", "q"])
-        self.assertEqual(len(app.view), 6)
+        self.assertEqual(len(app._view), 6)
         # unstarring while filtered removes the row
         app = self.run_keys(["S", "*", "q"])
-        self.assertEqual(len(app.view), 1)
+        self.assertEqual(len(app._view), 1)
         self.assertEqual(len(ai.STARS.read()), 1)
 
     def test_rescan_rereads_stars(self) -> None:
         app = self.make(["R", "q"])
         ai.STARS.set(A_ID, True)  # e.g. done by the skill while the TUI is open
         app.run()
-        self.assertTrue([s for s in app.all if s.id == A_ID][0].starred)
+        self.assertTrue([s for s in app._all if s.id == A_ID][0].starred)
         # and toggling another session does not clobber it
         app = self.run_keys(["*", "q"])
         self.assertEqual(sorted(ai.STARS.read()), sorted([A_ID, D_ID]))
@@ -1482,14 +1482,14 @@ class Tui(Env):
         self.assertEqual(sorted(ai.STARS.read()), [D_ID])
         app = self.run_keys(["\n", "8", "q", "q"])
         self.assertEqual(sorted(ai.STARS.read()), [])
-        self.assertFalse(app.view[0].starred)
+        self.assertFalse(app._view[0].starred)
 
     def test_star_in_viewer(self) -> None:
         app = self.run_keys(["\n", "*", "q", "q"])
         self.assertEqual(sorted(ai.STARS.read()), [D_ID])
         self.assertTrue(self.scr.any_frame(" starred: First prompt"))
         self.assertTrue(self.scr.any_frame(" CC * First prompt"))
-        self.assertTrue(app.view[0].starred)
+        self.assertTrue(app._view[0].starred)
 
     def test_help_mentions_star_keys(self) -> None:
         keys = [b.label for b in ai.KEY_BINDINGS if b.text]

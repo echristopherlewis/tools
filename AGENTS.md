@@ -8,6 +8,8 @@ Small standalone CLI tools; see [README.md](README.md).
   no `from __future__ import annotations`), portable across macOS and Linux (BSD/GNU-compatible flags).
 - Always use type hints on Python function parameters and return values (and on
   variables where the type isn't obvious).
+- Members (methods and instance variables) used only inside their own class (or its subclasses) get a
+  leading `_`; everything used from outside the class stays public.
 - Write code that is easy for humans to understand: clear names, straightforward control
   flow, and comments where the intent isn't obvious.
 - Give every non-trivial function a docstring that says what it does, describes each
@@ -25,11 +27,11 @@ One executable script (no `.py` suffix), in layers:
    (`ClaudeSource`, `CodexSource`), registered in `SOURCE_LIST` (order matters: claude first)
    and looked up by key in `SOURCES`. A source has display attributes (`tag`, `label`,
    `assistant_name`), resume settings (`default_cmd`, `resume_args`, `cmd_override`),
-   `session_env_var`, and methods `root`, `scan_root`, `discover`, `parse`,
-   `title_overrides`, `resume_template` and `resume_argv`. `Source.parse` turns a JSONL
+   `session_env_var`, and methods `_root`, `scan_root`, `discover`, `parse`,
+   `title_overrides`, `_resume_template` and `resume_argv`. `Source.parse` turns a JSONL
    transcript into a `Summary` (index entry) and a list of `Msg` dicts; the type comments
    near the top of the script define both. Injected harness messages are dropped via each
-   source's `NOISE`. Shared helpers (`iter_json`, `make_summary`, ...) are static/instance
+   source's `NOISE`. Shared helpers (`_iter_json`, `_make_summary`, ...) are static/instance
    methods on `Source`.
    Adding a tool means adding a `Source` subclass and putting an instance in `SOURCE_LIST`.
 2. **Index**: `SessionIndex` (singleton `INDEX`) caches summaries in
@@ -47,8 +49,8 @@ One executable script (no `.py` suffix), in layers:
 3. **Output**: `cmd_list` / `cmd_show` for plain text; `render` builds the transcript
    lines that `--show` and the TUI both use. A `Line` is `(text, kind, spans)`, where `spans`
    are `(start, end, style)` character offsets for inline styles (`Screen.text` draws them).
-   Assistant replies go through `MarkdownRenderer` (`lines`, `blocks`, `table_lines`, plus the
-   static `parse_inline` and `wrap_segments`), which strips the markup and emits the `heading`,
+   Assistant replies go through `MarkdownRenderer` (`lines`, `_blocks`, `_table_lines`, plus the
+   static `_parse_inline` and `_wrap_segments`), which strips the markup and emits the `heading`,
    `code`, `quote` and `table` kinds; user prompts, tool rows and results are not parsed.
 4. **TUI**: `Screen` wraps the curses window and its attribute table (drawing, key input,
    the footer prompt, the help screen); `App` (session list plus preview) and `Viewer`
