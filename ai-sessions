@@ -33,6 +33,78 @@ Environment:
   CLAUDE_CODE_SESSION_ID  set by Claude Code; same, checked second
 """
 
+# ---------------------------------------------------------------- Overview
+#
+# How the classes fit together. Data flows down: transcripts on disk become cached summaries,
+# then Session objects, then filtered lists and rendered transcript Lines on the screen.
+#
+#   ~/.claude/projects/*/*.jsonl      ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+#                |                                   |
+#         +--------------+                    +-------------+
+#         | ClaudeSource |                    | CodexSource |
+#         +--------------+                    +-------------+
+#                \______ subclasses of ______/
+#                         +----------+
+#                         |  Source  |   one per tool, in SOURCE_LIST / SOURCES
+#                         +----------+
+#                              | discover() -> transcript paths
+#                              | parse(path) -> Summary + [Msg]
+#                              v
+#   +-------------------------------------------+   read()   +-----------+
+#   | SessionIndex  (singleton INDEX)           |<-----------| StarStore |  stars.json
+#   |  load()          -> [Session]             |            | (STARS)   |
+#   |    Summaries cached in index.json         |            +-----------+
+#   |  transcript(s)   -> [Msg]  (small LRU)    |
+#   +-------------------------------------------+
+#            | [Session]                   | [Msg]
+#            v                             v
+#   +---------------+          render(Session, [Msg]) -> [Line]
+#   | SessionFilter |                      | assistant replies
+#   |  apply()      |                      v
+#   +---------------+             +------------------+
+#            | visible [Session]  | MarkdownRenderer |
+#            v                    +------------------+
+#   cmd_list (--list)    cmd_show (--show) prints render()'s Lines
+#   run_tui -> browse -> App  (interactive, below)
+#
+#                                 Enter
+#   +----------------------------+ -----> +------------------------------+
+#   | App                        |        | Viewer                       |
+#   |  session list + preview    | <----- |  full-screen transcript      |
+#   |  owns SessionFilter, Theme |  q/Esc |  uses its App's Screen and   |
+#   |  and the Screen            |        |  state (toggles, resume)     |
+#   +----------------------------+        +------------------------------+
+#         |  keymaps from build_keymap(KEY_BINDINGS)   |
+#         +---------------------+----------------------+
+#                               v draw, read keys
+#   +--------------------------------------------+  curses_attrs()  +-------+
+#   | Screen  (curses window, footer prompt,     |<-----------------| Theme |
+#   |          help screen from help_lines())    |                  +-------+
+#   +--------------------------------------------+
+#
+# The classes, in file order:
+#   Source / ClaudeSource / CodexSource  Everything specific to one tool: where its transcripts
+#       live, how to parse one into a Summary and [Msg] (dropping injected NOISE), and how to
+#       build the command that resumes a session.
+#   Session        One session as the UI sees it: the Summary's fields as attributes, plus
+#       project, starred and search_text; resume_argv() / resume_cmd() defer to its Source.
+#   Theme          Every color decision: terminal background detection, the list's row
+#       stripe, the palette, and the curses attribute table that App gives its Screen.
+#   StarStore      Starred session ids (user data, stars.json); SessionIndex.load marks
+#       Session.starred from it, and the * key and --star / --unstar change it.
+#   SessionIndex   Builds and caches the Summary index (re-parsing only changed transcripts),
+#       returns Sessions, and keeps recently parsed transcripts in memory.
+#   SessionFilter  Query, source, project, starred-only and sort mode: which sessions the
+#       list shows and in what order. Used by App and cmd_list.
+#   MarkdownRenderer  Turns an assistant reply into styled Lines; called only from render().
+#   KeyBinding     One row of KEY_BINDINGS, the single table behind App's and Viewer's keymaps
+#       (build_keymap) and the help screen (help_lines).
+#   Screen         Wraps the curses window: drawing text with inline spans, key input, the
+#       footer line editor and the help screen. Created by App, shared with Viewer.
+#   App            The interactive session browser: list, preview, filtering, sorting,
+#       starring and choosing a session to resume (read back by browse / run_tui).
+#   Viewer         The full-screen transcript with search, opened from App on one Session.
+
 import argparse
 import calendar
 import collections
